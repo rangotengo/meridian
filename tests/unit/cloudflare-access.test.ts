@@ -11,7 +11,8 @@ import {
 const config: AccessConfig = {
   teamDomain: "rangotengo.cloudflareaccess.com",
   audience: "meridian-test-audience",
-  allowedEmails: ["allowed@example.com"]
+  allowedEmails: ["allowed@example.com"],
+  allowPublicSignup: false
 };
 let pair: Awaited<ReturnType<typeof generateKeyPair>>;
 let keys: ReturnType<typeof createLocalJWKSet>;
@@ -41,6 +42,19 @@ async function token(overrides: JWTPayload = {}) {
 }
 
 describe("Cloudflare Access assertion verification", () => {
+  it("allows new verified emails when public signup is explicitly enabled", async () => {
+    const publicConfig = { ...config, allowedEmails: [], allowPublicSignup: true };
+    expect(
+      await verifyAccessAssertion(await token({ email: "new@example.com" }), publicConfig, keys)
+    ).toEqual({ subject: "access-user-123", email: "new@example.com" });
+    expect(
+      await verifyAccessAssertion(await token({ email: "invalid" }), publicConfig, keys)
+    ).toBeNull();
+    expect(
+      await verifyAccessAssertion(await token({ aud: "wrong-app" }), publicConfig, keys)
+    ).toBeNull();
+    expect(await verifyAccessAssertion(null, publicConfig, keys)).toBeNull();
+  });
   it("accepts a signed application identity and normalizes its email", async () => {
     expect(
       await verifyAccessAssertion(await token({ email: "Allowed@Example.com" }), config, keys)
@@ -95,6 +109,17 @@ describe("Cloudflare Access assertion verification", () => {
 });
 
 describe("Access configuration and password-mode boundary", () => {
+  it("requires explicit public signup to omit an allowlist and rejects typos", () => {
+    vi.stubEnv("CF_ACCESS_TEAM_DOMAIN", config.teamDomain);
+    vi.stubEnv("CF_ACCESS_AUD", config.audience);
+    vi.stubEnv("CF_ACCESS_ALLOWED_EMAILS", "");
+    vi.stubEnv("CF_ACCESS_PUBLIC_SIGNUP", "false");
+    expect(() => accessConfig()).toThrow();
+    vi.stubEnv("CF_ACCESS_PUBLIC_SIGNUP", "true");
+    expect(accessConfig().allowPublicSignup).toBe(true);
+    vi.stubEnv("CF_ACCESS_PUBLIC_SIGNUP", "yes");
+    expect(() => accessConfig()).toThrow();
+  });
   it("requires explicit valid configuration and an email allowlist", () => {
     vi.stubEnv("CF_ACCESS_TEAM_DOMAIN", config.teamDomain);
     vi.stubEnv("CF_ACCESS_AUD", config.audience);

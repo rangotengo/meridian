@@ -38,8 +38,11 @@ available identity providers.
    entire `meridian.arunshrestha.info.np` hostname, including API paths.
 6. Select **Google** and **One-time PIN** explicitly as login methods. Turn off
    automatic redirect to an identity provider so the login page offers both.
-7. Add an **Allow** policy with an **Emails** rule listing the exact intended
-   addresses. Do not use Everyone, a whole public email domain, or a Bypass rule.
+7. For open registration, add an **Allow** policy with two **Include → Login
+   Methods** rules: **Google** and **One-time PIN**. Include rules are alternatives;
+   either provider can admit a verified user. Remove the previous email allowlist
+   policy if it is no longer needed. Never use a Bypass rule.
+   For a private deployment instead, use an **Emails** rule listing exact addresses.
 8. Copy the application's **Application Audience (AUD)** tag. This is public
    configuration, not a secret. Confirm Workers and Zero Trust use Free plans;
    the domain's Free Website plan alone does not establish that.
@@ -60,18 +63,29 @@ AUTH_MODE=cloudflare-access
 APP_URL=https://meridian.arunshrestha.info.np
 CF_ACCESS_TEAM_DOMAIN=rangotengo.cloudflareaccess.com
 CF_ACCESS_AUD=<Meridian application AUD>
-CF_ACCESS_ALLOWED_EMAILS=<comma-separated exact allowed email addresses>
+CF_ACCESS_PUBLIC_SIGNUP=true
 ```
 
-Use the same allowed email list in the application and the Access policy. Missing
-Access configuration fails closed. Requests without a valid signed assertion
+This enables anyone admitted by the Access policy to create their own household.
+For private registration, omit this flag and set `CF_ACCESS_ALLOWED_EMAILS` to the
+same comma-separated email list as the Access policy. An empty allowlist without
+explicit public signup fails closed. Requests without a valid signed assertion
 cannot use a Meridian session cookie as a fallback.
 
 The application verifies RS256 signatures against the team's public keys, issuer,
-audience, expiry, issuance time, application token type, subject, and email list.
+audience, expiry, issuance time, application token type, subject, and valid email.
+Private registration additionally enforces the email allowlist.
 It does not trust the plain `Cf-Access-Authenticated-User-Email` header. Unprotected
 alternate hostnames must be disabled at deployment; signed identity checks remain
 required even behind Access.
+
+Cloudflare Access Free supports up to 50 users; open registration does not remove
+that limit. Keep the Free plan to honor the $0 requirement. A larger public
+service would need another authentication design or a changed budget.
+See [Access pricing](https://www.cloudflare.com/plans/) and
+[login-method policies](https://developers.cloudflare.com/cloudflare-one/access-controls/policies/common-policies/).
+For public Google signup, the Google OAuth consent screen must also allow the
+intended audience rather than remaining limited to named test users.
 
 ## Account behavior
 
@@ -90,7 +104,8 @@ required even behind Access.
 ## Release checks
 
 Test email-code and Google login using the same email address; both must resolve
-to the same Access subject and Meridian account. Test an unlisted email, an
+to the same Access subject and Meridian account. Test a new email in public mode
+and rejection of an unlisted email in private mode. Also test an
 expired token, another application's token, missing assertion, password endpoint
 requests, invited-user onboarding, removal/rejoin, and logout in a real browser.
 Local automated tests cover token validation and database behavior; live provider

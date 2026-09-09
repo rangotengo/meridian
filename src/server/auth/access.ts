@@ -2,11 +2,14 @@ import { createRemoteJWKSet, jwtVerify, type JWTVerifyGetKey } from "jose";
 import { z } from "zod";
 import { errors } from "@/lib/errors";
 
-const accessSchema = z.object({
-  teamDomain: z.string().regex(/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.cloudflareaccess\.com$/),
-  audience: z.string().min(1).max(256),
-  allowedEmails: z.array(z.string().email()).min(1)
-});
+const accessSchema = z
+  .object({
+    teamDomain: z.string().regex(/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.cloudflareaccess\.com$/),
+    audience: z.string().min(1).max(256),
+    allowedEmails: z.array(z.string().email()),
+    allowPublicSignup: z.boolean().default(false)
+  })
+  .refine((config) => config.allowPublicSignup || config.allowedEmails.length > 0);
 
 export type AccessConfig = z.infer<typeof accessSchema>;
 export type AccessIdentity = { subject: string; email: string };
@@ -26,7 +29,10 @@ export function assertPasswordAuth(): void {
 }
 
 export function accessConfig(): AccessConfig {
+  const publicSignup = process.env.CF_ACCESS_PUBLIC_SIGNUP ?? "false";
   const parsed = accessSchema.safeParse({
+    allowPublicSignup:
+      publicSignup === "true" ? true : publicSignup === "false" ? false : publicSignup,
     teamDomain: process.env.CF_ACCESS_TEAM_DOMAIN,
     audience: process.env.CF_ACCESS_AUD,
     allowedEmails: (process.env.CF_ACCESS_ALLOWED_EMAILS ?? "")
@@ -36,7 +42,7 @@ export function accessConfig(): AccessConfig {
   });
   if (!parsed.success) {
     throw new Error(
-      "Cloudflare Access requires a team domain, application AUD, and allowed emails."
+      "Cloudflare Access requires a team domain, application AUD, and either allowed emails or explicit public signup."
     );
   }
   return parsed.data;
@@ -78,7 +84,8 @@ export async function verifyAccessAssertion(
       return null;
     if (typeof payload.iat !== "number" || payload.iat > Math.floor(Date.now() / 1000)) return null;
     const email = payload.email.trim().toLowerCase();
-    if (!config.allowedEmails.includes(email)) return null;
+    if (!z.string().email().safeParse(email).success) return null;
+    if (!config.allowPublicSignup && !config.allowedEmails.includes(email)) return null;
     return { subject: payload.sub, email };
   } catch {
     // Invalid claims/signatures and unavailable keys all fail closed. Never log the token.

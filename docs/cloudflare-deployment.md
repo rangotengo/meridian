@@ -13,8 +13,10 @@ working deployment configuration. The application still requires PostgreSQL.
   Website plan. This zone plan is separate from Workers and Zero Trust plans.
 - Use both Cloudflare Access One-time PIN and Google sign-in, with team domain
   `rangotengo.cloudflareaccess.com`. See [Access setup](./cloudflare-access.md).
-  The app-side integration is implemented. The supplied application AUD and an
-  initial owner-only allowlist are stored in ignored `.env.cloudflare.local`.
+  The app-side integration is implemented. The supplied application AUD and
+  explicit public-signup setting are stored in ignored `.env.cloudflare.local`.
+  Anyone with a verified identity can create a private household once the Access
+  policy allows both login methods. Access Free remains limited to 50 users.
   Live Google provider setup and deployed login verification are still pending.
 - Wrangler OAuth can access the zone and D1 list, but requests to the Access
   organization and account subscriptions APIs returned HTTP 403. Do not infer
