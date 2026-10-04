@@ -79,6 +79,20 @@ describe("Cloudflare SQLite storage", () => {
     });
   });
 
+  it("recalculates 500+ days of balances and bulk Sure imports on workerd", async () => {
+    const result = await probe("bulk-history");
+    expect(result.longHistoryDays).toBeGreaterThanOrEqual(400);
+    expect(result.imported).toMatchObject({
+      accounts: 1,
+      categories: 1,
+      tags: 3,
+      transactions: 320,
+      transfers: 0,
+      valuations: 0
+    });
+    expect(result.importBalanceDays).toBeGreaterThanOrEqual(400);
+    expect(result.latestImportBalanceMinor).toBe(10000);
+  }, 60000);
   it("imports a fresh household and persists encrypted MeroShare snapshots", async () => {
     const result = await probe("import-meroshare");
     expect(result.imported).toMatchObject({ accounts: 1, transactions: 1 });

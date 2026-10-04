@@ -24,6 +24,20 @@ import { createApiKey, verifyApiKey, revokeApiKey } from "../../src/server/domai
 import { parseSms } from "../../src/server/domain/sms-parser";
 import { matchAccountForSms } from "../../src/server/domain/account-matcher";
 
+function isoDaysAgo(days: number): string {
+  const d = new Date();
+  d.setUTCDate(d.getUTCDate() - days);
+  return d.toISOString().slice(0, 10);
+}
+
+function ddMmYy(iso: string): string {
+  return `${iso.slice(8, 10)}/${iso.slice(5, 7)}/${iso.slice(2, 4)}`;
+}
+
+function ddMmYyyy(iso: string): string {
+  return `${iso.slice(8, 10)}/${iso.slice(5, 7)}/${iso.slice(0, 4)}`;
+}
+
 export class StorageProbe {
   private db;
   private ready;
@@ -340,7 +354,9 @@ export class StorageProbe {
         sessionId: "",
         emailVerified: true
       };
-      const today = "2026-09-09";
+      // Dates are generated relative to the real clock so the balance
+      // recalculation span (and the test outcome) never depends on today.
+      const yesterday = isoDaysAgo(1);
 
       // Create Bank Accounts
       const laxmiAcct = await createAccount(exec, actor, {
@@ -348,7 +364,7 @@ export class StorageProbe {
         institution: "Laxmi Sunrise",
         type: "depository",
         currency: "NPR",
-        openedOn: today,
+        openedOn: yesterday,
         openingBalanceDisplayMinor: 50000,
         includedInReports: true,
         joint: false
@@ -358,7 +374,7 @@ export class StorageProbe {
         institution: "Nabil Bank",
         type: "depository",
         currency: "NPR",
-        openedOn: today,
+        openedOn: yesterday,
         openingBalanceDisplayMinor: 100000,
         includedInReports: true,
         joint: false
@@ -371,8 +387,9 @@ export class StorageProbe {
       const authenticatedActor = await verifyApiKey(exec, createdKey.rawKey);
 
       // 3. Process Laxmi Credit SMS
-      const laxmiText =
-        "Dear Customer, Your #88011052 has been credited by NPR 770.00 on 10/09/26. Remarks:FPQR-479651654-5834-24:FPQR-479651654-5834-24\n-Laxmi Sunrise";
+      const laxmiText = `Dear Customer, Your #88011052 has been credited by NPR 770.00 on ${ddMmYy(
+        yesterday
+      )}. Remarks:FPQR-479651654-5834-24:FPQR-479651654-5834-24\n-Laxmi Sunrise`;
       const parsedLaxmi = parseSms(laxmiText, "LAXMI");
       const matchLaxmi = await matchAccountForSms(exec, authenticatedActor!.familyId, {
         bankName: parsedLaxmi.bankName,
@@ -389,8 +406,9 @@ export class StorageProbe {
       });
 
       // 4. Process Nabil Debit SMS
-      const nabilText =
-        "Dear Customer, Your 110##02167 has been withdrawn by NPR 24,360.00 on 09/09/2026 14:13:30, Remarks: PREPAID CARD 150 T\nDownload App: https://rebrand.ly/nBank";
+      const nabilText = `Dear Customer, Your 110##02167 has been withdrawn by NPR 24,360.00 on ${ddMmYyyy(
+        yesterday
+      )} 14:13:30, Remarks: PREPAID CARD 150 T\nDownload App: https://rebrand.ly/nBank`;
       const parsedNabil = parseSms(nabilText, "Nabil_Alert");
       const matchNabil = await matchAccountForSms(exec, authenticatedActor!.familyId, {
         bankName: parsedNabil.bankName,
@@ -429,6 +447,131 @@ export class StorageProbe {
         nabilExpenseLogged: nabilEntry.duplicated === false,
         nabilDuplicated: nabilDup.duplicated === true,
         revokedBlocked: afterRevokeActor === null
+      });
+    }
+    if (operation === "/bulk-history") {
+      const exec = db as unknown as Executor;
+      const user = await registerAccessHousehold(
+        exec,
+        { subject: "bulk-history-user", email: "bulk-history@example.test" },
+        { name: "Bulk", familyName: "Bulk Family", currency: "NPR", timezone: "UTC" }
+      );
+      const actor: Actor = {
+        userId: user.id,
+        familyId: user.familyId,
+        email: user.email,
+        name: user.name,
+        familyRole: "admin",
+        platformRole: "user",
+        sessionId: "",
+        emailVerified: true
+      };
+
+      // 1) An account whose recalculation spans 500+ days of daily snapshots.
+      //    Before the parameter-limit fix this insert failed at 26 days.
+      const account = await createAccount(exec, actor, {
+        name: "Long History",
+        type: "depository",
+        currency: "NPR",
+        openedOn: isoDaysAgo(500),
+        openingBalanceDisplayMinor: 100000,
+        includedInReports: true,
+        joint: false
+      });
+      await addTransaction(exec, actor, {
+        accountId: account.accountId,
+        date: isoDaysAgo(450),
+        amountLedgerMinor: 1000,
+        name: "Backdated expense"
+      });
+      const balanceRows = await db.execute(
+        sql`SELECT CAST(count(*) AS INTEGER) AS count FROM balances WHERE account_id = ${account.accountId}`
+      );
+      const longHistoryDays = Number(balanceRows.rows[0]!.count);
+
+      // 2) A Sure import with hundreds of rows (tags, splits, backdated
+      //    transactions) into a separate empty household.
+      const importUser = await registerAccessHousehold(
+        exec,
+        { subject: "bulk-import-user", email: "bulk-import@example.test" },
+        { name: "Importer", familyName: "Import Family", currency: "NPR", timezone: "UTC" }
+      );
+      const importActor: Actor = {
+        userId: importUser.id,
+        familyId: importUser.familyId,
+        email: importUser.email,
+        name: importUser.name,
+        familyRole: "admin",
+        platformRole: "user",
+        sessionId: "",
+        emailVerified: true
+      };
+      const records: { type: string; data: Record<string, unknown> }[] = [
+        {
+          type: "Account",
+          data: {
+            id: "bulk-cash",
+            name: "Bulk Cash",
+            accountable_type: "Depository",
+            balance: "100.00",
+            currency: "NPR",
+            created_at: isoDaysAgo(600)
+          }
+        },
+        { type: "Category", data: { id: "c1", name: "Bulk category" } },
+        { type: "Tag", data: { id: "t1", name: "one" } },
+        { type: "Tag", data: { id: "t2", name: "two" } },
+        { type: "Tag", data: { id: "t3", name: "three" } }
+      ];
+      for (let i = 0; i < 300; i++) {
+        const base = {
+          id: `tx-${i}`,
+          account_id: "bulk-cash",
+          name: `Bulk transaction ${i}`,
+          amount: "1.00",
+          currency: "NPR",
+          date: isoDaysAgo(1 + (i % 400)),
+          category_id: "c1",
+          tag_ids: ["t1", "t2", "t3"]
+        };
+        if (i < 10) {
+          records.push({
+            type: "Transaction",
+            data: {
+              ...base,
+              split_lines: [
+                { amount: "0.50", name: `Split ${i}a` },
+                { amount: "0.50", name: `Split ${i}b` }
+              ]
+            }
+          });
+        } else {
+          records.push({ type: "Transaction", data: base });
+        }
+      }
+      const archive = records.map((record) => JSON.stringify(record)).join("\n");
+      const imported = await importSureExport(
+        exec,
+        importActor,
+        "all.ndjson",
+        new TextEncoder().encode(archive)
+      );
+      const importBalanceRows = await db.execute(
+        sql`SELECT CAST(count(*) AS INTEGER) AS count FROM balances b
+            JOIN accounts a ON a.id = b.account_id
+            WHERE a.family_id = ${importActor.familyId}`
+      );
+      const latestRows = await db.execute(
+        sql`SELECT CAST(balance_minor AS TEXT) AS balance_minor FROM balances b
+            JOIN accounts a ON a.id = b.account_id
+            WHERE a.family_id = ${importActor.familyId}
+            ORDER BY b.as_of DESC LIMIT 1`
+      );
+      return Response.json({
+        longHistoryDays,
+        imported,
+        importBalanceDays: Number(importBalanceRows.rows[0]!.count),
+        latestImportBalanceMinor: Number(latestRows.rows[0]!.balance_minor)
       });
     }
     return new Response("Unknown probe", { status: 404 });
