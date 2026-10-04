@@ -2,6 +2,7 @@ import { usesCloudStorage } from "@/server/db/dialect";
 import { inflateRawSync } from "node:zlib";
 import { eq, sql } from "drizzle-orm";
 import type { Executor } from "../db/client";
+import { chunkRows } from "../db/params";
 import {
   accounts,
   auditEvents,
@@ -430,10 +431,10 @@ async function insertTransaction(
     .values({ entryId: entry.id, categoryId: input.categoryId, merchant: input.merchant })
     .returning({ id: transactions.id });
   if (!transaction) throw errors.conflict("Could not import a Sure transaction.");
-  if (input.tagIds.length) {
+  for (const chunk of chunkRows(input.tagIds, 2)) {
     await exec
       .insert(transactionTags)
-      .values(input.tagIds.map((tagId) => ({ transactionId: transaction.id, tagId })));
+      .values(chunk.map((tagId) => ({ transactionId: transaction.id, tagId })));
   }
   return { entryId: entry.id, amountMinor: input.amountMinor };
 }

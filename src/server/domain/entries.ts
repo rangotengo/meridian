@@ -1,6 +1,7 @@
 import { caseInsensitiveLike } from "@/server/db/dialect";
 import { and, asc, desc, eq, exists, gte, inArray, lte, or, sql } from "drizzle-orm";
 import type { Executor } from "../db/client";
+import { chunkParams, chunkRows } from "../db/params";
 import { accounts, categories, entries, tags, transactionTags, transactions } from "../db/schema";
 import type { Actor } from "../auth/context";
 import {
@@ -59,10 +60,14 @@ async function assertCategoryInFamily(exec: Executor, familyId: string, category
 
 async function assertTagsInFamily(exec: Executor, familyId: string, tagIds: string[]) {
   if (tagIds.length === 0) return [];
-  const rows = await exec
-    .select({ id: tags.id })
-    .from(tags)
-    .where(and(inArray(tags.id, tagIds), eq(tags.familyId, familyId)));
+  const rows: { id: string }[] = [];
+  for (const chunk of chunkParams(tagIds)) {
+    const matched = await exec
+      .select({ id: tags.id })
+      .from(tags)
+      .where(and(inArray(tags.id, chunk), eq(tags.familyId, familyId)));
+    rows.push(...matched);
+  }
   if (rows.length !== new Set(tagIds).size) throw errors.validation("Unknown tag.");
   return rows.map((r) => r.id);
 }
@@ -111,9 +116,11 @@ export async function createTransactionEntry(
         .where(eq(transactions.entryId, eid))
         .limit(1);
       if (!txn) throw errors.conflict("Failed to create transaction for tags.");
-      await tx
-        .insert(transactionTags)
-        .values(tagIds.map((tagId) => ({ transactionId: txn.id, tagId })));
+      for (const chunk of chunkRows(tagIds, 2)) {
+        await tx
+          .insert(transactionTags)
+          .values(chunk.map((tagId) => ({ transactionId: txn.id, tagId })));
+      }
     }
     return eid;
   });
@@ -307,9 +314,11 @@ export async function updateTransactionEntry(
           .where(eq(transactions.entryId, entryId))
           .limit(1);
         if (txn) {
-          await tx
-            .insert(transactionTags)
-            .values(tagIds.map((tagId) => ({ transactionId: txn.id, tagId })));
+          for (const chunk of chunkRows(tagIds, 2)) {
+            await tx
+              .insert(transactionTags)
+              .values(chunk.map((tagId) => ({ transactionId: txn.id, tagId })));
+          }
         }
       }
     }
@@ -541,18 +550,21 @@ export async function listEntriesPage(
       ? { date: page[page.length - 1]!.date, id: page[page.length - 1]!.id }
       : null;
 
-  const tagRows = page.length
-    ? await exec.execute<{ entry_id: string; tag_id: string | null }>(sql`
-        SELECT e.id AS entry_id, tt.tag_id AS tag_id
-        FROM entries e
-        JOIN transactions t ON t.entry_id = e.id
-        LEFT JOIN transaction_tags tt ON tt.transaction_id = t.id
-        WHERE e.id IN (${sql.join(
-          page.map((p) => sql`${p.id}`),
-          sql`, `
-        )})
-      `)
-    : { rows: [] as { entry_id: string; tag_id: string | null }[] };
+  // Chunk the IN(...) list: cloud SQLite caps a statement at 100 parameters.
+  const tagRows: { rows: { entry_id: string; tag_id: string | null }[] } = { rows: [] };
+  for (const idChunk of chunkParams(page.map((p) => p.id))) {
+    const res = await exec.execute<{ entry_id: string; tag_id: string | null }>(sql`
+      SELECT e.id AS entry_id, tt.tag_id AS tag_id
+      FROM entries e
+      JOIN transactions t ON t.entry_id = e.id
+      LEFT JOIN transaction_tags tt ON tt.transaction_id = t.id
+      WHERE e.id IN (${sql.join(
+        idChunk.map((id) => sql`${id}`),
+        sql`, `
+      )})
+    `);
+    tagRows.rows.push(...(res.rows ?? []));
+  }
 
   const tagsByEntry = new Map<string, string[]>();
   for (const r of tagRows.rows ?? []) {

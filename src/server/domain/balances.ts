@@ -1,5 +1,6 @@
 import { sql } from "drizzle-orm";
 import type { Executor } from "../db/client";
+import { chunkParams, chunkRows } from "../db/params";
 import { balances as balancesTable } from "../db/schema";
 import { isValuationDriven } from "../authorization/access";
 import { addDays, diffDays, isIsoDate, minDate, todayIn } from "@/lib/datetime";
@@ -148,9 +149,9 @@ export async function recalculateAccount(
     await tx.execute(
       sql`DELETE FROM balances WHERE account_id = ${accountId} AND as_of >= ${start}`
     );
-    const chunkSize = 500;
-    for (let i = 0; i < rows.length; i += chunkSize) {
-      const chunk = rows.slice(i, i + chunkSize);
+    // Cloudflare SQLite caps one statement at 100 bound parameters, so chunk
+    // by the 4 balance columns (25 rows per statement on the cloud backend).
+    for (const chunk of chunkRows(rows, 4)) {
       await tx.insert(balancesTable).values(
         chunk.map((r) => ({
           accountId: r.accountId,
@@ -169,31 +170,34 @@ export async function latestBalancesFor(
 ): Promise<Map<string, { balanceMinor: number; asOf: string; currency: string }>> {
   const result = new Map<string, { balanceMinor: number; asOf: string; currency: string }>();
   if (!accountIds.length) return result;
-  const res = await exec.execute<{
-    account_id: string;
-    balance_minor: string;
-    as_of: string;
-    currency: string;
-  }>(sql`
-    SELECT
-      CAST(account_id AS TEXT) AS account_id,
-      CAST(balance_minor AS TEXT) AS balance_minor,
-      CAST(as_of AS TEXT) AS as_of,
-      currency
-    FROM balances b
-    WHERE as_of = (SELECT max(latest.as_of) FROM balances latest WHERE latest.account_id = b.account_id)
-    AND account_id IN (${sql.join(
-      accountIds.map((id) => sql`${id}`),
-      sql`, `
-    )})
-    ORDER BY account_id, as_of DESC
-  `);
-  for (const r of res.rows ?? []) {
-    result.set(r.account_id, {
-      balanceMinor: safeParseMinor(r.balance_minor),
-      asOf: r.as_of.slice(0, 10),
-      currency: r.currency
-    });
+  // Chunk the IN(...) list: cloud SQLite caps a statement at 100 parameters.
+  for (const idChunk of chunkParams(accountIds)) {
+    const res = await exec.execute<{
+      account_id: string;
+      balance_minor: string;
+      as_of: string;
+      currency: string;
+    }>(sql`
+      SELECT
+        CAST(account_id AS TEXT) AS account_id,
+        CAST(balance_minor AS TEXT) AS balance_minor,
+        CAST(as_of AS TEXT) AS as_of,
+        currency
+      FROM balances b
+      WHERE as_of = (SELECT max(latest.as_of) FROM balances latest WHERE latest.account_id = b.account_id)
+      AND account_id IN (${sql.join(
+        idChunk.map((id) => sql`${id}`),
+        sql`, `
+      )})
+      ORDER BY account_id, as_of DESC
+    `);
+    for (const r of res.rows ?? []) {
+      result.set(r.account_id, {
+        balanceMinor: safeParseMinor(r.balance_minor),
+        asOf: r.as_of.slice(0, 10),
+        currency: r.currency
+      });
+    }
   }
   return result;
 }

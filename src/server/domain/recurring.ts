@@ -1,5 +1,6 @@
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import type { Executor } from "../db/client";
+import { chunkParams } from "../db/params";
 import {
   accounts,
   categories,
@@ -330,31 +331,35 @@ export async function skipNextOccurrence(
 export async function listSeries(exec: Executor, actor: Actor) {
   const accountIds = await accessibleAccountIds(exec, actor);
   if (accountIds.length === 0) return [];
-  return exec
-    .select({
-      id: recurringSeries.id,
-      accountId: recurringSeries.accountId,
-      accountName: accounts.name,
-      name: recurringSeries.name,
-      merchant: recurringSeries.merchant,
-      amountMinor: recurringSeries.amountMinor,
-      currency: recurringSeries.currency,
-      categoryId: recurringSeries.categoryId,
-      frequency: recurringSeries.frequency,
-      config: recurringSeries.config,
-      nextDue: recurringSeries.nextDue,
-      active: recurringSeries.active,
-      accountStatus: accounts.status
-    })
-    .from(recurringSeries)
-    .innerJoin(accounts, eq(accounts.id, recurringSeries.accountId))
-    .where(
-      and(
-        eq(recurringSeries.familyId, actor.familyId),
-        inArray(recurringSeries.accountId, accountIds)
+  // Chunk the IN(...) list: cloud SQLite caps a statement at 100 parameters.
+  const series = [];
+  for (const chunk of chunkParams(accountIds)) {
+    const rows = await exec
+      .select({
+        id: recurringSeries.id,
+        accountId: recurringSeries.accountId,
+        accountName: accounts.name,
+        name: recurringSeries.name,
+        merchant: recurringSeries.merchant,
+        amountMinor: recurringSeries.amountMinor,
+        currency: recurringSeries.currency,
+        categoryId: recurringSeries.categoryId,
+        frequency: recurringSeries.frequency,
+        config: recurringSeries.config,
+        nextDue: recurringSeries.nextDue,
+        active: recurringSeries.active,
+        accountStatus: accounts.status
+      })
+      .from(recurringSeries)
+      .innerJoin(accounts, eq(accounts.id, recurringSeries.accountId))
+      .where(
+        and(eq(recurringSeries.familyId, actor.familyId), inArray(recurringSeries.accountId, chunk))
       )
-    )
-    .orderBy(asc(recurringSeries.nextDue));
+      .orderBy(asc(recurringSeries.nextDue));
+    series.push(...rows);
+  }
+  series.sort((a, b) => (a.nextDue < b.nextDue ? -1 : a.nextDue > b.nextDue ? 1 : 0));
+  return series;
 }
 
 export type PostResult = { posted: number; paused: number; failed: number };
