@@ -54,6 +54,26 @@ credentials unreadable. For initial setup, securely pipe a base64-encoded random
 32-byte key into `wrangler secret put MERO_SHARE_ENCRYPTION_KEY`; never commit it.
 Normal deployments preserve the existing secret.
 
+## Backups, restore and monitoring
+
+Since 2026-10-05 production has an operator-only maintenance surface gated by
+the `MERIDIAN_OPS_TOKEN` Worker secret (`wrangler secret put MERIDIAN_OPS_TOKEN`,
+rotatable freely). Requests to `/__meridian/ops/*` carrying the
+`x-meridian-ops-token` header reach the Durable Object; without the exact token
+those paths keep the stock 404. The `node bin/cloud-ops.mjs` CLI drives:
+
+- **Point-in-time recovery**: 30-day bookmarks (`status`, `bookmark` dry-run,
+  `restore` with offline undo-bookmark log and `ops.restore_*` audit events).
+  PITR needs Cloudflare's storage relay, so local preview answers 501 there.
+- **Logical snapshot export** of every application table for off-site,
+  operator-encrypted backups (ciphertext credential columns only, no secrets).
+- `/api/health` additionally reports `cron.lastTickAt`, the last successful
+  five-minute cron tick.
+
+Full procedures, rollback limits, secret rotation and incident response live in
+[runbook section 6](./RUNBOOKS.md#6-cloudflare-operations-production), including
+a free uptime check design (Access service token + free monitor).
+
 ## Verification
 
 - Production deployment and custom domain binding succeeded; HTTPS redirects to
