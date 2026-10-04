@@ -8,6 +8,6 @@ export default defineConfig({
     fileParallelism: false,
     testTimeout: 20000,
     hookTimeout: 60000,
-    include: ["tests/unit/cloud-storage.test.ts"]
+    include: ["tests/unit/cloud-storage.test.ts", "tests/unit/cloud-ops.test.ts"]
   }
 });
