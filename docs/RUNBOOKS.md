@@ -152,3 +152,122 @@ of deleting it (S14):
   and lets them set a new password.
 - Family admins cannot remove a platform super-admin; demote that account
   first (see section 4).
+
+---
+
+## 6. Cloudflare operations (production)
+
+Production runs OpenNext on a Cloudflare Worker with **all data in one
+SQLite-backed Durable Object** (`meridian-v1`, class `MeridianDatabase`).
+The PostgreSQL procedures in section 1 do not apply to it. Everything here
+stays on Free plans. See also [deployment notes](./cloudflare-deployment.md).
+
+### Operator access
+
+Set the Worker secret once (rotate freely, no data consequences):
+
+```bash
+openssl rand -base64 32            # generate
+npx wrangler secret put MERIDIAN_OPS_TOKEN
+```
+
+With the secret set, requests to `https://meridian.arunshrestha.info.np/__meridian/ops/*`
+carrying the header `x-meridian-ops-token: <secret>` reach the operator
+endpoints inside the Durable Object. Without the exact token, every
+`/__meridian/*` path is the stock 404; the object re-validates the token
+independently. Drive everything through `node bin/cloud-ops.mjs` (no npm
+script entry needed):
+
+```bash
+node bin/cloud-ops.mjs status
+node bin/cloud-ops.mjs bookmark --time 2026-10-04T12:00:00Z
+node bin/cloud-ops.mjs export --out meridian-backup.json
+node bin/cloud-ops.mjs restore --time 2026-10-04T12:00:00Z          # dry run only
+node bin/cloud-ops.mjs restore --time 2026-10-04T12:00:00Z --yes    # restores
+```
+
+### Deploy and rollback
+
+Deploy with `npm run cf:deploy`; Worker secrets persist across deploys.
+`npx wrangler rollback` (optionally with a version id) instantly reverts the
+Worker code. **Limits:** rollback touches code only — the Durable Object
+database keeps its data and already-applied migrations. Cloud migrations are
+forward-only (no down-scripts), so after rolling back to older code, newer
+schema may remain in the database. If that breaks the older code, follow with
+a PITR restore to a bookmark from before the offending deploy.
+
+### Point-in-time recovery (PITR)
+
+SQLite-backed Durable Objects retain 30 days of change history, so the object
+can be restored to any point in the last 30 days ([Cloudflare
+docs](https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/)).
+No paid service is involved. PITR is **not available in local preview**
+(miniflare keeps no change log; the endpoints report 501 there).
+
+Restore flow (`bin/cloud-ops.mjs restore`):
+
+1. Dry run resolves the target bookmark for a timestamp (or accepts an exact
+   `--bookmark`) and reports `undoBookmark` (the current state).
+2. With `--yes` the script records the undo bookmark to `logs/cloud-ops.jsonl`
+   **before** restoring — the restore wipes everything written after the
+   target bookmark, including in-database audit rows.
+3. The object writes an `ops.restore_started` audit event, hands the target
+   bookmark to storage, and aborts its session; it restarts at the bookmark.
+4. The script waits for the object to answer again, then writes
+   `ops.restore_completed` into the restored database.
+5. Undo: `node bin/cloud-ops.mjs restore --bookmark <undoBookmark> --yes`
+   (also within 30 days).
+
+**Restore drill** (run once before trusting PITR, then periodically): take an
+export, note the time, add a visible test transaction in the UI, restore to
+just before it, confirm it is gone, restore back with the undo bookmark,
+confirm it is back, and check `/api/health`. Local tests prove the
+orchestration; only this live drill proves an actual storage-relay restore.
+
+### Off-site logical backup (free)
+
+`node bin/cloud-ops.mjs export` streams every application table as JSON
+(`meridian-ops-export` v1). Credential columns are ciphertext; the export
+contains no Worker secrets. Encrypt and store offline, then delete the
+plaintext: `gpg --symmetric --output b.json.gpg b.json`. Suggested retention:
+7 daily, 4 weekly, 12 monthly, scheduled from any machine holding the ops
+token. PITR only covers 30 days; exports are the long-horizon record.
+**Note:** import-from-export is not implemented — exports are an offline
+record and partial manual-recovery aid, not a one-command restore.
+
+### Health and uptime monitoring
+
+`/api/health` reports `db`, `migrations`, `queue` (pending/running/completed/
+dead) and `cron.lastTickAt` — the last successful five-minute cron tick —
+plus mail configuration. HTTP 503 means failing DB, pending migrations.
+Cloudflare Access protects the whole hostname, so a plain external checker
+only sees the Access login. For a real check on a free plan: create an Access
+**service token** (Zero Trust → Service tokens), add an Allow rule for it to
+the Meridian Access application, and point a free uptime monitor
+(e.g. Better Stack or UptimeRobot) at `/api/health` sending the
+`CF-Access-Client-Id` / `CF-Access-Client-Secret` headers. Alert on non-200;
+to catch a stalled cron, use a keyword-capable monitor on `lastTickAt` or
+check `node bin/cloud-ops.mjs status` when investigating.
+
+### Secret rotation
+
+- `MERIDIAN_OPS_TOKEN`: rotate freely (`wrangler secret put ...`), then
+  update operator machines. No data consequences.
+- `MERO_SHARE_ENCRYPTION_KEY`: **do not rotate casually.** Replacing it makes
+  every stored MeroShare credential undecryptable; affected users must
+  re-enter credentials (there is no re-encryption path). If key compromise
+  forces rotation, expect every household using MeroShare to reconnect.
+- Access/Google OAuth secrets live in the Cloudflare/Google consoles, not in
+  the Worker.
+
+### Incident response
+
+1. Look at `/api/health` and `node bin/cloud-ops.mjs status` (queue depth,
+   last tick, table counts, current bookmark).
+2. Bad code: `npx wrangler rollback` (code only).
+3. Bad data: `bin/cloud-ops.mjs restore` to just before the incident
+   (dry-run first; undo bookmark is logged).
+4. Loss beyond 30 days: latest encrypted export is the only record; recovery
+   is manual.
+5. Write down what happened; `audit_events` keeps the `ops.restore_*` trail
+   for every restore performed.

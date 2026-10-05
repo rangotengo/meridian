@@ -1,74 +1,69 @@
 # Meridian production readiness checklist
 
-Reviewed 2026-09-08. This checklist reflects the current working tree. Items marked **Pending** must be completed or explicitly accepted before public production use.
+Reviewed 2026-10-05. Production runs on Cloudflare Free plans: Next.js via
+OpenNext on a Worker, **all data in one SQLite-backed Durable Object**
+(`meridian-v1`), Cloudflare Access in front. Deployed 2026-09-09 at
+https://meridian.arunshrestha.info.np with an empty database. PostgreSQL
+remains the local/docker backend only.
 
-## Release blockers
+## Done — architecture and code
 
-- [x] **Remove unsafe platform-admin promotion.** Resolved (S13). Signup and email verification never grant `super_admin`, even for addresses in `ADMIN_EMAILS` (covered by tests for verification enabled and disabled, and for invitations). Platform admins are granted only by the operator script `npm run admin:promote -- <email>`, which requires proven inbox ownership (a previously consumed verification or reset link) and otherwise issues a one-time verification link. `--demote` revokes.
+- [x] Database strategy: SQLite-backed Durable Object, no external database,
+      no paid services. Cloud migrations (`db/cloud-migrations`) apply
+      atomically when the object starts.
+- [x] Queue: five-minute Cron Trigger drives the in-object job queue with
+      retries, stale-job recovery, dedupe and dead-letter handling.
+- [x] Cloudflare compatibility: OpenNext deployment verified in staging and
+      production (Server Actions, auth, exports, scheduler not public).
+- [x] Auth: Cloudflare Access (Google + email codes) with full RS256
+      assertion validation; AUD pinned; public/private signup modes; password
+      flows disabled in Access mode.
+- [x] Backup and restore paths (2026-10-05): 30-day point-in-time recovery
+      via operator-only endpoints (`bin/cloud-ops.mjs`, gated by the
+      `MERIDIAN_OPS_TOKEN` Worker secret) with dry-run, undo bookmark logged
+      offline, and `ops.restore_*` audit events; free full-database logical
+      export for off-site encrypted storage. Runbook: docs/RUNBOOKS.md §6.
+- [x] Health endpoint: `/api/health` reports DB reachability, pending
+      migrations, queue stats (pending/running/completed/dead),
+      `cron.lastTickAt` (last successful five-minute tick) and mail config.
+- [x] Earlier release blockers: safe admin promotion (S13), member removal
+      (S14), currency-change safety (F13), fail-closed mailer configuration.
 
-- [x] **Define safe member-removal behavior.** Resolved (S14). Removal deactivates the member (`users.removed_at`, migration 0005) instead of deleting them. Owned accounts — including private accounts — and all entries, balances, transfers, and audit history are preserved under the deactivated owner. Sessions, auth tokens, and account shares (both directions) are revoked; removed members cannot sign in or be promoted. Re-inviting the email and accepting the emailed link reactivates the account. Tested: private-account access, linked transfers, balances, audit history, and guards (last admin, platform admin, non-admin).
+## Remaining operator tasks
 
-- [x] **Make currency changes financially safe.** Resolved (F13). A currency change with active budgets and no available conversion rate is rejected with an actionable error; conversion of active budgets and the currency update run in one transaction. Superseded budget history is left untouched. Regression tests cover all four paths.
+- [ ] Live sign-in drill: complete Google and email-code login in production
+      (login page verified 2026-09-09; interactive sign-in still untested).
+- [ ] First real household: create the operator account/household in
+      production and exercise one invitation link end to end.
+- [ ] Live MeroShare: connect and sync one real connection in production.
+- [ ] PITR restore drill in production (runbook §6): local tests prove the
+      orchestration; only a live drill proves the storage-relay restore.
+- [ ] Access **service token** for the Shortcuts API (mobile bank SMS
+      endpoint) so iPhone Shortcuts can call it non-interactively; add an
+      Allow rule for it in the Access application.
+- [ ] Free external uptime monitor on `/api/health` using the service-token
+      headers; alert on non-200 and on a stale `cron.lastTickAt`.
+- [ ] Schedule off-site encrypted exports (any machine with the ops token;
+      suggested 7 daily / 4 weekly / 12 monthly).
+- [ ] Browser E2E against a production-shaped environment: signup,
+      login/logout, invitations, member roles, private accounts, transfers,
+      splits, reports, exports/imports, recurring entries, MeroShare; plus
+      mobile layout, accessibility and large-export checks before wider use.
 
-- [x] **Configure and verify real email delivery (code side).** Resolved in code: the mailer fails closed — console transport is refused when `NODE_ENV=production`, and SMTP without `SMTP_URL`/`MAIL_FROM` refuses to start; `/api/health` reports the misconfiguration as `degraded`; docker-compose requires the mail settings explicitly. **Remaining operator task before public launch:** set `MAIL_TRANSPORT=smtp`, `SMTP_URL`, `MAIL_FROM`, production `APP_URL`, then verify verification/reset/invitation/email-change messages against a real recipient inbox with SPF/DKIM/DMARC passing (see `docs/RUNBOOKS.md` §3).
+## Accepted risks and limits
 
-- [x] **Make CI green.** The tree is fully Prettier-formatted; `format:check` passes. Lint, typecheck, tests, and production build verified locally on the formatted tree (see Current evidence).
-
-## Cloudflare decision and migration
-
-- [ ] **Choose the database strategy.** The application currently uses PostgreSQL and cannot use D1 by changing one environment variable. Decide between:
-  - PostgreSQL retained externally, optionally accessed through Cloudflare Hyperdrive; or
-  - a deliberate PostgreSQL-to-D1/SQLite port.
-
-- [ ] **If using D1, port the data model and SQL.** Replace PostgreSQL-only UUID casts, JSONB, numeric types, intervals, advisory locks, `FOR UPDATE SKIP LOCKED`, and PostgreSQL migrations while preserving money precision, ledger invariants, authorization filters, and transaction atomicity.
-
-- [ ] **Replace the long-running worker.** The current Node worker polls PostgreSQL continuously. Implement Cloudflare Queues consumers and scheduled triggers for email, recurring transactions, balance maintenance, cleanup, retries, deduplication, and dead-letter handling.
-
-- [ ] **Run the actual Cloudflare compatibility check.** Add Wrangler configuration and test either vinext or OpenNext. Verify `proxy.ts`, CSP nonces, Server Actions, authenticated dynamic pages, API routes, exports, and error handling on the deployed runtime. A successful `next build` is insufficient.
-
-- [ ] **Measure Workers limits.** Measure bundle size, cold starts, SSR/reporting CPU, password hashing CPU, imports, and large exports. The Workers Free CPU limit is 10 ms per HTTP request, so do not assume the free plan can run this workload.
-
-- [ ] **Make migrations deployment-safe.** Use deploy-time database migrations. If PostgreSQL is retained, acquire a dedicated connection for the entire advisory-lock lifecycle; pooled calls must not acquire and release a session lock on different connections.
-
-## Security and privacy
-
-- [ ] Set `NODE_ENV=production` and use a valid HTTPS `APP_URL`.
-- [ ] Generate and store a strong `MERO_SHARE_ENCRYPTION_KEY` if MeroShare is enabled.
-- [ ] Configure trusted proxy behavior only for the actual hosting path; verify rate limits use reliable client metadata.
-- [ ] Confirm session cookie security, logout/revocation, reset-token invalidation, email verification, and cross-family/account permission behavior through HTTP tests.
-- [ ] Confirm exports contain only accounts visible to the requesting actor and that private data is never cached by the service worker or edge cache.
-- [ ] Add abuse protection such as Turnstile to public signup, login, reset, and invitation endpoints if the app is internet-facing.
-- [ ] Review `ADMIN_EMAILS`, seed settings, debug logging, and all production secrets before deployment. Keep `SEED_DEMO=false`.
-
-## Data protection and operations
-
-- [ ] Create a production backup schedule and retention policy.
-- [ ] Store encrypted/off-site backups; R2 is suitable for export or backup objects, with access controls and lifecycle retention.
-- [ ] Perform a restore drill into an isolated database and verify ledger totals, balances, users, sessions, and audit records.
-- [ ] Configure `/api/health` monitoring and alerts for database failure, pending migrations, dead jobs, and mail failure.
-- [ ] Decide how logs and audit records are retained, accessed, and deleted.
-- [ ] Document rollback, migration rollback limits, secret rotation, incident response, and account recovery.
-- [ ] Test graceful shutdown and retry behavior for email, recurring jobs, MeroShare sync, imports, and exports.
-
-## Functional acceptance
-
-- [ ] Run browser end-to-end tests against a staging deployment, including signup, verification, login/logout, password reset, invitations, member roles, private accounts, transfers, splits, budgets, currency changes, reports, exports/imports, recurring entries, and MeroShare.
-- [ ] Test concurrent edits and retries for transfers, splits, imports, currency changes, and background jobs.
-- [ ] Test mobile layout, accessibility, error states, loading states, print/export output, and service-worker update/logout behavior.
-- [ ] Test with production-like data volume, including long account histories and large exports.
-- [ ] Confirm email deliverability, sender authentication (SPF/DKIM/DMARC), reset links, invitation links, and HTTPS redirects.
-
-## Current evidence
-
-- Production build: passed (`NODE_ENV=production next build`).
-- TypeScript: passed.
-- ESLint: passed.
-- Dependency audit: zero reported vulnerabilities.
-- Automated tests: 161 passed across 26 files against an isolated PostgreSQL test database (includes new S13/S14/F13 and mail-configuration suites).
-- Formatting gate: passing (`prettier --check .` clean after whole-tree format).
-- Cloudflare runtime/deployment: not yet configured or tested.
-- Browser end-to-end, real mail delivery, live MeroShare, production backup/restore, and Cloudflare limits: not yet verified.
+- Import-from-export restore is not implemented; PITR (30 days) is the
+  primary restore path and exports are the long-horizon offline record.
+- `MERO_SHARE_ENCRYPTION_KEY` rotation invalidates all stored MeroShare
+  credentials (no re-encryption path).
+- `wrangler rollback` reverts Worker code only; cloud migrations are
+  forward-only, so pair a rollback with a PITR restore when schema changed.
+- Free-plan ceilings (Durable Objects: 5 GB storage, 100k requests/day,
+  100k rows written/day) are ample for household scale; re-review before
+  admitting many households.
 
 ## Release gate
 
-Release only after every release blocker is resolved, the chosen Cloudflare architecture is tested in staging, the CI pipeline is green, a restore drill succeeds, and the functional acceptance suite passes against the deployed production-shaped environment.
+Public scale-up only after the operator tasks above are done, a live restore
+drill has succeeded, CI is green, and the browser E2E suite passes against
+the deployed environment.

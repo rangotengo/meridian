@@ -4,6 +4,14 @@ import { createCloudDatabase, type CloudStorage } from "./src/server/db/cloud/cl
 import { cloudDatabaseContext } from "./src/server/db/cloud/context";
 import { migrateCloudStorage } from "./src/server/db/cloud/migrate";
 import { getDb } from "./src/server/db/client";
+import {
+  ensureOpsStateTable,
+  handleOpsEndpoints,
+  OPS_BASE_PATH,
+  opsGate,
+  recordTick,
+  type OpsPitr
+} from "./cloudflare-ops";
 import { createJobRegistry, registerWorkerBootstraps } from "./src/server/queue/jobs";
 import {
   claimBatch,
@@ -17,9 +25,16 @@ interface WorkerEnv {
   MERIDIAN_DB: {
     getByName(name: string): { fetch(request: Request): Promise<Response> };
   };
+  /**
+   * Operator secret. When set, `/__meridian/ops/*` requests carrying it in
+   * the `x-meridian-ops-token` header are forwarded into the Durable Object
+   * for point-in-time recovery and snapshot exports. Unset → always 404.
+   */
+  MERIDIAN_OPS_TOKEN?: string;
 }
 interface ObjectContext {
-  storage: CloudStorage;
+  storage: CloudStorage & OpsPitr;
+  abort(message: string): void;
   waitUntil(promise: Promise<unknown>): void;
 }
 
@@ -31,13 +46,21 @@ export class MeridianDatabase {
     private readonly env: WorkerEnv
   ) {
     this.db = createCloudDatabase(ctx.storage);
-    this.ready = migrateCloudStorage(ctx.storage);
+    this.ready = migrateCloudStorage(ctx.storage).then(() => ensureOpsStateTable(ctx.storage));
   }
 
   async fetch(request: Request): Promise<Response> {
     await this.ready;
     return cloudDatabaseContext.run(this.db, async () => {
       const url = new URL(request.url);
+      if (url.hostname === "meridian.internal" && url.pathname.startsWith(`${OPS_BASE_PATH}/`)) {
+        return handleOpsEndpoints(request, {
+          db: this.db,
+          pitr: this.ctx.storage,
+          abort: (message) => this.ctx.abort(message),
+          token: this.env.MERIDIAN_OPS_TOKEN
+        });
+      }
       if (url.hostname === "meridian.internal" && url.pathname === "/__meridian/tick") {
         const db = getDb();
         await registerWorkerBootstraps(db);
@@ -60,6 +83,7 @@ export class MeridianDatabase {
           }
           completed++;
         }
+        await recordTick(this.db);
         return Response.json({ processed: completed });
       }
       return app.fetch(request, this.env, {
@@ -73,8 +97,10 @@ export class MeridianDatabase {
 }
 
 const worker = {
-  fetch(request: Request, env: WorkerEnv): Promise<Response> | Response {
+  async fetch(request: Request, env: WorkerEnv): Promise<Response> {
     const url = new URL(request.url);
+    const opsRequest = await opsGate(request, env.MERIDIAN_OPS_TOKEN);
+    if (opsRequest) return env.MERIDIAN_DB.getByName("meridian-v1").fetch(opsRequest);
     if (url.hostname === "meridian.internal" || url.pathname.startsWith("/__meridian/")) {
       return new Response("Not found", { status: 404 });
     }

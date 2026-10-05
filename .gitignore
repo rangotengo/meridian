@@ -28,3 +28,6 @@ vitest.config.ts.timestamp-*
 # Playwright MCP working artifacts
 .playwright-mcp/
 pg_review.log
+
+# Operator CLI restore/undo bookmark log (bin/cloud-ops.mjs)
+logs/
