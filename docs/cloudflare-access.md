@@ -112,3 +112,58 @@ Local automated tests cover token validation and database behavior. The operator
 confirmed both providers and the Allow policy; the production login page was
 verified to offer Google and email codes on 2026-09-09. Completing authentication
 with each provider still requires an interactive user.
+
+## Reaching /api/v1 from iOS Shortcuts with a service token
+
+The whole hostname sits behind the Meridian Access application, and this
+documentation never uses a Bypass rule. Automation clients such as iOS
+Shortcuts or Tasker cannot complete an interactive Google or email-code login,
+so machine access to `/api/v1/*` uses a Cloudflare Access **service token**
+at the edge plus a Meridian **API key** in the request itself. Both are
+required.
+
+### Create the service token
+
+1. In **Cloudflare Zero Trust → Access → Service Auth**, create a service
+   token named e.g. `meridian-shortcuts`. Record the generated
+   **Client ID** and **Client Secret**; the secret is shown once.
+2. Create a second **Self-hosted** Access application named e.g.
+   **Meridian API** covering the path `meridian.arunshrestha.info.np/api/v1`.
+3. Give it one policy: **Action: Service Auth**, **Include → Service Token**
+   selecting the token from step 1.
+4. Keep this path-scoped application above the hostname-wide Meridian
+   application in the application list. When several applications match a
+   URL, Cloudflare Access applies the one with the most specific path, so
+   `/api/v1/*` requests authenticate with the service token while everything
+   else still requires a user login. Never use a Bypass rule for this.
+
+See
+[service tokens](https://developers.cloudflare.com/cloudflare-one/identity/service-tokens/)
+and [path-scoped applications](https://developers.cloudflare.com/cloudflare-one/policies/access/apps/).
+
+### Configure the shortcut
+
+Send these headers on every call:
+
+```text
+CF-Access-Client-Id:     <service token Client ID>
+CF-Access-Client-Secret: <service token Client Secret>
+Authorization:           Bearer mr_live_<Meridian API key>
+Content-Type:            application/json
+```
+
+The Meridian API key is created in **Settings → API Keys & Shortcuts**. The
+service token satisfies Cloudflare at the edge; the API key authenticates the
+Meridian actor.
+
+### Why a service-token assertion cannot break these routes
+
+A service-token request carries a signed `CF-Access-JWT-assertion` whose
+subject is the service token ID and which has **no email**. That would fail
+the email-bearing identity checks used by browser login. The `/api/v1`
+routes never read that assertion: `authenticateApiRequest`
+(`src/server/auth/api-auth.ts`) authenticates solely with the Meridian API
+key and never calls `loadActor` or the Access JWT verification, so the
+service-token JWT is ignored rather than rejected. The API-key actor is also
+always downgraded to `platformRole: "user"`, so an API key can never reach
+admin functionality.

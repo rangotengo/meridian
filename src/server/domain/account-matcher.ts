@@ -1,6 +1,7 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import type { Executor } from "../db/client";
-import { accounts } from "../db/schema";
+import { accountShares, accounts } from "../db/schema";
+import type { Actor } from "../auth/context";
 
 export type AccountRow = typeof accounts.$inferSelect;
 
@@ -25,15 +26,71 @@ export type MatchAccountResult = {
     | "fallback_default";
 };
 
+// Permission levels that allow writing ledger entries to the account.
+const WRITABLE_SHARE_LEVELS = ["full_control", "read_write"];
+
+/**
+ * Resolves the accounts the given actor may write to within the family:
+ * joint accounts (no owner), accounts they own, and accounts shared to them
+ * with full_control or read_write. This mirrors the centralized access policy
+ * in src/server/authorization/access.ts.
+ */
+async function writableAccountsForActor(
+  exec: Executor,
+  familyId: string,
+  userId: string
+): Promise<AccountRow[]> {
+  const ownedOrJoint = await exec
+    .select()
+    .from(accounts)
+    .where(
+      and(
+        eq(accounts.familyId, familyId),
+        eq(accounts.status, "active"),
+        // ownerId null → joint account, full control for every family member.
+        sql`(${accounts.ownerId} IS NULL OR ${accounts.ownerId} = ${userId})`
+      )
+    );
+
+  const shared = await exec
+    .select({ account: accounts })
+    .from(accountShares)
+    .innerJoin(accounts, eq(accounts.id, accountShares.accountId))
+    .where(
+      and(
+        eq(accountShares.userId, userId),
+        eq(accounts.familyId, familyId),
+        eq(accounts.status, "active"),
+        inArray(accountShares.permission, WRITABLE_SHARE_LEVELS)
+      )
+    );
+
+  const seen = new Set<string>();
+  const out: AccountRow[] = [];
+  for (const row of [...ownedOrJoint, ...shared.map((s) => s.account)]) {
+    if (!seen.has(row.id)) {
+      seen.add(row.id);
+      out.push(row);
+    }
+  }
+  return out;
+}
+
 export async function matchAccountForSms(
   exec: Executor,
   familyId: string,
-  hints: MatchAccountHints
+  hints: MatchAccountHints,
+  actor?: Pick<Actor, "userId">
 ): Promise<MatchAccountResult | null> {
-  const allAccounts = await exec
-    .select()
-    .from(accounts)
-    .where(and(eq(accounts.familyId, familyId), eq(accounts.status, "active")));
+  // When an actor is supplied, matching is restricted to accounts that actor
+  // can write to (private accounts of other members are never selected, and
+  // read_only shares are skipped). Callers should always pass the actor.
+  const allAccounts = actor
+    ? await writableAccountsForActor(exec, familyId, actor.userId)
+    : await exec
+        .select()
+        .from(accounts)
+        .where(and(eq(accounts.familyId, familyId), eq(accounts.status, "active")));
 
   if (allAccounts.length === 0) {
     return null;
@@ -115,7 +172,7 @@ export async function matchAccountForSms(
     }
   }
 
-  // 6. Fallback: First depository (cash / checking) or first active account
+  // 6. Fallback: First depository (cash / checking) or first writable account
   const fallback = allAccounts.find((a) => a.type === "depository") || allAccounts[0];
 
   if (!fallback) {

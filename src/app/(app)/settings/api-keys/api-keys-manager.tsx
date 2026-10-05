@@ -10,13 +10,20 @@ import { Copy, Check, Key, Smartphone, Trash2, CheckCircle2 } from "lucide-react
 type ApiKeyItem = {
   id: string;
   name: string;
+  userName: string | null;
   keyPrefix: string;
   lastUsedAt: Date | null;
   revokedAt: Date | null;
   createdAt: Date;
 };
 
-export function ApiKeysManager({ keys }: { keys: ApiKeyItem[] }) {
+export function ApiKeysManager({
+  keys,
+  userName
+}: {
+  keys: ApiKeyItem[];
+  userName?: string | null;
+}) {
   const [state, formAction] = useActionState(createApiKeyAction, undefined);
   const [copiedKey, setCopiedKey] = useState(false);
   const [copiedCurl, setCopiedCurl] = useState(false);
@@ -103,9 +110,11 @@ export function ApiKeysManager({ keys }: { keys: ApiKeyItem[] }) {
       {/* Keys List */}
       <Card>
         <div className="mb-4">
-          <h3 className="text-sm font-semibold">Your API Keys</h3>
+          <h3 className="text-sm font-semibold">API Keys</h3>
           <p className="text-xs text-muted-foreground">
-            Keys grant full access to record transactions into your family ledger.
+            You see your own keys
+            {userName ? " and, as a family admin, every key in the household" : ""}. Keys grant
+            access to record transactions into the family ledger.
           </p>
         </div>
 
@@ -126,6 +135,7 @@ export function ApiKeysManager({ keys }: { keys: ApiKeyItem[] }) {
                     <div className="flex items-center gap-2">
                       <Key className="h-4 w-4 text-muted-foreground" />
                       <span className="font-medium">{k.name}</span>
+                      {k.userName && <Badge tone="neutral">{k.userName}</Badge>}
                       {isRevoked ? (
                         <Badge tone="destructive">Revoked</Badge>
                       ) : (

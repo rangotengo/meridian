@@ -17,7 +17,7 @@ export default async function ApiKeysPage() {
         title="API Keys & Shortcuts"
         subtitle="Manage access tokens for iOS Shortcuts, Android automation, and mobile bank SMS integrations."
       />
-      <ApiKeysManager keys={keys} />
+      <ApiKeysManager keys={keys} userName={actor.name} />
     </>
   );
 }
