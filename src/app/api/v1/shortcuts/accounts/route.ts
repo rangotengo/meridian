@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { authenticateApiRequest } from "@/server/auth/api-auth";
 import { accessibleAccountIds } from "@/server/authorization/access";
 import { getDb } from "@/server/db/client";
@@ -13,28 +13,20 @@ export async function GET(req: Request) {
 
     // Only accounts the actor can see (joint, owned, or explicitly shared) —
     // never other members' private accounts.
-    const visibleIds = await accessibleAccountIds(db, actor);
+    const visibleIds = new Set(await accessibleAccountIds(db, actor));
 
-    const userAccounts =
-      visibleIds.length === 0
-        ? []
-        : await db
-            .select({
-              id: accounts.id,
-              name: accounts.name,
-              institution: accounts.institution,
-              type: accounts.type,
-              currency: accounts.currency,
-              status: accounts.status
-            })
-            .from(accounts)
-            .where(
-              and(
-                eq(accounts.familyId, actor.familyId),
-                eq(accounts.status, "active"),
-                inArray(accounts.id, visibleIds)
-              )
-            );
+    const activeAccounts = await db
+      .select({
+        id: accounts.id,
+        name: accounts.name,
+        institution: accounts.institution,
+        type: accounts.type,
+        currency: accounts.currency,
+        status: accounts.status
+      })
+      .from(accounts)
+      .where(and(eq(accounts.familyId, actor.familyId), eq(accounts.status, "active")));
+    const userAccounts = activeAccounts.filter((a) => visibleIds.has(a.id));
 
     const userCategories = await db
       .select({
