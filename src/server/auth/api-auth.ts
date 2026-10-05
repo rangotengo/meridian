@@ -1,13 +1,13 @@
 import { verifyApiKey } from "@/server/domain/api-keys";
 import { getDb } from "@/server/db/client";
+import { usesCloudStorage } from "@/server/db/dialect";
 import { consumeRateLimit } from "@/server/security/rate-limit";
-import { hashToken } from "@/lib/crypto";
 import { DomainError } from "@/lib/errors";
 import type { Actor } from "./context";
 
-// Failed API key verifications are rate limited per client IP (or, when no
-// trusted IP is available, per presented token hash) to blunt brute-force
-// guessing of `mr_live_` keys.
+// Failed API key verifications are rate limited per client IP to blunt
+// brute-force guessing of `mr_live_` keys. Without a trustworthy IP all
+// failures share one bucket; valid keys are never counted, so they keep working.
 const FAILED_KEY_LIMIT = 20;
 const FAILED_KEY_WINDOW_SECONDS = 900;
 
@@ -29,6 +29,12 @@ export function extractApiKeyFromRequest(requestHeaders: Headers): string | null
 }
 
 function trustedClientKey(requestHeaders: Headers): string | null {
+  // On Workers every request passes through the Cloudflare edge, which
+  // overwrites CF-Connecting-IP; elsewhere the header is client-controlled.
+  if (usesCloudStorage) {
+    const edgeIp = requestHeaders.get("cf-connecting-ip");
+    if (edgeIp) return edgeIp;
+  }
   const trustProxy =
     process.env.TRUST_PROXY === "true" || process.env.TRUST_PROXY_HEADERS === "true";
   if (!trustProxy) return null;
@@ -66,7 +72,7 @@ export async function authenticateApiRequest(req: Request): Promise<Actor> {
 
   // Count the failure; once the window limit is exceeded this throws a 429
   // DomainError instead of the usual 401.
-  const clientKey = trustedClientKey(req.headers) ?? hashToken(token).slice(0, 16);
+  const clientKey = trustedClientKey(req.headers) ?? "unknown";
   await consumeRateLimit(
     db,
     `api-key-fail:${clientKey}`,
