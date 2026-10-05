@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import type { Executor } from "../db/client";
+import { chunkParams } from "../db/params";
 import {
   accounts,
   entries,
@@ -561,13 +562,15 @@ export async function listMeroShareConnections(exec: Executor, actor: Actor) {
       )
     );
   const meroAccountIds = rows.flatMap((row) => (row.meroAccount ? [row.meroAccount.id] : []));
-  const holdingRows = meroAccountIds.length
-    ? await exec
-        .select()
-        .from(meroShareHoldings)
-        .where(inArray(meroShareHoldings.meroShareAccountId, meroAccountIds))
-        .orderBy(meroShareHoldings.ticker)
-    : [];
+  const holdingRows: (typeof meroShareHoldings.$inferSelect)[] = [];
+  for (const chunk of chunkParams(meroAccountIds)) {
+    const rows = await exec
+      .select()
+      .from(meroShareHoldings)
+      .where(inArray(meroShareHoldings.meroShareAccountId, chunk))
+      .orderBy(meroShareHoldings.ticker);
+    holdingRows.push(...rows);
+  }
   const holdingsByAccount = new Map<string, (typeof meroShareHoldings.$inferSelect)[]>();
   for (const holding of holdingRows) {
     const values = holdingsByAccount.get(holding.meroShareAccountId) ?? [];
@@ -792,14 +795,24 @@ async function applySnapshot(
         .delete(meroShareHoldings)
         .where(eq(meroShareHoldings.meroShareAccountId, meroAccountId));
     } else {
-      await exec.execute(sql`
-        DELETE FROM mero_share_holdings
-        WHERE mero_share_account_id = ${meroAccountId}
-          AND ticker NOT IN (${sql.join(
-            snapshotAccount.holdings.map((holding) => sql`${holding.ticker}`),
-            sql`, `
-          )})
-      `);
+      // Compute the stale set in JS and delete it in parameter-bounded
+      // chunks: a NOT IN (...) list would exceed cloud SQLite's 100-param cap.
+      const keep = new Set(snapshotAccount.holdings.map((holding) => holding.ticker));
+      const existing = await exec
+        .select({ ticker: meroShareHoldings.ticker })
+        .from(meroShareHoldings)
+        .where(eq(meroShareHoldings.meroShareAccountId, meroAccountId));
+      const stale = existing.map((row) => row.ticker).filter((ticker) => !keep.has(ticker));
+      for (const chunk of chunkParams(stale)) {
+        await exec
+          .delete(meroShareHoldings)
+          .where(
+            and(
+              eq(meroShareHoldings.meroShareAccountId, meroAccountId),
+              inArray(meroShareHoldings.ticker, chunk)
+            )
+          );
+      }
     }
     for (const transaction of snapshotAccount.transactions) {
       await exec

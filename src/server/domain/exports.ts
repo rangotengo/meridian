@@ -1,5 +1,6 @@
 import { and, eq, inArray } from "drizzle-orm";
 import type { Executor } from "../db/client";
+import { chunkParams } from "../db/params";
 import {
   accountShares,
   accounts,
@@ -36,51 +37,57 @@ export async function buildFamilyExport(exec: Executor, actor: Actor): Promise<F
     .where(eq(categories.familyId, familyId));
   const tagRows = await exec.select().from(tags).where(eq(tags.familyId, familyId));
 
-  const entryRows =
-    visibleAccountIds.length > 0
-      ? await exec
-          .select({
-            entry: entries,
-            txnCategoryId: transactions.categoryId,
-            txnMerchant: transactions.merchant,
-            txnTransferId: transactions.transferId,
-            valuationKind: valuations.kind
-          })
-          .from(entries)
-          .innerJoin(accounts, eq(accounts.id, entries.accountId))
-          .leftJoin(transactions, eq(transactions.entryId, entries.id))
-          .leftJoin(valuations, eq(valuations.entryId, entries.id))
-          .where(and(eq(accounts.familyId, familyId), inArray(accounts.id, visibleAccountIds)))
-      : [];
+  // Chunk the IN(...) lists: cloud SQLite caps a statement at 100 parameters.
+  const entryRows = [];
+  for (const chunk of chunkParams(visibleAccountIds)) {
+    const rows = await exec
+      .select({
+        entry: entries,
+        txnCategoryId: transactions.categoryId,
+        txnMerchant: transactions.merchant,
+        txnTransferId: transactions.transferId,
+        valuationKind: valuations.kind
+      })
+      .from(entries)
+      .innerJoin(accounts, eq(accounts.id, entries.accountId))
+      .leftJoin(transactions, eq(transactions.entryId, entries.id))
+      .leftJoin(valuations, eq(valuations.entryId, entries.id))
+      .where(and(eq(accounts.familyId, familyId), inArray(accounts.id, chunk)));
+    entryRows.push(...rows);
+  }
 
-  const tagLinks =
-    entryRows.length > 0 && visibleAccountIds.length > 0
-      ? await exec
-          .select({ entryId: entries.id, tagId: transactionTags.tagId })
-          .from(transactionTags)
-          .innerJoin(transactions, eq(transactions.id, transactionTags.transactionId))
-          .innerJoin(entries, eq(entries.id, transactions.entryId))
-          .innerJoin(accounts, eq(accounts.id, entries.accountId))
-          .where(and(eq(accounts.familyId, familyId), inArray(accounts.id, visibleAccountIds)))
-      : [];
+  const tagLinks = [];
+  if (entryRows.length > 0) {
+    for (const chunk of chunkParams(visibleAccountIds)) {
+      const rows = await exec
+        .select({ entryId: entries.id, tagId: transactionTags.tagId })
+        .from(transactionTags)
+        .innerJoin(transactions, eq(transactions.id, transactionTags.transactionId))
+        .innerJoin(entries, eq(entries.id, transactions.entryId))
+        .innerJoin(accounts, eq(accounts.id, entries.accountId))
+        .where(and(eq(accounts.familyId, familyId), inArray(accounts.id, chunk)));
+      tagLinks.push(...rows);
+    }
+  }
 
   const memberRows = await exec
     .select({ id: users.id, email: users.email, name: users.name, role: users.familyRole })
     .from(users)
     .where(eq(users.familyId, familyId));
 
-  const shareRows =
-    visibleAccountIds.length > 0
-      ? await exec
-          .select({
-            accountId: accountShares.accountId,
-            userId: accountShares.userId,
-            permission: accountShares.permission
-          })
-          .from(accountShares)
-          .innerJoin(accounts, eq(accounts.id, accountShares.accountId))
-          .where(and(eq(accounts.familyId, familyId), inArray(accounts.id, visibleAccountIds)))
-      : [];
+  const shareRows = [];
+  for (const chunk of chunkParams(visibleAccountIds)) {
+    const rows = await exec
+      .select({
+        accountId: accountShares.accountId,
+        userId: accountShares.userId,
+        permission: accountShares.permission
+      })
+      .from(accountShares)
+      .innerJoin(accounts, eq(accounts.id, accountShares.accountId))
+      .where(and(eq(accounts.familyId, familyId), inArray(accounts.id, chunk)));
+    shareRows.push(...rows);
+  }
 
   const rateRows = await exec.select().from(exchangeRates);
 

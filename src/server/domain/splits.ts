@@ -1,5 +1,6 @@
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import type { Executor } from "../db/client";
+import { chunkParams, chunkRows } from "../db/params";
 import { categories, entries, tags, transactionTags, transactions } from "../db/schema";
 import type { Actor } from "../auth/context";
 import {
@@ -81,10 +82,14 @@ export async function splitEntry(
 
   const categoryIds = children.map((c) => c.categoryId).filter((id): id is string => !!id);
   if (categoryIds.length > 0) {
-    const matching = await exec
-      .select({ id: categories.id })
-      .from(categories)
-      .where(and(eq(categories.familyId, actor.familyId), inArray(categories.id, categoryIds)));
+    const matching: { id: string }[] = [];
+    for (const chunk of chunkParams(categoryIds)) {
+      const rows = await exec
+        .select({ id: categories.id })
+        .from(categories)
+        .where(and(eq(categories.familyId, actor.familyId), inArray(categories.id, chunk)));
+      matching.push(...rows);
+    }
     if (matching.length !== new Set(categoryIds).size) {
       throw errors.validation("One or more chosen categories do not belong to this family.");
     }
@@ -92,10 +97,14 @@ export async function splitEntry(
 
   const allTagIds = Array.from(new Set(children.flatMap((c) => c.tagIds ?? [])));
   if (allTagIds.length > 0) {
-    const validTags = await exec
-      .select({ id: tags.id })
-      .from(tags)
-      .where(and(eq(tags.familyId, actor.familyId), inArray(tags.id, allTagIds)));
+    const validTags: { id: string }[] = [];
+    for (const chunk of chunkParams(allTagIds)) {
+      const rows = await exec
+        .select({ id: tags.id })
+        .from(tags)
+        .where(and(eq(tags.familyId, actor.familyId), inArray(tags.id, chunk)));
+      validTags.push(...rows);
+    }
     if (validTags.length !== allTagIds.length) {
       throw errors.validation("One or more chosen tags do not belong to this family.");
     }
@@ -127,12 +136,14 @@ export async function splitEntry(
         .returning({ id: transactions.id });
 
       if (child.tagIds && child.tagIds.length > 0) {
-        await tx.insert(transactionTags).values(
-          child.tagIds.map((tagId) => ({
-            transactionId: childTxn!.id,
-            tagId
-          }))
-        );
+        for (const chunk of chunkRows(child.tagIds, 2)) {
+          await tx.insert(transactionTags).values(
+            chunk.map((tagId) => ({
+              transactionId: childTxn!.id,
+              tagId
+            }))
+          );
+        }
       }
     }
   });

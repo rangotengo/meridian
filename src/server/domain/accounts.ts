@@ -1,5 +1,6 @@
 import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import type { Executor } from "../db/client";
+import { chunkParams } from "../db/params";
 import { accountShares, accounts, entries, users } from "../db/schema";
 import type { Actor } from "../auth/context";
 import {
@@ -375,9 +376,13 @@ export async function familyMemberOptions(exec: Executor, familyId: string) {
 
 export async function accountsExistForFamily(exec: Executor, familyId: string, ids: string[]) {
   if (ids.length === 0) return true;
-  const rows = await exec
-    .select({ id: accounts.id })
-    .from(accounts)
-    .where(and(eq(accounts.familyId, familyId), inArray(accounts.id, ids)));
-  return rows.length === ids.length;
+  let matched = 0;
+  for (const chunk of chunkParams(ids)) {
+    const rows = await exec
+      .select({ id: accounts.id })
+      .from(accounts)
+      .where(and(eq(accounts.familyId, familyId), inArray(accounts.id, chunk)));
+    matched += rows.length;
+  }
+  return matched === ids.length;
 }
