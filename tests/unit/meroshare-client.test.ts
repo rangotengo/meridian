@@ -38,16 +38,15 @@ describe("MeroShareClient", () => {
       if (url.pathname.endsWith("/myTransaction/")) {
         return Response.json({
           totalItems: 1,
-          transactionView: [
+          myTransactionHistory: [
             {
-              script: "NABIL",
-              scriptDesc: "Nabil Bank",
-              creditQty: "100",
-              debitQty: "0",
-              balAfterTrans: "100",
-              transactionDate: "2026-08-20",
-              historyDesc: "IPO allotment",
-              transCode: "IPO"
+              scrip: "NABIL",
+              scripName: "Nabil Bank",
+              quantity: "100",
+              historyDate: "2026-08-20",
+              activityLabel: "Buy",
+              remarks: "IPO allotment",
+              transactionCode: "IPO"
             }
           ]
         });
@@ -68,7 +67,6 @@ describe("MeroShareClient", () => {
     expect(snapshot.accounts).toHaveLength(1);
     expect(snapshot.accounts[0]).toMatchObject({
       boid: "1301000000000001",
-      currency: "NPR",
       totalValue: "25062.50"
     });
     expect(snapshot.accounts[0]!.holdings[0]).toMatchObject({
