@@ -41,6 +41,14 @@ const baseUrl = (
 const token = opt("token") ?? process.env.MERIDIAN_OPS_TOKEN;
 if (!token) die("Set the MERIDIAN_OPS_TOKEN Worker secret in the environment or pass --token.");
 const headers = { "x-meridian-ops-token": token };
+// Cloudflare Access guards the whole hostname, so production calls also need
+// an Access service token; without one Access answers with its login page.
+const accessId = process.env.CF_ACCESS_CLIENT_ID;
+const accessSecret = process.env.CF_ACCESS_CLIENT_SECRET;
+if (accessId && accessSecret) {
+  headers["CF-Access-Client-Id"] = accessId;
+  headers["CF-Access-Client-Secret"] = accessSecret;
+}
 
 async function call(pathname, init = {}) {
   const response = await fetch(`${baseUrl}${pathname}`, {

@@ -175,8 +175,11 @@ With the secret set, requests to `https://meridian.arunshrestha.info.np/__meridi
 carrying the header `x-meridian-ops-token: <secret>` reach the operator
 endpoints inside the Durable Object. Without the exact token, every
 `/__meridian/*` path is the stock 404; the object re-validates the token
-independently. Drive everything through `node bin/cloud-ops.mjs` (no npm
-script entry needed):
+independently. Cloudflare Access still sits in front of these paths, so also
+create an Access service token with an Allow rule (see the uptime section
+below) and export it as `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET`
+before running the CLI. Drive everything through `node bin/cloud-ops.mjs`
+(no npm script entry needed):
 
 ```bash
 node bin/cloud-ops.mjs status
