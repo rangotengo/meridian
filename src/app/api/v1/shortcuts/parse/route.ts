@@ -1,16 +1,39 @@
 import { NextResponse } from "next/server";
+import { z } from "zod";
 import { authenticateApiRequest } from "@/server/auth/api-auth";
 import { getDb } from "@/server/db/client";
 import { parseSms } from "@/server/domain/sms-parser";
 import { matchAccountForSms } from "@/server/domain/account-matcher";
+import { apiErrorResponse, guardMutatingRequest, readJsonBody } from "../http";
+
+const bodySchema = z.object({
+  rawSms: z.string().max(4000).optional(),
+  sms: z.string().max(4000).optional(),
+  message: z.string().max(4000).optional(),
+  body: z.string().max(4000).optional(),
+  sender: z.string().max(100).optional(),
+  from: z.string().max(100).optional(),
+  accountId: z.string().uuid().optional(),
+  bank: z.string().max(120).optional()
+});
 
 export async function POST(req: Request) {
   try {
-    const actor = await authenticateApiRequest(req);
-    const body = await req.json().catch(() => ({}));
+    const guard = guardMutatingRequest(req);
+    if (guard) return guard;
 
-    const rawSms = (body.rawSms ?? body.sms ?? body.message ?? body.body ?? "").toString().trim();
-    const sender = (body.sender ?? body.from ?? "").toString().trim();
+    const actor = await authenticateApiRequest(req);
+    const bodyResult = await readJsonBody(req);
+    if (!bodyResult.ok) return bodyResult.res;
+
+    const parsedBody = bodySchema.safeParse(bodyResult.data);
+    if (!parsedBody.success) {
+      return NextResponse.json({ ok: false, error: "Invalid request body." }, { status: 400 });
+    }
+    const body = parsedBody.data;
+
+    const rawSms = (body.rawSms ?? body.sms ?? body.message ?? body.body ?? "").trim();
+    const sender = (body.sender ?? body.from ?? "").trim();
 
     if (!rawSms) {
       return NextResponse.json(
@@ -21,14 +44,19 @@ export async function POST(req: Request) {
 
     const parsed = parseSms(rawSms, sender || null);
     const db = getDb();
-    const match = await matchAccountForSms(db, actor.familyId, {
-      preferredAccountId: body.accountId || null,
-      bankName: body.bank || parsed.bankName || null,
-      accountDigits: parsed.accountDigits,
-      accountNumber: parsed.accountNumber,
-      sender: sender || null,
-      rawText: rawSms
-    });
+    const match = await matchAccountForSms(
+      db,
+      actor.familyId,
+      {
+        preferredAccountId: body.accountId ?? null,
+        bankName: body.bank || parsed.bankName || null,
+        accountDigits: parsed.accountDigits,
+        accountNumber: parsed.accountNumber,
+        sender: sender || null,
+        rawText: rawSms
+      },
+      actor
+    );
 
     return NextResponse.json({
       ok: true,
@@ -38,6 +66,7 @@ export async function POST(req: Request) {
         currency: parsed.currency,
         kind: parsed.kind,
         date: parsed.date,
+        dateExplicit: parsed.dateExplicit,
         accountNumber: parsed.accountNumber,
         accountDigits: parsed.accountDigits,
         bankName: parsed.bankName,
@@ -55,8 +84,6 @@ export async function POST(req: Request) {
         : null
     });
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : "Internal server error.";
-    const status = msg.includes("unauthorized") || msg.includes("API key") ? 401 : 500;
-    return NextResponse.json({ ok: false, error: msg }, { status });
+    return apiErrorResponse(err, "shortcuts.parse");
   }
 }

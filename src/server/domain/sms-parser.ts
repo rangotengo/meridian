@@ -1,4 +1,5 @@
 import { hashToken } from "@/lib/crypto";
+import { currencyExponent } from "@/lib/money";
 
 export type ParsedSmsResult = {
   amountMinor: number;
@@ -6,6 +7,7 @@ export type ParsedSmsResult = {
   currency: string;
   kind: "expense" | "income";
   date: string; // YYYY-MM-DD
+  dateExplicit: boolean; // true when the SMS itself carried a parseable date
   accountNumber: string | null;
   accountDigits: string | null; // Just the unmasked digits for matching
   bankName: string | null;
@@ -93,6 +95,26 @@ function getTodayIso(): string {
   return `${y}-${m}-${d}`;
 }
 
+/**
+ * Converts a decimal amount string to minor units using the currency's real
+ * exponent (e.g. 0 for JPY/KRW, 3 for BHD) instead of assuming two decimals.
+ * Extra precision beyond the exponent is rounded half away from zero.
+ */
+export function amountTextToMinor(text: string, currency: string): number {
+  const exp = currencyExponent(currency);
+  const cleaned = text.replace(/[\s,]/g, "");
+  const negative = cleaned.startsWith("-");
+  const unsigned = negative ? cleaned.slice(1) : cleaned;
+  const [whole = "0", fracRaw = ""] = unsigned.split(".");
+  // One extra digit beyond the exponent decides rounding.
+  const padded = (fracRaw + "0".repeat(exp + 1)).slice(0, exp + 1);
+  const kept = exp === 0 ? 0 : Number(padded.slice(0, exp));
+  const roundDigit = Number(padded.slice(exp, exp + 1) || "0");
+  let minor = Number(whole || "0") * 10 ** exp + kept;
+  if (roundDigit >= 5) minor += 1;
+  return negative ? -minor : minor;
+}
+
 export function parseSms(text: string, sender?: string | null): ParsedSmsResult {
   const clean = text.trim();
 
@@ -123,15 +145,17 @@ export function parseSms(text: string, sender?: string | null): ParsedSmsResult 
   else if (/\b(eur|€)\b/i.test(clean)) currency = "EUR";
   else if (/\b(gbp|£)\b/i.test(clean)) currency = "GBP";
   else if (/\b(inr|₹)\b/i.test(clean)) currency = "INR";
+  else if (/\b(jpy|¥)\b/i.test(clean)) currency = "JPY";
   else if (/\b(npr|rs\.?|nrs\.?|रू)\b/i.test(clean)) currency = "NPR";
 
   let amountMajor = 0;
+  let amountText: string | null = null;
 
   // Specific regex for action + amount or amount + action
   const actionAmountRegexes = [
-    /(?:credited|debited|withdrawn|deposited|charged|spent|received|paid)\s+(?:by|for|of)?\s*(?:NPR|Rs\.?|NRs\.?|INR|USD|\$|EUR|€|GBP|£)?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)/i,
-    /(?:NPR|Rs\.?|NRs\.?|INR|USD|\$|EUR|€|GBP|£)\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)\s*(?:has been\s+)?(?:credited|debited|withdrawn|deposited|charged|spent|received|paid)/i,
-    /(?:NPR|Rs\.?|NRs\.?|INR|USD|\$|EUR|€|GBP|£)\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)/i
+    /(?:credited|debited|withdrawn|deposited|charged|spent|received|paid)\s+(?:by|for|of)?\s*(?:NPR|Rs\.?|NRs\.?|INR|JPY|¥|USD|\$|EUR|€|GBP|£)?\s*([0-9]+(?:,[0-9]{3})*(?:\.[0-9]{1,4})?)/i,
+    /(?:NPR|Rs\.?|NRs\.?|INR|JPY|¥|USD|\$|EUR|€|GBP|£)\s*([0-9]+(?:,[0-9]{3})*(?:\.[0-9]{1,4})?)\s*(?:has been\s+)?(?:credited|debited|withdrawn|deposited|charged|spent|received|paid)/i,
+    /(?:NPR|Rs\.?|NRs\.?|INR|JPY|¥|USD|\$|EUR|€|GBP|£)\s*([0-9]+(?:,[0-9]{3})*(?:\.[0-9]{1,4})?)/i
   ];
 
   for (const regex of actionAmountRegexes) {
@@ -140,6 +164,7 @@ export function parseSms(text: string, sender?: string | null): ParsedSmsResult 
       const parsedNum = parseFloat(match[1].replace(/,/g, ""));
       if (!isNaN(parsedNum) && parsedNum > 0) {
         amountMajor = parsedNum;
+        amountText = match[1];
         break;
       }
     }
@@ -150,17 +175,24 @@ export function parseSms(text: string, sender?: string | null): ParsedSmsResult 
     const fallback = clean.match(/\b([0-9]{1,3}(?:,[0-9]{3})*\.[0-9]{2})\b/);
     if (fallback?.[1]) {
       amountMajor = parseFloat(fallback[1].replace(/,/g, ""));
+      amountText = fallback[1];
     }
   }
 
-  const amountMinor = Math.round(amountMajor * 100);
+  // Minor units derived with the detected currency's real exponent
+  // (e.g. JPY has 0 decimals, so "JPY 1000" is 1000 minor, not 100000).
+  const amountMinor = amountText ? amountTextToMinor(amountText, currency) : 0;
 
   // 3. Extract Date
   let date = getTodayIso();
+  let dateExplicit = false;
   const dateMatch = clean.match(/(?:on|dated)?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})/i);
   if (dateMatch?.[1]) {
     const normalized = normalizeDate(dateMatch[1]);
-    if (normalized) date = normalized;
+    if (normalized) {
+      date = normalized;
+      dateExplicit = true;
+    }
   }
 
   // 4. Extract Account Number / Identifier
@@ -209,7 +241,7 @@ export function parseSms(text: string, sender?: string | null): ParsedSmsResult 
   let referenceId: string | null = null;
   let merchant: string | null = null;
 
-  const remarksMatch = clean.match(/Remarks\s*:\s*([^\\r\\n]+)/i);
+  const remarksMatch = clean.match(/Remarks\s*:\s*([^\r\n]+)/i);
   if (remarksMatch?.[1]) {
     remarks = remarksMatch[1]
       .replace(/Download\s+App:.*$/i, "")
@@ -253,6 +285,7 @@ export function parseSms(text: string, sender?: string | null): ParsedSmsResult 
     currency,
     kind,
     date,
+    dateExplicit,
     accountNumber,
     accountDigits,
     bankName,

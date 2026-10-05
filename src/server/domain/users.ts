@@ -1,7 +1,15 @@
 import { mergeJson } from "@/server/db/dialect";
 import { and, desc, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
 import type { Executor } from "../db/client";
-import { accountShares, accounts, authTokens, families, sessions, users } from "../db/schema";
+import {
+  accountShares,
+  accounts,
+  apiKeys,
+  authTokens,
+  families,
+  sessions,
+  users
+} from "../db/schema";
 import type { Actor } from "../auth/context";
 import { hashPassword, passwordPolicyError, verifyPassword } from "@/lib/crypto";
 import { errors } from "@/lib/errors";
@@ -423,11 +431,16 @@ export async function removeMember(
       .set({ removedAt: new Date(), updatedAt: new Date() })
       .where(eq(users.id, targetUserId));
 
-    // Revoke every access path for the removed member: their sessions and
-    // tokens, shares granted to them, and shares on the accounts they own
-    // (those accounts are archived under the deactivated owner).
+    // Revoke every access path for the removed member: their sessions,
+    // tokens, and API keys, shares granted to them, and shares on the
+    // accounts they own (those accounts are archived under the deactivated
+    // owner).
     await tx.delete(sessions).where(eq(sessions.userId, targetUserId));
     await tx.delete(authTokens).where(eq(authTokens.userId, targetUserId));
+    await tx
+      .update(apiKeys)
+      .set({ revokedAt: new Date(), updatedAt: new Date() })
+      .where(and(eq(apiKeys.userId, targetUserId), isNull(apiKeys.revokedAt)));
     await tx.delete(accountShares).where(eq(accountShares.userId, targetUserId));
     await tx
       .delete(accountShares)

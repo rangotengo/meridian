@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseSms } from "@/server/domain/sms-parser";
+import { parseSms, amountTextToMinor } from "@/server/domain/sms-parser";
 
 describe("sms-parser", () => {
   it("parses Laxmi Sunrise credit SMS correctly", () => {
@@ -51,5 +51,41 @@ Siddhartha Bank`;
     expect(parsed.accountDigits).toBe("9850");
     expect(parsed.remarks).toContain("Fund Trf frm NABIL BANK LTD");
     expect(parsed.referenceId).toContain("178894247201261c");
+  });
+
+  it("marks whether the date came from the SMS itself", () => {
+    const withDate = parseSms("Dear Customer, NPR 500.00 debited on 09/09/2026", "SBL");
+    expect(withDate.dateExplicit).toBe(true);
+    expect(withDate.date).toBe("2026-09-09");
+
+    const withoutDate = parseSms("Dear Customer, NPR 500.00 debited", "SBL");
+    expect(withoutDate.dateExplicit).toBe(false);
+    expect(withoutDate.date).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+  });
+});
+
+describe("sms-parser currency exponents", () => {
+  it("derives minor units with the currency's real exponent (JPY = 0)", () => {
+    const parsed = parseSms("Your account has been debited by JPY 1000 for train ticket", "NBL");
+    expect(parsed.currency).toBe("JPY");
+    expect(parsed.amountMinor).toBe(1000);
+    expect(parsed.amountMajor).toBe(1000);
+  });
+
+  it("keeps cents for two-decimal currencies", () => {
+    const parsed = parseSms("Your account has been credited by USD 10.50", "NBL");
+    expect(parsed.currency).toBe("USD");
+    expect(parsed.amountMinor).toBe(1050);
+  });
+
+  it("rounds sub-minor precision half away from zero", () => {
+    expect(amountTextToMinor("100.999", "NPR")).toBe(10100);
+    expect(amountTextToMinor("100.994", "NPR")).toBe(10099);
+    expect(amountTextToMinor("2.5", "JPY")).toBe(3);
+    expect(amountTextToMinor("2.4", "JPY")).toBe(2);
+  });
+
+  it("handles thousands separators", () => {
+    expect(amountTextToMinor("24,360.00", "NPR")).toBe(2436000);
   });
 });

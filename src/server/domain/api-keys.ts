@@ -71,15 +71,29 @@ export async function createApiKey(
   };
 }
 
-export async function listApiKeysForActor(
-  exec: Executor,
-  actor: Actor
-): Promise<
-  Array<Pick<ApiKeyRow, "id" | "name" | "keyPrefix" | "lastUsedAt" | "revokedAt" | "createdAt">>
-> {
-  return exec
+export type ApiKeySummary = {
+  id: string;
+  userId: string;
+  userName: string | null;
+  name: string;
+  keyPrefix: string;
+  lastUsedAt: Date | null;
+  revokedAt: Date | null;
+  createdAt: Date;
+};
+
+export async function listApiKeysForActor(exec: Executor, actor: Actor): Promise<ApiKeySummary[]> {
+  // Members see only their own keys; family admins see every key in the family.
+  const scope =
+    actor.familyRole === "admin"
+      ? eq(apiKeys.familyId, actor.familyId)
+      : and(eq(apiKeys.familyId, actor.familyId), eq(apiKeys.userId, actor.userId));
+
+  const rows = await exec
     .select({
       id: apiKeys.id,
+      userId: apiKeys.userId,
+      userName: users.name,
       name: apiKeys.name,
       keyPrefix: apiKeys.keyPrefix,
       lastUsedAt: apiKeys.lastUsedAt,
@@ -87,8 +101,20 @@ export async function listApiKeysForActor(
       createdAt: apiKeys.createdAt
     })
     .from(apiKeys)
-    .where(eq(apiKeys.familyId, actor.familyId))
+    .leftJoin(users, eq(users.id, apiKeys.userId))
+    .where(scope)
     .orderBy(desc(apiKeys.createdAt));
+
+  return rows.map((r) => ({
+    id: r.id,
+    userId: r.userId,
+    userName: r.userName ?? null,
+    name: r.name,
+    keyPrefix: r.keyPrefix,
+    lastUsedAt: r.lastUsedAt ? new Date(r.lastUsedAt) : null,
+    revokedAt: r.revokedAt ? new Date(r.revokedAt) : null,
+    createdAt: new Date(r.createdAt)
+  }));
 }
 
 export async function revokeApiKey(exec: Executor, actor: Actor, keyId: string): Promise<void> {
@@ -99,7 +125,13 @@ export async function revokeApiKey(exec: Executor, actor: Actor, keyId: string):
     .limit(1);
 
   if (!key) {
-    throw errors.notFound("API key not found.");
+    throw errors.notFound("API key");
+  }
+
+  // Only the key's owner or a family admin may revoke it. Report a missing key
+  // rather than a permission error so key ids of other members are not enumerable.
+  if (key.userId !== actor.userId && actor.familyRole !== "admin") {
+    throw errors.notFound("API key");
   }
 
   if (key.revokedAt) {
@@ -150,12 +182,15 @@ export async function verifyApiKey(exec: Executor, rawKey: string): Promise<Acto
     return null;
   }
 
+  // API keys never carry the platform super-admin role: an operator who is a
+  // platform admin must not be able to reach admin-only functionality by
+  // presenting a personal API key.
   return {
     userId: user.id,
     sessionId: `api_key:${key.id}`,
     familyId: user.familyId,
     familyRole: user.familyRole as Actor["familyRole"],
-    platformRole: user.platformRole as Actor["platformRole"],
+    platformRole: "user" as const,
     email: user.email,
     name: user.name,
     emailVerified: !!user.emailVerifiedAt,
