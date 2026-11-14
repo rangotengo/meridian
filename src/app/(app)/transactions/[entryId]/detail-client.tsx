@@ -55,6 +55,11 @@ export function TransactionDetailClient(p: DetailProps) {
   const privacy = usePrivacy();
   const isExpense = p.entry.amountMinor > 0;
   const canCore = p.level === "full_control";
+  const canAnnotate = p.level !== "read_only";
+  const isLinked = Boolean(p.transferId);
+  // Date/amount are locked while linked: disabled inputs are not submitted,
+  // so annotation-only saves reach the server without the protected fields.
+  const coreLocked = !canCore || isLinked;
   const [updateState, updateAction] = useActionState(updateTransactionAction, undefined);
   const [linkState, linkAction] = useActionState(linkTransferAction, undefined);
 
@@ -76,19 +81,29 @@ export function TransactionDetailClient(p: DetailProps) {
               disabled={!canCore}
             />
           </Field>
-          <Field label="Date" htmlFor="d-date">
+          <Field
+            label="Date"
+            htmlFor="d-date"
+            hint={isLinked ? "Linked transfer — unlink to change the date." : undefined}
+          >
             <Input
               id="d-date"
               name="date"
               type="date"
               defaultValue={p.entry.date}
-              disabled={!canCore}
+              disabled={coreLocked}
             />
           </Field>
           <Field
             label={`Amount (${p.entry.currency})`}
             htmlFor="d-amount"
-            hint={canCore ? undefined : "Your access level cannot change amounts."}
+            hint={
+              isLinked
+                ? "Linked transfer — unlink to change the amount."
+                : canCore
+                  ? undefined
+                  : "Your access level cannot change amounts."
+            }
           >
             <Input
               id="d-amount"
@@ -96,11 +111,16 @@ export function TransactionDetailClient(p: DetailProps) {
               inputMode="decimal"
               type={privacy ? "password" : "text"}
               defaultValue={displayAmount(p.entry.amountMinor, p.entry.currency)}
-              disabled={!canCore}
+              disabled={coreLocked}
             />
           </Field>
           <Field label="Category" htmlFor="d-category">
-            <Select id="d-category" name="categoryId" defaultValue={p.categoryId ?? ""}>
+            <Select
+              id="d-category"
+              name="categoryId"
+              defaultValue={p.categoryId ?? ""}
+              disabled={!canAnnotate}
+            >
               <option value="">Uncategorized</option>
               {p.categories.map((c) => (
                 <option key={c.id} value={c.id}>
@@ -115,6 +135,7 @@ export function TransactionDetailClient(p: DetailProps) {
               name="merchant"
               defaultValue={p.merchant ?? ""}
               maxLength={120}
+              disabled={!canAnnotate}
             />
           </Field>
           <div className="sm:col-span-2">
@@ -124,17 +145,27 @@ export function TransactionDetailClient(p: DetailProps) {
                 name="notes"
                 defaultValue={p.entry.notes ?? ""}
                 maxLength={5000}
+                disabled={!canAnnotate}
               />
             </Field>
           </div>
           <div className="sm:col-span-2">
-            <TagPicker tags={p.tags} selected={p.tagIds} />
+            <TagPicker tags={p.tags} selected={p.tagIds} disabled={!canAnnotate} />
           </div>
           <div className="flex items-center gap-3 sm:col-span-2">
-            <SubmitButton>Save changes</SubmitButton>
-            {!canCore && p.level === "read_write" ? (
+            {canAnnotate ? <SubmitButton>Save changes</SubmitButton> : null}
+            {p.level === "read_only" ? (
+              <span className="text-xs text-muted-foreground">
+                Read-only access — you can view this transaction but not edit it.
+              </span>
+            ) : !canCore && p.level === "read_write" ? (
               <span className="text-xs text-muted-foreground">
                 You can edit category, merchant and notes only.
+              </span>
+            ) : isLinked ? (
+              <span className="text-xs text-muted-foreground">
+                Linked transfer: date and amount are locked, but notes, merchant, category and tags
+                can still be edited.
               </span>
             ) : null}
           </div>

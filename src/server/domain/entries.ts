@@ -208,10 +208,20 @@ export async function updateTransactionEntry(
     .from(transactions)
     .where(eq(transactions.entryId, entryId))
     .limit(1);
-  if (txn?.transferId && (patch.amountLedgerMinor !== undefined || patch.date !== undefined)) {
-    throw errors.conflict(
-      "Cannot edit amount or date of a linked transfer leg. Unlink the transfer first."
-    );
+  // Linked transfer legs: amount and date are protected, but only an actual
+  // CHANGE is rejected. Callers (the transaction form in particular) submit
+  // the current values back on annotation-only edits, so an unchanged value
+  // must pass — otherwise notes/merchant/category edits are impossible for
+  // full-control users until they unlink.
+  if (txn?.transferId) {
+    const changesAmount =
+      patch.amountLedgerMinor !== undefined && patch.amountLedgerMinor !== entry.amountMinor;
+    const changesDate = patch.date !== undefined && patch.date !== entry.date;
+    if (changesAmount || changesDate) {
+      throw errors.conflict(
+        "Cannot edit amount or date of a linked transfer leg. Unlink the transfer first."
+      );
+    }
   }
 
   const [splitCount] = await exec

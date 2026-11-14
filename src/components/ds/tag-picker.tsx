@@ -2,16 +2,18 @@ export function TagPicker({
   tags,
   name = "tagIds",
   selected = [],
-  legend = "Tags"
+  legend = "Tags",
+  disabled = false
 }: {
   tags: { id: string; name: string }[];
   name?: string;
   selected?: string[];
   legend?: string;
+  disabled?: boolean;
 }) {
   if (tags.length === 0) return null;
   return (
-    <fieldset>
+    <fieldset disabled={disabled} className={disabled ? "opacity-60" : undefined}>
       <legend className="mb-1.5 block text-xs font-medium text-muted-foreground">{legend}</legend>
       <div className="flex flex-wrap gap-2">
         {tags.map((tag) => (
