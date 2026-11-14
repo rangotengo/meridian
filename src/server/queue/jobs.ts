@@ -13,6 +13,47 @@ export type JobPayloads = {
   email: { to: string; subject: string; text: string };
 };
 
+/**
+ * Runs one recurring-posting pass and propagates per-series failures to the
+ * queue: postDueSeries deliberately isolates failures per series (one bad
+ * series must not block the rest), but a pass with failures is NOT a success.
+ * Throwing here routes the job through failJob's retry / dead-letter handling.
+ * Successful progress is preserved across the retry — posted occurrences
+ * commit atomically with their schedule advance and are deduped by
+ * externalId — so the retry only reworks series that are still due.
+ */
+export async function runRecurringPost(exec: Executor) {
+  const result = await postDueSeries(exec);
+  if (result.failed > 0) {
+    throw new Error(
+      `Recurring posting failed for ${result.failed} series (${result.posted} posted, ${result.paused} paused).`
+    );
+  }
+  return result;
+}
+
+/**
+ * Runs one balance-maintenance pass and propagates per-account failures to
+ * the queue. recalculateAllActiveAccounts deliberately attempts every
+ * account (one failure must not block the others), but a pass with failures
+ * is NOT a success: the durable repair jobs enqueued by recurring posting
+ * ride on this handler, so resolving here would complete the repair job
+ * while the very account needing repair stays stale — and once its series
+ * is no longer due, nothing would revisit it until nightly maintenance.
+ * Throwing routes the job through failJob's retry / dead-letter handling,
+ * which preserves the repair intent until a recalculation succeeds.
+ */
+export async function runBalanceMaintenance(exec: Executor) {
+  const result = await recalculateAllActiveAccounts(exec);
+  if (result.failures.length > 0) {
+    const ids = result.failures.map((f) => f.accountId).join(", ");
+    throw new Error(
+      `Balance recalculation failed for ${result.failures.length} account(s): ${ids} (${result.recalculated} succeeded).`
+    );
+  }
+  return result;
+}
+
 export async function createJobRegistry() {
   const mailer = createMailer();
   const registry = new Map<
@@ -30,7 +71,7 @@ export async function createJobRegistry() {
   });
 
   registry.set("maintenance:balances", async (_payload, exec) => {
-    await recalculateAllActiveAccounts(exec);
+    await runBalanceMaintenance(exec);
   });
 
   registry.set("maintenance:cleanup", async (_payload, exec) => {
@@ -41,7 +82,7 @@ export async function createJobRegistry() {
   });
 
   registry.set("recurring:post", async (_payload, exec) => {
-    await postDueSeries(exec);
+    await runRecurringPost(exec);
   });
 
   return registry;

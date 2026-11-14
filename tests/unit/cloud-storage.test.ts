@@ -116,4 +116,13 @@ describe("Cloudflare SQLite storage", () => {
     expect(result.recurring).toEqual({ posted: 1, paused: 0, failed: 0 });
     expect(result.recurringAgain).toEqual({ posted: 0, paused: 0, failed: 0 });
   });
+  it("commits balance-repair intent with each recurring occurrence on SQLite", async () => {
+    const result = await probe("recurring-repair");
+    expect(result.result).toEqual({ posted: 1, paused: 0, failed: 0 });
+    expect(result.entries).toBe(2);
+    // Both occurrences share one pending repair job (dedupe key per account).
+    expect(result.repairJobsPending).toBe(1);
+    expect(result.balanceMinor).toBe(-200);
+    expect(result.again).toEqual({ posted: 0, paused: 0, failed: 0 });
+  });
 });

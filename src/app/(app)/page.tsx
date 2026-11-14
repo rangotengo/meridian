@@ -6,6 +6,8 @@ import { getUserPrivacyMode } from "@/server/domain/users";
 import { listAccountsForActor } from "@/server/domain/accounts";
 import { DashboardCustomizer } from "@/components/finance/dashboard-customizer";
 import type { DashboardData, HealthFactor } from "@/components/finance/dashboard-data";
+import { isStaleRate } from "@/server/domain/exchange-rates";
+import { todayIn } from "@/lib/datetime";
 
 export const metadata = { title: "Dashboard" };
 
@@ -134,6 +136,17 @@ export default async function DashboardPage({
           pct: budget.overall.pct
         }
       : null,
+    fx: {
+      incomplete: summary.incompleteFx ?? false,
+      issues: summary.fxIssues ?? [],
+      rates: (summary.fxRates ?? []).map((r) => ({
+        base: r.base,
+        quote: r.quote,
+        rate: r.rate,
+        quotedOn: r.quotedOn,
+        stale: isStaleRate(r.quotedOn, todayIn(family.timezone))
+      }))
+    },
     health: {
       overall,
       trend,

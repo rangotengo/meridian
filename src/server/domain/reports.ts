@@ -1,7 +1,7 @@
 import { sql } from "drizzle-orm";
 import type { Executor } from "../db/client";
 import type { Family } from "../auth/context";
-import { getRate, convertMinor } from "./exchange-rates";
+import { getRateInfo, convertMinor, type RateInfo } from "./exchange-rates";
 import { captureDebugLog } from "../observability/debug-log";
 import {
   addDays,
@@ -32,13 +32,18 @@ function safeAdd(a: number, b: number): number {
 
 export type FxIssue = { base: string; quote: string; date: string };
 
+/** A rate a report actually converted with, including its quoted-on date. */
+export type FxRateUsed = RateInfo;
+
 export type ConversionContext = {
   issues: Map<string, FxIssue>;
-  rateCache: Map<string, string | null>;
+  rateCache: Map<string, RateInfo | null>;
+  /** Successful conversions, keyed by `base:quote`, for stale-rate display. */
+  usedRates: Map<string, RateInfo>;
 };
 
 function newConversionContext(): ConversionContext {
-  return { issues: new Map(), rateCache: new Map() };
+  return { issues: new Map(), rateCache: new Map(), usedRates: new Map() };
 }
 
 async function convertTo(
@@ -51,21 +56,24 @@ async function convertTo(
 ): Promise<number> {
   if (from === to) return amountMinor;
   const cacheKey = `${from}:${to}:${onDate}`;
-  let rate: string | null;
+  let info: RateInfo | null;
   if (ctx.rateCache.has(cacheKey)) {
-    rate = ctx.rateCache.get(cacheKey)!;
+    info = ctx.rateCache.get(cacheKey)!;
   } else {
-    rate = await getRate(exec, from, to, onDate);
-    ctx.rateCache.set(cacheKey, rate);
+    info = await getRateInfo(exec, from, to, onDate);
+    ctx.rateCache.set(cacheKey, info);
   }
-  if (rate === null) {
+  if (info === null) {
     const key = `${from}:${to}`;
     if (!ctx.issues.has(key)) {
       ctx.issues.set(key, { base: from, quote: to, date: onDate });
     }
     return 0;
   }
-  return convertMinor(amountMinor, rate, from, to);
+  const usedKey = `${from}:${to}`;
+  const previous = ctx.usedRates.get(usedKey);
+  if (!previous || info.quotedOn > previous.quotedOn) ctx.usedRates.set(usedKey, info);
+  return convertMinor(amountMinor, info.rate, from, to);
 }
 
 export type DashboardSummary = {
@@ -87,6 +95,8 @@ export type DashboardSummary = {
   monthKey: string;
   incompleteFx?: boolean;
   fxIssues?: FxIssue[];
+  /** Rates the totals were converted with, so the UI can show their dates. */
+  fxRates?: FxRateUsed[];
 };
 
 const ACCESS_SQL = (userId: string) =>
@@ -262,6 +272,7 @@ export async function dashboardSummary(
 
   const incompleteFx = ctx.issues.size > 0;
   const fxIssues = incompleteFx ? Array.from(ctx.issues.values()) : undefined;
+  const fxRates = ctx.usedRates.size > 0 ? Array.from(ctx.usedRates.values()) : undefined;
 
   await reportFxIssues(exec, ctx, family.id, "dashboard");
 
@@ -283,7 +294,8 @@ export async function dashboardSummary(
     })),
     monthKey: mk,
     incompleteFx,
-    fxIssues
+    fxIssues,
+    fxRates
   };
 }
 

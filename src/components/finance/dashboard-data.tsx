@@ -52,6 +52,14 @@ export type DashboardData = {
     remainingMinor: number;
     pct: number;
   } | null;
+  fx: {
+    /** True when some amounts were excluded because no rate exists. */
+    incomplete: boolean;
+    /** Currency pairs with no usable rate; their amounts are excluded. */
+    issues: { base: string; quote: string; date: string }[];
+    /** Rates totals were converted with, with quoted-on dates. */
+    rates: { base: string; quote: string; rate: string; quotedOn: string; stale: boolean }[];
+  };
   health: {
     overall: number;
     trend: "up" | "down";

@@ -83,6 +83,11 @@ export default async function SettingsPage() {
               { href: "/settings/categories", label: "Categories", hint: "Spending categories" },
               { href: "/settings/tags", label: "Tags", hint: "Flexible labels" },
               { href: "/settings/members", label: "Members", hint: "Family & invitations" },
+              {
+                href: "/settings/exchange-rates",
+                label: "Exchange rates",
+                hint: "Currency conversion rates"
+              },
               { href: "/settings/security", label: "Security", hint: "Sessions & password" },
               { href: "/settings/data", label: "Data", hint: "Export & imports" }
             ].map((item) => (

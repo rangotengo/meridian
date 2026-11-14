@@ -1,9 +1,23 @@
-import { sql } from "drizzle-orm";
+import { desc, sql } from "drizzle-orm";
 import type { Executor } from "../db/client";
 import { exchangeRates } from "../db/schema";
+import type { Actor } from "../auth/context";
+import { assertSuperAdmin } from "../auth/context";
+import { recordAudit } from "../observability/audit";
 import { isValidCurrency, currencyExponent } from "@/lib/money";
 import { errors } from "@/lib/errors";
-import { isIsoDate } from "@/lib/datetime";
+import { diffDays, isIsoDate } from "@/lib/datetime";
+
+/** A rate that was actually used / stored, with the date it was quoted on. */
+export type RateInfo = { base: string; quote: string; rate: string; quotedOn: string };
+
+/** Rates older than this many days are surfaced as stale in the UI. */
+export const FX_STALE_DAYS = 30;
+
+export function isStaleRate(quotedOn: string, today: string, staleDays = FX_STALE_DAYS): boolean {
+  if (!isIsoDate(quotedOn) || !isIsoDate(today)) return false;
+  return diffDays(today, quotedOn) > staleDays;
+}
 
 export async function upsertRate(
   exec: Executor,
@@ -32,27 +46,104 @@ export async function upsertRate(
     });
 }
 
+/**
+ * The authorized write path for exchange rates. Rates are instance-level
+ * reference data (the exchange_rates table has no family scope), so an
+ * ordinary verified member — even a family admin — must not be able to
+ * replace rates other households' reports rely on. Only a platform
+ * super-admin may write; the audit event is instance-level too, so it
+ * carries no familyId. The bare upsertRate stays unguarded for fixture
+ * seeding in tests and trusted import paths.
+ */
+export async function upsertRateForActor(
+  exec: Executor,
+  actor: Actor,
+  input: { base: string; quote: string; rate: string; quotedOn: string }
+): Promise<void> {
+  assertSuperAdmin(actor);
+  await upsertRate(exec, input);
+  await recordAudit(exec, {
+    familyId: null,
+    actorUserId: actor.userId,
+    action: "exchange_rate.upserted",
+    entityType: "exchange_rate",
+    entityId: `${input.base.toUpperCase()}:${input.quote.toUpperCase()}:${input.quotedOn}`,
+    metadata: {
+      base: input.base.toUpperCase(),
+      quote: input.quote.toUpperCase(),
+      rate: input.rate,
+      quotedOn: input.quotedOn
+    }
+  });
+}
+
+export async function getRateInfo(
+  exec: Executor,
+  base: string,
+  quote: string,
+  onOrBefore: string
+): Promise<RateInfo | null> {
+  const b = base.toUpperCase();
+  const q = quote.toUpperCase();
+  if (b === q) return { base: b, quote: q, rate: "1", quotedOn: onOrBefore };
+  const res = await exec.execute<{ rate: string; quoted_on: string }>(sql`
+    SELECT CAST(rate AS TEXT) AS rate, CAST(quoted_on AS TEXT) AS quoted_on FROM (
+      SELECT rate, quoted_on FROM exchange_rates
+      WHERE base_currency = ${b} AND quote_currency = ${q}
+        AND quoted_on <= ${onOrBefore}
+      UNION ALL
+      SELECT 1.0 / CAST(rate AS NUMERIC) AS rate, quoted_on FROM exchange_rates
+      WHERE base_currency = ${q} AND quote_currency = ${b}
+        AND quoted_on <= ${onOrBefore}
+    ) pairs
+    ORDER BY quoted_on DESC
+    LIMIT 1
+  `);
+  const row = (res.rows ?? [])[0];
+  if (!row) return null;
+  return { base: b, quote: q, rate: row.rate, quotedOn: String(row.quoted_on ?? "").slice(0, 10) };
+}
+
 export async function getRate(
   exec: Executor,
   base: string,
   quote: string,
   onOrBefore: string
 ): Promise<string | null> {
-  if (base.toUpperCase() === quote.toUpperCase()) return "1";
-  const res = await exec.execute<{ rate: string }>(sql`
-    SELECT CAST(rate AS TEXT) AS rate FROM (
-      SELECT rate, quoted_on FROM exchange_rates
-      WHERE base_currency = ${base.toUpperCase()} AND quote_currency = ${quote.toUpperCase()}
-        AND quoted_on <= ${onOrBefore}
-      UNION ALL
-      SELECT 1.0 / CAST(rate AS NUMERIC) AS rate, quoted_on FROM exchange_rates
-      WHERE base_currency = ${quote.toUpperCase()} AND quote_currency = ${base.toUpperCase()}
-        AND quoted_on <= ${onOrBefore}
-    ) pairs
-    ORDER BY quoted_on DESC
-    LIMIT 1
-  `);
-  return (res.rows ?? [])[0]?.rate ?? null;
+  const info = await getRateInfo(exec, base, quote, onOrBefore);
+  return info?.rate ?? null;
+}
+
+/**
+ * Latest stored rate for every ordered pair, newest quoted_on first per pair.
+ * Deliberately returns only pairs that were explicitly stored (no derived
+ * inverses) so the settings UI shows exactly what exists in the table.
+ */
+export async function listLatestRates(exec: Executor): Promise<RateInfo[]> {
+  const rows = await exec
+    .select({
+      base: exchangeRates.baseCurrency,
+      quote: exchangeRates.quoteCurrency,
+      rate: exchangeRates.rate,
+      quotedOn: exchangeRates.quotedOn
+    })
+    .from(exchangeRates)
+    .orderBy(desc(exchangeRates.quotedOn));
+  const latest = new Map<string, RateInfo>();
+  for (const r of rows) {
+    const key = `${r.base}:${r.quote}`;
+    if (!latest.has(key)) {
+      latest.set(key, {
+        base: r.base,
+        quote: r.quote,
+        rate: String(r.rate),
+        quotedOn: String(r.quotedOn).slice(0, 10)
+      });
+    }
+  }
+  return [...latest.values()].sort((a, b) =>
+    `${a.base}${a.quote}`.localeCompare(`${b.base}${b.quote}`)
+  );
 }
 
 export function convertMinor(

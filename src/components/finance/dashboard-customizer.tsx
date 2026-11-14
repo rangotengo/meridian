@@ -22,6 +22,7 @@ import { SpendingLimit } from "@/components/finance/spending-limit";
 import { MoneyMovement } from "@/components/finance/money-movement";
 import { RecentTransactions } from "@/components/finance/recent-transactions";
 import { HealthScore } from "@/components/finance/health-score";
+import { FxWarning } from "@/components/finance/fx-warning";
 
 type WidgetSize = "sm" | "lg" | "full";
 
@@ -187,6 +188,8 @@ export function DashboardCustomizer({ data }: { data: DashboardData }) {
             </Button>
           </div>
         </div>
+
+        <FxWarning />
 
         <DndContext
           sensors={sensors}

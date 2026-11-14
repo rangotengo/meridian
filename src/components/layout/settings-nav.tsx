@@ -26,6 +26,7 @@ const sections = [
     label: "Family",
     links: [
       { href: "/settings/members", label: "Members" },
+      { href: "/settings/exchange-rates", label: "Exchange rates" },
       { href: "/settings/data", label: "Your data" }
     ]
   }
