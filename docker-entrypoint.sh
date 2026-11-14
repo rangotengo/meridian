@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-role="${1:-web}"
+role="${APP_ROLE:-${1:-web}}"
 
 if [ "$role" = "web" ]; then
   npm run db:migrate
