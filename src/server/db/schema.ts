@@ -12,6 +12,7 @@ export const sessions = tables.sessions;
 export const authTokens = tables.authTokens;
 export const apiKeys = tables.apiKeys;
 export const invitations = tables.invitations;
+export const instanceInvitations = tables.instanceInvitations;
 export const categories = tables.categories;
 export const tags = tables.tags;
 export const accounts = tables.accounts;

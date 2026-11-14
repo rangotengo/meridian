@@ -7,6 +7,7 @@ import migration4 from "../../../../db/cloud-migrations/0005_member_removal.up.s
 import migration5 from "../../../../db/cloud-migrations/0006_cloudflare_access.up.sql";
 import migration6 from "../../../../db/cloud-migrations/0007_storage_guards.up.sql";
 import migration7 from "../../../../db/cloud-migrations/0008_api_keys.up.sql";
+import migration8 from "../../../../db/cloud-migrations/0009_instance_invitations.up.sql";
 
 export const cloudMigrations = [
   { name: "0001_init", sql: migration0 },
@@ -16,5 +17,6 @@ export const cloudMigrations = [
   { name: "0005_member_removal", sql: migration4 },
   { name: "0006_cloudflare_access", sql: migration5 },
   { name: "0007_storage_guards", sql: migration6 },
-  { name: "0008_api_keys", sql: migration7 }
+  { name: "0008_api_keys", sql: migration7 },
+  { name: "0009_instance_invitations", sql: migration8 }
 ];

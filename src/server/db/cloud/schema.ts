@@ -162,6 +162,26 @@ export const invitations = sqliteTable(
   (t) => [index("invitations_family_idx").on(t.familyId)]
 );
 
+export const instanceInvitations = sqliteTable(
+  "instance_invitations",
+  {
+    id: text("id")
+      .primaryKey()
+      .$defaultFn(() => crypto.randomUUID()),
+    email: text("email").notNull(),
+    tokenHash: text("token_hash").notNull().unique(),
+    invitedBy: text("invited_by")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    expiresAt: isoTimestamp("expires_at").notNull(),
+    acceptedAt: isoTimestamp("accepted_at"),
+    createdAt: isoTimestamp("created_at")
+      .notNull()
+      .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`)
+  },
+  (t) => [index("instance_invitations_email_idx").on(t.email)]
+);
+
 export const categories = sqliteTable(
   "categories",
   {

@@ -6,5 +6,6 @@ export const CLOUD_MIGRATION_NAMES = [
   "0005_member_removal",
   "0006_cloudflare_access",
   "0007_storage_guards",
-  "0008_api_keys"
+  "0008_api_keys",
+  "0009_instance_invitations"
 ] as const;
