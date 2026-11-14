@@ -380,20 +380,31 @@ export const MAX_CATCHUP_OCCURRENCES_PER_RUN = 100;
  * a deterministic externalId, so the entries_external_dedupe unique index makes
  * re-runs idempotent.
  *
- * Occurrence creation and schedule advancement are atomic: the entry insert,
- * its transaction row, and the next_due advance to the following occurrence
- * commit in ONE transaction per occurrence. A crash between occurrences leaves
- * next_due pointing at the first unposted occurrence, so a retry resumes there
- * (and the dedupe index absorbs any occurrence a previous code path committed
- * without advancing the schedule).
+ * Occurrence creation, schedule advancement, and balance-repair intent are
+ * atomic: the entry insert, its transaction row, the next_due advance to the
+ * following occurrence, AND a `maintenance:balances` repair job for the
+ * account (deduped per account while pending) commit in ONE transaction per
+ * occurrence. A crash between occurrences leaves next_due pointing at the
+ * first unposted occurrence, so a retry resumes there (and the dedupe index
+ * absorbs any occurrence a previous code path committed without advancing the
+ * schedule) — and a repair job is already pending for every committed
+ * occurrence, whether the worker dies, the immediate recalculation fails,
+ * or a later occurrence fails.
+ *
+ * A later occurrence failure does not skip the recalculation / repair for
+ * occurrences that already committed: the failure is remembered, the
+ * committed occurrences are recalculated immediately, and only then is the
+ * series counted as failed (so runRecurringPost still propagates the failure
+ * and the queue retries the series from the first unposted occurrence).
+ * The repair job is retryable even once the series is no longer due: the
+ * `maintenance:balances` handler rebuilds every active account
+ * independently of series due state.
  *
  * After a series posts, its account balances are recalculated. If that
- * recalculation fails, a durable `maintenance:balances` repair job is enqueued
- * (deduped per account while pending) BEFORE the failure is counted, so
- * committed entries never silently keep stale materialized balances: the
- * repair job — not just the nightly maintenance — will rebuild them, and the
- * failure itself propagates to the caller (see the queue handler) so the
- * recurring job is retried / dead-lettered instead of marked successful.
+ * recalculation fails, the repair enqueue is retried as a fallback (the
+ * in-transaction job already covers it) and the failure propagates to the
+ * caller (see the queue handler) so the recurring job is retried /
+ * dead-lettered instead of marked successful.
  *
  * Each series is judged against its own family's timezone, so a series due on
  * "the 1st" posts when it is the 1st for that family, not for the worker.
@@ -448,55 +459,77 @@ export async function postDueSeries(exec: Executor, now = new Date()): Promise<P
     try {
       let occurrence = series.nextDue;
       let processed = 0;
-      // Catch-up loop: advance until past today, posting each missed
-      // occurrence in its own transaction (bounded per run, see
-      // MAX_CATCHUP_OCCURRENCES_PER_RUN).
-      while (occurrence <= today && processed < MAX_CATCHUP_OCCURRENCES_PER_RUN) {
-        const externalId = `${series.id}:${occurrence}`;
-        const following = nextOccurrence(
-          series.frequency as Frequency,
-          series.config as SeriesConfig,
-          occurrence
-        );
-        await exec.transaction(async (tx) => {
-          const [entry] = await tx
-            .insert(entries)
-            .values({
-              accountId: series.accountId,
-              recurringSeriesId: series.id,
-              date: occurrence,
-              amountMinor: series.amountMinor,
-              currency: series.currency,
-              name: series.name,
-              externalSource: "recurring",
-              externalId,
-              entryableType: "transaction"
-            })
-            .onConflictDoNothing()
-            .returning({ id: entries.id });
-          const entryId = entry?.id;
-          if (entryId) {
-            await tx.insert(transactions).values({
-              entryId,
-              categoryId: series.categoryId,
-              merchant: series.merchant
-            });
-          }
-          // Advance the schedule in the SAME transaction as the insert. On a
-          // dedupe hit (a legacy / interrupted run already committed this
-          // occurrence) entryId is undefined, but the advance still commits
-          // atomically, so progress is never lost or replayed.
-          await tx
-            .update(recurringSeries)
-            .set({
-              nextDue: following,
-              ...(entryId ? { lastPostedEntryId: entryId } : {}),
-              updatedAt: new Date()
-            })
-            .where(eq(recurringSeries.id, series.id));
-        });
-        processed++;
-        occurrence = following;
+      // A later occurrence can fail after earlier ones committed. Remember
+      // the failure instead of aborting: the committed occurrences already
+      // carry their repair intent (enqueued in-transaction below), and their
+      // balances still need the immediate recalculation.
+      let postError: unknown = null;
+      try {
+        // Catch-up loop: advance until past today, posting each missed
+        // occurrence in its own transaction (bounded per run, see
+        // MAX_CATCHUP_OCCURRENCES_PER_RUN).
+        while (occurrence <= today && processed < MAX_CATCHUP_OCCURRENCES_PER_RUN) {
+          const externalId = `${series.id}:${occurrence}`;
+          const following = nextOccurrence(
+            series.frequency as Frequency,
+            series.config as SeriesConfig,
+            occurrence
+          );
+          await exec.transaction(async (tx) => {
+            const [entry] = await tx
+              .insert(entries)
+              .values({
+                accountId: series.accountId,
+                recurringSeriesId: series.id,
+                date: occurrence,
+                amountMinor: series.amountMinor,
+                currency: series.currency,
+                name: series.name,
+                externalSource: "recurring",
+                externalId,
+                entryableType: "transaction"
+              })
+              .onConflictDoNothing()
+              .returning({ id: entries.id });
+            const entryId = entry?.id;
+            if (entryId) {
+              await tx.insert(transactions).values({
+                entryId,
+                categoryId: series.categoryId,
+                merchant: series.merchant
+              });
+            }
+            // Advance the schedule in the SAME transaction as the insert. On a
+            // dedupe hit (a legacy / interrupted run already committed this
+            // occurrence) entryId is undefined, but the advance still commits
+            // atomically, so progress is never lost or replayed.
+            await tx
+              .update(recurringSeries)
+              .set({
+                nextDue: following,
+                ...(entryId ? { lastPostedEntryId: entryId } : {}),
+                updatedAt: new Date()
+              })
+              .where(eq(recurringSeries.id, series.id));
+            // Commit the repair intent WITH the occurrence: a pending
+            // maintenance:balances job for this account now exists before
+            // anything outside this transaction can fail. The dedupe key
+            // collapses repeats while a job is pending, so posting several
+            // occurrences leaves a single repair job.
+            await enqueue(
+              tx,
+              "maintenance:balances",
+              {},
+              {
+                dedupeKey: `balance-repair:${series.accountId}`
+              }
+            );
+          });
+          processed++;
+          occurrence = following;
+        }
+      } catch (e) {
+        postError = e;
       }
 
       if (processed >= MAX_CATCHUP_OCCURRENCES_PER_RUN && occurrence <= today) {
@@ -516,9 +549,10 @@ export async function postDueSeries(exec: Executor, now = new Date()): Promise<P
         try {
           await recalculateAccount(exec, series.accountId);
         } catch (recalcError) {
-          // The entries are committed and the schedule has advanced, so a
-          // plain retry of this series would never revisit them. Enqueue
-          // durable repair work first, then surface the failure.
+          // Repair intent is already durable (enqueued in-transaction with
+          // each committed occurrence); retry the enqueue as a fallback in
+          // case a future code path posts without it, then surface the
+          // failure so the queue retries / dead-letters this job.
           try {
             await enqueue(
               exec,
@@ -529,14 +563,16 @@ export async function postDueSeries(exec: Executor, now = new Date()): Promise<P
               }
             );
           } catch {
-            // Repair enqueue is best-effort on top of the nightly
-            // maintenance:balances cron; the thrown failure below still
-            // drives the queue retry for this job.
+            // The in-transaction repair job already covers this account.
           }
           throw recalcError;
         }
-        result.posted++;
+        if (!postError) result.posted++;
       }
+      // A partially posted series still failed: the retry resumes from the
+      // first unposted occurrence (next_due was left there by the failed
+      // transaction's rollback).
+      if (postError) throw postError;
     } catch (e) {
       result.failed++;
       await captureDebugLog(exec, {

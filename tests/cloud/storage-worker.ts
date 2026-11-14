@@ -11,6 +11,7 @@ import { listEntriesPage } from "../../src/server/domain/entries";
 import { dashboardSummary, incomeExpenseSeries } from "../../src/server/domain/reports";
 import { upsertRate, getRate } from "../../src/server/domain/exchange-rates";
 import { createSeries, postDueSeries } from "../../src/server/domain/recurring";
+import { recalculateAllActiveAccounts } from "../../src/server/domain/balances-maintenance";
 import { createInvitation, acceptInvitationWithAccess } from "../../src/server/domain/invitations";
 import { setBudget } from "../../src/server/domain/budgets";
 import { buildFamilyExport } from "../../src/server/domain/exports";
@@ -572,6 +573,69 @@ export class StorageProbe {
         imported,
         importBalanceDays: Number(importBalanceRows.rows[0]!.count),
         latestImportBalanceMinor: Number(latestRows.rows[0]!.balance_minor)
+      });
+    }
+    if (operation === "/recurring-repair") {
+      const exec = db as unknown as Executor;
+      const user = await registerAccessHousehold(
+        exec,
+        { subject: "recurring-repair-user", email: "recurring-repair@example.test" },
+        { name: "Repair", familyName: "Repair Family", currency: "NPR", timezone: "UTC" }
+      );
+      const actor: Actor = {
+        userId: user.id,
+        familyId: user.familyId,
+        email: user.email,
+        name: user.name,
+        familyRole: "admin",
+        platformRole: "user",
+        sessionId: "",
+        emailVerified: true
+      };
+      const account = await createAccount(exec, actor, {
+        name: "Repair Cash",
+        type: "depository",
+        currency: "NPR",
+        openedOn: isoDaysAgo(30),
+        openingBalanceDisplayMinor: 0,
+        includedInReports: true,
+        joint: false
+      });
+      // Occurrences on isoDaysAgo(7) and today are due.
+      const start = isoDaysAgo(7);
+      await createSeries(exec, actor, {
+        accountId: account.accountId,
+        name: "Weekly bill",
+        amountLedgerMinor: 100,
+        frequency: "weekly",
+        config: { weekday: new Date(`${start}T00:00:00Z`).getUTCDay() },
+        nextDue: start
+      });
+      const result = await postDueSeries(exec);
+      const entryRows = await db.execute(
+        sql`SELECT CAST(count(*) AS INTEGER) AS count FROM entries WHERE account_id = ${account.accountId}`
+      );
+      // Repair intent commits with the occurrences: one pending
+      // maintenance:balances job (both occurrences share the dedupe key).
+      const jobRows = await db.execute(
+        sql`SELECT CAST(count(*) AS INTEGER) AS count FROM jobs
+            WHERE queue = 'maintenance:balances'
+              AND dedupe_key = ${`balance-repair:${account.accountId}`}
+              AND status = 'pending'`
+      );
+      // This is exactly what the maintenance:balances queue handler runs.
+      await recalculateAllActiveAccounts(exec);
+      const balanceRows = await db.execute(
+        sql`SELECT CAST(balance_minor AS TEXT) AS balance_minor FROM balances
+            WHERE account_id = ${account.accountId} ORDER BY as_of DESC LIMIT 1`
+      );
+      const again = await postDueSeries(exec);
+      return Response.json({
+        result,
+        entries: Number(entryRows.rows[0]!.count),
+        repairJobsPending: Number(jobRows.rows[0]!.count),
+        balanceMinor: Number(balanceRows.rows[0]!.balance_minor),
+        again
       });
     }
     return new Response("Unknown probe", { status: 404 });
