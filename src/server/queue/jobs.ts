@@ -13,6 +13,25 @@ export type JobPayloads = {
   email: { to: string; subject: string; text: string };
 };
 
+/**
+ * Runs one recurring-posting pass and propagates per-series failures to the
+ * queue: postDueSeries deliberately isolates failures per series (one bad
+ * series must not block the rest), but a pass with failures is NOT a success.
+ * Throwing here routes the job through failJob's retry / dead-letter handling.
+ * Successful progress is preserved across the retry — posted occurrences
+ * commit atomically with their schedule advance and are deduped by
+ * externalId — so the retry only reworks series that are still due.
+ */
+export async function runRecurringPost(exec: Executor) {
+  const result = await postDueSeries(exec);
+  if (result.failed > 0) {
+    throw new Error(
+      `Recurring posting failed for ${result.failed} series (${result.posted} posted, ${result.paused} paused).`
+    );
+  }
+  return result;
+}
+
 export async function createJobRegistry() {
   const mailer = createMailer();
   const registry = new Map<
@@ -41,7 +60,7 @@ export async function createJobRegistry() {
   });
 
   registry.set("recurring:post", async (_payload, exec) => {
-    await postDueSeries(exec);
+    await runRecurringPost(exec);
   });
 
   return registry;

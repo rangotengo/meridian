@@ -16,6 +16,7 @@ import {
   assertAccountOpen
 } from "../authorization/access";
 import { recalculateAccount } from "./balances";
+import { enqueue } from "../queue/index";
 import { recordAudit } from "../observability/audit";
 import { captureDebugLog } from "../observability/debug-log";
 import { errors } from "@/lib/errors";
@@ -365,11 +366,34 @@ export async function listSeries(exec: Executor, actor: Actor) {
 export type PostResult = { posted: number; paused: number; failed: number };
 
 /**
+ * Upper bound on occurrences posted for a single series in one run. A series
+ * that fell far behind (worker down for months, daily-equivalent backlog on a
+ * weekly series, bad config) catches up over successive runs instead of
+ * monopolising one job; next_due is left at the first unposted occurrence, so
+ * the next run resumes exactly where this one stopped.
+ */
+export const MAX_CATCHUP_OCCURRENCES_PER_RUN = 100;
+
+/**
  * Posts every active series whose next_due has arrived (or was missed while the
  * worker was down). Each occurrence is written with externalSource="recurring" and
  * a deterministic externalId, so the entries_external_dedupe unique index makes
- * re-runs idempotent. next_due is advanced in the same transaction as the insert,
- * so a crash mid-run cannot double-post.
+ * re-runs idempotent.
+ *
+ * Occurrence creation and schedule advancement are atomic: the entry insert,
+ * its transaction row, and the next_due advance to the following occurrence
+ * commit in ONE transaction per occurrence. A crash between occurrences leaves
+ * next_due pointing at the first unposted occurrence, so a retry resumes there
+ * (and the dedupe index absorbs any occurrence a previous code path committed
+ * without advancing the schedule).
+ *
+ * After a series posts, its account balances are recalculated. If that
+ * recalculation fails, a durable `maintenance:balances` repair job is enqueued
+ * (deduped per account while pending) BEFORE the failure is counted, so
+ * committed entries never silently keep stale materialized balances: the
+ * repair job — not just the nightly maintenance — will rebuild them, and the
+ * failure itself propagates to the caller (see the queue handler) so the
+ * recurring job is retried / dead-lettered instead of marked successful.
  *
  * Each series is judged against its own family's timezone, so a series due on
  * "the 1st" posts when it is the 1st for that family, not for the worker.
@@ -422,11 +446,18 @@ export async function postDueSeries(exec: Executor, now = new Date()): Promise<P
     if (series.nextDue > today) continue;
 
     try {
-      let posted = false;
       let occurrence = series.nextDue;
-      // Catch-up loop: advance until past today, posting each missed occurrence.
-      while (occurrence <= today) {
+      let processed = 0;
+      // Catch-up loop: advance until past today, posting each missed
+      // occurrence in its own transaction (bounded per run, see
+      // MAX_CATCHUP_OCCURRENCES_PER_RUN).
+      while (occurrence <= today && processed < MAX_CATCHUP_OCCURRENCES_PER_RUN) {
         const externalId = `${series.id}:${occurrence}`;
+        const following = nextOccurrence(
+          series.frequency as Frequency,
+          series.config as SeriesConfig,
+          occurrence
+        );
         await exec.transaction(async (tx) => {
           const [entry] = await tx
             .insert(entries)
@@ -450,27 +481,60 @@ export async function postDueSeries(exec: Executor, now = new Date()): Promise<P
               categoryId: series.categoryId,
               merchant: series.merchant
             });
-            await tx
-              .update(recurringSeries)
-              .set({ lastPostedEntryId: entryId, updatedAt: new Date() })
-              .where(eq(recurringSeries.id, series.id));
           }
+          // Advance the schedule in the SAME transaction as the insert. On a
+          // dedupe hit (a legacy / interrupted run already committed this
+          // occurrence) entryId is undefined, but the advance still commits
+          // atomically, so progress is never lost or replayed.
+          await tx
+            .update(recurringSeries)
+            .set({
+              nextDue: following,
+              ...(entryId ? { lastPostedEntryId: entryId } : {}),
+              updatedAt: new Date()
+            })
+            .where(eq(recurringSeries.id, series.id));
         });
-        posted = true;
-        occurrence = nextOccurrence(
-          series.frequency as Frequency,
-          series.config as SeriesConfig,
-          occurrence
-        );
+        processed++;
+        occurrence = following;
       }
 
-      await exec
-        .update(recurringSeries)
-        .set({ nextDue: occurrence, updatedAt: new Date() })
-        .where(eq(recurringSeries.id, series.id));
+      if (processed >= MAX_CATCHUP_OCCURRENCES_PER_RUN && occurrence <= today) {
+        await captureDebugLog(exec, {
+          category: "recurring",
+          level: "warn",
+          message:
+            "Recurring catch-up hit the per-run occurrence bound; remainder deferred to next run",
+          source: "worker",
+          familyId: series.familyId,
+          accountId: series.accountId,
+          metadata: { seriesId: series.id, seriesName: series.name, nextDue: occurrence }
+        });
+      }
 
-      if (posted) {
-        await recalculateAccount(exec, series.accountId);
+      if (processed > 0) {
+        try {
+          await recalculateAccount(exec, series.accountId);
+        } catch (recalcError) {
+          // The entries are committed and the schedule has advanced, so a
+          // plain retry of this series would never revisit them. Enqueue
+          // durable repair work first, then surface the failure.
+          try {
+            await enqueue(
+              exec,
+              "maintenance:balances",
+              {},
+              {
+                dedupeKey: `balance-repair:${series.accountId}`
+              }
+            );
+          } catch {
+            // Repair enqueue is best-effort on top of the nightly
+            // maintenance:balances cron; the thrown failure below still
+            // drives the queue retry for this job.
+          }
+          throw recalcError;
+        }
         result.posted++;
       }
     } catch (e) {
