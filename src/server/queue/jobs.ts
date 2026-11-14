@@ -32,6 +32,28 @@ export async function runRecurringPost(exec: Executor) {
   return result;
 }
 
+/**
+ * Runs one balance-maintenance pass and propagates per-account failures to
+ * the queue. recalculateAllActiveAccounts deliberately attempts every
+ * account (one failure must not block the others), but a pass with failures
+ * is NOT a success: the durable repair jobs enqueued by recurring posting
+ * ride on this handler, so resolving here would complete the repair job
+ * while the very account needing repair stays stale — and once its series
+ * is no longer due, nothing would revisit it until nightly maintenance.
+ * Throwing routes the job through failJob's retry / dead-letter handling,
+ * which preserves the repair intent until a recalculation succeeds.
+ */
+export async function runBalanceMaintenance(exec: Executor) {
+  const result = await recalculateAllActiveAccounts(exec);
+  if (result.failures.length > 0) {
+    const ids = result.failures.map((f) => f.accountId).join(", ");
+    throw new Error(
+      `Balance recalculation failed for ${result.failures.length} account(s): ${ids} (${result.recalculated} succeeded).`
+    );
+  }
+  return result;
+}
+
 export async function createJobRegistry() {
   const mailer = createMailer();
   const registry = new Map<
@@ -49,7 +71,7 @@ export async function createJobRegistry() {
   });
 
   registry.set("maintenance:balances", async (_payload, exec) => {
-    await recalculateAllActiveAccounts(exec);
+    await runBalanceMaintenance(exec);
   });
 
   registry.set("maintenance:cleanup", async (_payload, exec) => {
