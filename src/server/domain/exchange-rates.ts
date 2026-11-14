@@ -1,6 +1,9 @@
 import { desc, sql } from "drizzle-orm";
 import type { Executor } from "../db/client";
 import { exchangeRates } from "../db/schema";
+import type { Actor } from "../auth/context";
+import { assertSuperAdmin } from "../auth/context";
+import { recordAudit } from "../observability/audit";
 import { isValidCurrency, currencyExponent } from "@/lib/money";
 import { errors } from "@/lib/errors";
 import { diffDays, isIsoDate } from "@/lib/datetime";
@@ -41,6 +44,37 @@ export async function upsertRate(
       target: [exchangeRates.baseCurrency, exchangeRates.quoteCurrency, exchangeRates.quotedOn],
       set: { rate: input.rate }
     });
+}
+
+/**
+ * The authorized write path for exchange rates. Rates are instance-level
+ * reference data (the exchange_rates table has no family scope), so an
+ * ordinary verified member — even a family admin — must not be able to
+ * replace rates other households' reports rely on. Only a platform
+ * super-admin may write; the audit event is instance-level too, so it
+ * carries no familyId. The bare upsertRate stays unguarded for fixture
+ * seeding in tests and trusted import paths.
+ */
+export async function upsertRateForActor(
+  exec: Executor,
+  actor: Actor,
+  input: { base: string; quote: string; rate: string; quotedOn: string }
+): Promise<void> {
+  assertSuperAdmin(actor);
+  await upsertRate(exec, input);
+  await recordAudit(exec, {
+    familyId: null,
+    actorUserId: actor.userId,
+    action: "exchange_rate.upserted",
+    entityType: "exchange_rate",
+    entityId: `${input.base.toUpperCase()}:${input.quote.toUpperCase()}:${input.quotedOn}`,
+    metadata: {
+      base: input.base.toUpperCase(),
+      quote: input.quote.toUpperCase(),
+      rate: input.rate,
+      quotedOn: input.quotedOn
+    }
+  });
 }
 
 export async function getRateInfo(

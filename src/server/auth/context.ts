@@ -83,6 +83,18 @@ export async function requireSuperAdmin(): Promise<Actor> {
   return actor;
 }
 
+/**
+ * Non-redirecting equivalent of requireSuperAdmin for domain code and tests:
+ * throws a forbidden DomainError instead of redirecting, so callers that
+ * already hold an Actor (server actions after requireSuperAdmin, domain
+ * services) can enforce the platform-admin boundary without Next.js.
+ */
+export function assertSuperAdmin(actor: Actor): void {
+  if (actor.platformRole !== "super_admin") {
+    throw errors.forbidden("Only a platform admin can perform that action.");
+  }
+}
+
 export function assertActorVerified(actor: Actor): void {
   if (requireEmailVerification() && !actor.emailVerified) {
     throw errors.forbidden("Email verification is required.");

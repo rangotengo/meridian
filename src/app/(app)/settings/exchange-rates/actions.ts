@@ -2,9 +2,9 @@
 
 import { revalidatePath } from "next/cache";
 import { z } from "zod";
-import { requireVerifiedActor } from "@/server/auth/context";
+import { requireSuperAdmin } from "@/server/auth/context";
 import { getDb } from "@/server/db/client";
-import { upsertRate } from "@/server/domain/exchange-rates";
+import { upsertRateForActor } from "@/server/domain/exchange-rates";
 import { runAction, type ActionState } from "@/server/actions/runner";
 
 const rateSchema = z.object({
@@ -16,18 +16,20 @@ const rateSchema = z.object({
 
 /**
  * Exchange rates are instance-level reference data (the exchange_rates table
- * has no family scope, mirroring exports), so any verified user who can see
- * a missing-rate warning can also fix it by entering the rate. Validation of
- * the pair, positivity, and date happens in upsertRate.
+ * has no family scope), so writes are restricted to platform super-admins:
+ * any verified user who could write here could replace the rates other
+ * households' reports rely on. Validation of the pair, positivity, and date
+ * happens in upsertRate; the actor and the changed rate are recorded in the
+ * audit trail by upsertRateForActor.
  */
 export async function upsertExchangeRateAction(
   _prev: ActionState | undefined,
   formData: FormData
 ): Promise<ActionState> {
   return runAction("fx.upsert_rate", async () => {
+    const actor = await requireSuperAdmin();
     const input = rateSchema.parse(Object.fromEntries(formData));
-    await requireVerifiedActor();
-    await upsertRate(getDb(), {
+    await upsertRateForActor(getDb(), actor, {
       base: input.base.toUpperCase(),
       quote: input.quote.toUpperCase(),
       rate: input.rate,

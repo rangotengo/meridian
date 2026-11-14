@@ -58,14 +58,24 @@ export default async function ExchangeRatesPage() {
         </Alert>
       ) : null}
 
-      <Card>
-        <h2 className="mb-4 text-base font-medium">Add or refresh a rate</h2>
-        <ExchangeRateForm
-          defaultBase={missing[0]?.currency ?? neededCurrencies[0] ?? "USD"}
-          defaultQuote={family.currency}
-          today={today}
-        />
-      </Card>
+      {actor.platformRole === "super_admin" ? (
+        <Card>
+          <h2 className="mb-4 text-base font-medium">Add or refresh a rate</h2>
+          <ExchangeRateForm
+            defaultBase={missing[0]?.currency ?? neededCurrencies[0] ?? "USD"}
+            defaultQuote={family.currency}
+            today={today}
+          />
+        </Card>
+      ) : (
+        <Card>
+          <h2 className="mb-4 text-base font-medium">Add or refresh a rate</h2>
+          <p className="text-sm text-muted-foreground">
+            Exchange rates are shared across all households, so only a platform admin can add or
+            change them. If a rate is missing or looks wrong, ask a platform admin to update it.
+          </p>
+        </Card>
+      )}
 
       <Card>
         <h2 className="mb-4 text-base font-medium">Rates for your accounts</h2>
