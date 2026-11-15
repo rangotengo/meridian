@@ -58,7 +58,11 @@ function widgetFor(id: string) {
       return <AccountCards />;
     case "transfer-spending":
       return (
-        <div className="flex h-full flex-col gap-4 [&>*]:flex-1">
+        // QuickActions keeps its natural height (shrink-0): forcing both
+        // cards to flex-1 halves squeezes it below its content height, and
+        // the Card's overflow-hidden then clips its buttons mid-row.
+        // SpendingLimit flexes to fill whatever height the row leaves.
+        <div className="flex h-full flex-col gap-4 [&>*:first-child]:shrink-0 [&>*:last-child]:flex-auto">
           <QuickActions />
           <SpendingLimit />
         </div>
