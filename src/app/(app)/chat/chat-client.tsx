@@ -284,7 +284,12 @@ export function ChatClient({
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
+              // Don't send while an IME composition is active: the Enter
+              // that confirms a candidate would otherwise send a
+              // half-composed message. keyCode 229 is the legacy signal
+              // some browsers still report for composition keydowns.
+              const composing = e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229;
+              if (e.key === "Enter" && !e.shiftKey && !composing) {
                 e.preventDefault();
                 void send(e);
               }
