@@ -256,10 +256,67 @@ check `node bin/cloud-ops.mjs status` when investigating.
 
 - `MERIDIAN_OPS_TOKEN`: rotate freely (`wrangler secret put ...`), then
   update operator machines. No data consequences.
-- `MERO_SHARE_ENCRYPTION_KEY`: **do not rotate casually.** Replacing it makes
-  every stored MeroShare credential undecryptable; affected users must
-  re-enter credentials (there is no re-encryption path). If key compromise
-  forces rotation, expect every household using MeroShare to reconnect.
+- `MERO_SHARE_ENCRYPTION_KEY`: rotate with the re-encryption tool — never by
+  just replacing the value, which would make every stored MeroShare
+  credential undecryptable. This is an **offline procedure for PostgreSQL
+  deployments**; the CLI does not rotate credentials inside a live
+  Cloudflare Durable Object.
+
+  Why the apps must be stopped: any still-running process configured with
+  the old key can save old-key credentials at any moment. The rotation
+  guards its own window — it holds an advisory lock that current credential
+  writers wait on, and it aborts if a write from a process that predates the
+  lock (an old binary, a manual SQL session) lands after its snapshot — but
+  no rotation can stop an old-key process from writing _after_ it commits.
+  Only the stopped-writers barrier below makes the cutover safe.
+
+  Procedure:
+  1. Generate a new key: `openssl rand -base64 32`. Store it in the vault
+     alongside the old key (see step 6 — the old key is retained, not
+     discarded).
+  2. **Stop web + worker** (every MeroShare credential writer) and confirm
+     they are down. Keep them stopped through step 5.
+  3. With the database reachable and the **current** key in
+     `MERO_SHARE_ENCRYPTION_KEY`, set `MERO_SHARE_NEW_ENCRYPTION_KEY` to the
+     new key and dry-run first:
+     `npm run meroshare:rotate-key -- --dry-run` (verifies every stored
+     credential decrypts under the current key; writes nothing).
+  4. Run `npm run meroshare:rotate-key`. The rotation is transactional: one
+     unreadable record, or any credential write that slips past the lock and
+     lands before the rotation's final verification read, aborts it with
+     nothing written and the old key keeps working. A write landing in the
+     sliver between that read and the commit cannot be detected by the tool
+     — which is why step 2 (writers stopped) is the real barrier, not a
+     formality.
+  5. While the apps are **still stopped**, replace
+     `MERO_SHARE_ENCRYPTION_KEY` with the new key in the deployment
+     environment of **both** web and worker, then redeploy/restart them.
+  6. Verify before resuming normal use: sign in and run a real MeroShare
+     sync for one connection — success proves the stored credentials
+     decrypt under the new key end to end. **Retain the old key in the
+     vault**: database backups taken before the rotation contain
+     `mero_share_connections` rows encrypted with the old key, and
+     restoring one brings those credentials back. Discard the old key only
+     once every backup containing old-key credentials has expired.
+
+  Failure and recovery:
+  - _Rotation aborts_ (unreadable record, or "credentials changed while the
+    rotation was running"): nothing was written; the old key is still the
+    only key in play. Keep the apps stopped, find and stop the writer (or
+    fix/remove the unreadable connection), then start again from the
+    dry-run in step 3.
+  - _Apps were started with the wrong key after a successful rotation_:
+    MeroShare syncs fail with "credentials are unreadable"; reads do not
+    damage the stored data. Stop the apps, set the correct new key on both,
+    redeploy, and re-verify per step 6. Exception: if a user **saved** a
+    connection while the wrong key was configured, that row is encrypted
+    with the wrong key — roll back (below) or have that user disconnect
+    and reconnect it after the correct key is live.
+  - _Roll back to the old key_: with the apps stopped, run the same tool in
+    reverse — `MERO_SHARE_ENCRYPTION_KEY` set to the current (new) key and
+    `MERO_SHARE_NEW_ENCRYPTION_KEY` set to the old key — then restore the
+    old key in both apps' environments and redeploy.
+
 - Access/Google OAuth secrets live in the Cloudflare/Google consoles, not in
   the Worker.
 

@@ -15,6 +15,37 @@ function key(): Buffer {
   return Buffer.from(env.MERO_SHARE_ENCRYPTION_KEY, "base64");
 }
 
+/**
+ * Parse an operator-supplied encryption key (base64) for offline tooling such
+ * as key rotation, where keys come from CLI environment variables rather than
+ * the runtime env. Throws a validation error naming the variable at fault.
+ */
+export function parseProviderSecretKey(value: string | undefined, envName: string): Buffer {
+  if (!value) {
+    throw errors.validation(
+      `${envName} is not set. Set it to a 32-byte base64 encryption key first.`
+    );
+  }
+  const keyMaterial = Buffer.from(value, "base64");
+  if (keyMaterial.length !== 32) {
+    throw errors.validation(`${envName} must be a 32-byte base64 value.`);
+  }
+  return keyMaterial;
+}
+
+/** Encrypt a provider credential with an explicit rotation key. */
+export function encryptProviderSecretWithKey(value: string, keyMaterial: Buffer): string {
+  return encryptText(value, keyMaterial);
+}
+
+export function decryptProviderSecretWithKey(value: string, keyMaterial: Buffer): string {
+  try {
+    return decryptText(value, keyMaterial);
+  } catch {
+    throw errors.conflict("Stored MeroShare credentials are unreadable. Reconnect the account.");
+  }
+}
+
 function encryptText(value: string, keyBytes: Buffer): string {
   const iv = randomBytes(IV_BYTES);
   const cipher = createCipheriv("aes-256-gcm", keyBytes, iv);
