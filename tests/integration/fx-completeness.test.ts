@@ -4,6 +4,7 @@ import * as reportsSvc from "@/server/domain/reports";
 import * as budgetsSvc from "@/server/domain/budgets";
 import * as categoriesSvc from "@/server/domain/categories";
 import * as exchangeRatesSvc from "@/server/domain/exchange-rates";
+import { executeTool, buildToolContext } from "@/server/ai/tools";
 import { currentFamily, type Family } from "@/server/auth/context";
 import { endOfMonth } from "@/lib/datetime";
 import type { TestUser } from "../helpers";
@@ -236,5 +237,42 @@ describe("fx completeness beyond the dashboard", () => {
     });
     expect(spend.fx.incompleteFx).toBe(false);
     expect(spend.fx.fxIssues).toHaveLength(0);
+  });
+
+  it("dashboard_summary AI tool forwards the fx completeness warnings", async () => {
+    const { user } = await makeHousehold();
+    await makeAccount(user, { currency: "CAD", openingBalanceDisplayMinor: 20000 });
+
+    const ctx = await buildToolContext(db(), actorOf(user));
+    const res = (await executeTool("dashboard_summary", "{}", ctx)) as {
+      netWorthMinor: number;
+      fx: reportsSvc.FxCompleteness;
+    };
+
+    // The CAD balance is excluded from the converted total, and the tool
+    // result carries the same `fx` shape as query_spending /
+    // monthly_income_expense instead of dropping the warning.
+    expect(res.netWorthMinor).toBe(0);
+    expect(res.fx.incompleteFx).toBe(true);
+    expect(res.fx.fxIssues).toHaveLength(1);
+    expect(res.fx.fxIssues[0]).toMatchObject({
+      base: "CAD",
+      quote: "NPR",
+      amountMinor: 20000
+    });
+
+    // Control: a household with only family-currency accounts gets a
+    // complete, empty fx block (arrays present, not undefined).
+    const { user: plainUser } = await makeHousehold();
+    await makeAccount(plainUser, { currency: "NPR", openingBalanceDisplayMinor: 5000 });
+    const plainCtx = await buildToolContext(db(), actorOf(plainUser));
+    const plain = (await executeTool("dashboard_summary", "{}", plainCtx)) as {
+      netWorthMinor: number;
+      fx: reportsSvc.FxCompleteness;
+    };
+    expect(plain.netWorthMinor).toBe(5000);
+    expect(plain.fx.incompleteFx).toBe(false);
+    expect(plain.fx.fxIssues).toEqual([]);
+    expect(plain.fx.fxRates).toEqual([]);
   });
 });

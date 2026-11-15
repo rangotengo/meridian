@@ -140,7 +140,15 @@ const TOOLS: Tool[] = [
         liabilitiesMinor: s.liabilitiesMinor,
         incomeThisMonthMinor: s.incomeThisMonthMinor,
         expenseThisMonthMinor: s.expenseThisMonthMinor,
-        monthKey: s.monthKey
+        monthKey: s.monthKey,
+        // Same `fx` shape as query_spending / monthly_income_expense:
+        // dashboardSummary exposes the fields flat (with undefined for
+        // empty lists), so normalize them into an FxCompleteness object.
+        fx: {
+          incompleteFx: s.incompleteFx,
+          fxIssues: s.fxIssues ?? [],
+          fxRates: s.fxRates ?? []
+        }
       };
     }
   ),
