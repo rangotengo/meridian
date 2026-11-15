@@ -43,4 +43,5 @@ export const oauthClients = tables.oauthClients;
 export const oauthGrants = tables.oauthGrants;
 export const oauthAuthorizationCodes = tables.oauthAuthorizationCodes;
 export const oauthTokens = tables.oauthTokens;
+export const oauthAssertionClaims = tables.oauthAssertionClaims;
 export const oauthAuthorizationRequests = tables.oauthAuthorizationRequests;

@@ -175,7 +175,13 @@ function accountFilter(accountIds?: string[]) {
 export async function dashboardSummary(
   exec: Executor,
   family: Family,
-  userId: string
+  userId: string,
+  /** Optional extra account restriction (e.g. an MCP grant's ceiling,
+   * already intersected with current access by the caller). EVERY
+   * subquery below applies it — balances, flows, categories, and
+   * recent entries — so a restricted summary can never leak totals,
+   * category names, or FX metadata from excluded accounts. */
+  accountIds?: string[]
 ): Promise<DashboardSummary> {
   const ctx = newConversionContext();
   const today = todayIn(family.timezone);
@@ -195,6 +201,7 @@ export async function dashboardSummary(
       AND a.status = 'active'
       AND a.included_in_reports = true
       AND ${ACCESS_SQL(userId)}
+      ${accountFilter(accountIds)}
       AND b.as_of = (SELECT max(latest.as_of) FROM balances latest WHERE latest.account_id = b.account_id AND latest.as_of <= ${today})
     ORDER BY b.account_id
   `);
@@ -239,6 +246,7 @@ export async function dashboardSummary(
       AND a.included_in_reports = true
       AND a.status = 'active'
       AND ${ACCESS_SQL(userId)}
+      ${accountFilter(accountIds)}
       AND e.entryable_type = 'transaction'
       AND t.transfer_id IS NULL
       AND NOT EXISTS (SELECT 1 FROM entries c WHERE c.parent_entry_id = e.id)
@@ -284,6 +292,7 @@ export async function dashboardSummary(
       AND a.included_in_reports = true
       AND a.status = 'active'
       AND ${ACCESS_SQL(userId)}
+      ${accountFilter(accountIds)}
       AND e.entryable_type = 'transaction'
       AND t.transfer_id IS NULL
       AND NOT EXISTS (SELECT 1 FROM entries c WHERE c.parent_entry_id = e.id)
@@ -335,6 +344,7 @@ export async function dashboardSummary(
     WHERE a.family_id = ${family.id}
       AND a.status = 'active'
       AND ${ACCESS_SQL(userId)}
+      ${accountFilter(accountIds)}
       AND NOT EXISTS (SELECT 1 FROM entries c WHERE c.parent_entry_id = e.id)
     ORDER BY e.date DESC, e.created_at DESC
     LIMIT 8
@@ -429,6 +439,12 @@ export async function netWorthMinorForAccounts(
 export type NetWorthSeriesResult = {
   points: NetWorthPoint[];
   fx: FxCompleteness;
+  /** Dates that HAVE a point but where at least one in-scope account's
+   * snapshot is missing, so the point understates net worth. Completeness
+   * is judged per account per day: an account is expected to contribute
+   * from its first snapshot date (its opening) onward; accounts with no
+   * snapshots at all are not yet reporting and are not counted. */
+  incompleteDates: { date: string; missingAccountIds: string[] }[];
 };
 
 export async function netWorthSeries(
@@ -443,12 +459,13 @@ export async function netWorthSeries(
   const cutoff =
     days === "all" ? sql`` : sql`AND b.as_of >= ${addDays(today, -days)} AND b.as_of <= ${today}`;
   const res = await exec.execute<{
+    account_id: string;
     as_of: string;
     balance_minor: string;
     currency: string;
     type: string;
   }>(sql`
-    SELECT CAST(b.as_of AS TEXT) AS as_of, CAST(b.balance_minor AS TEXT) AS balance_minor, b.currency, a.type
+    SELECT CAST(b.account_id AS TEXT) AS account_id, CAST(b.as_of AS TEXT) AS as_of, CAST(b.balance_minor AS TEXT) AS balance_minor, b.currency, a.type
     FROM balances b
     JOIN accounts a ON a.id = b.account_id
     WHERE a.family_id = ${family.id}
@@ -461,6 +478,7 @@ export async function netWorthSeries(
   `);
 
   const byDate = new Map<string, number>();
+  const presentByDate = new Map<string, Set<string>>();
   for (const r of res.rows ?? []) {
     const d = r.as_of.slice(0, 10);
     const converted = await convertTo(
@@ -472,7 +490,41 @@ export async function netWorthSeries(
       ctx
     );
     byDate.set(d, safeAdd(byDate.get(d) ?? 0, converted));
+    const present = presentByDate.get(d) ?? new Set<string>();
+    present.add(r.account_id);
+    presentByDate.set(d, present);
   }
+
+  // Per-account completeness: which in-scope accounts were expected to
+  // have a snapshot on each date that produced a point.
+  const scopeRows = await exec.execute<{
+    account_id: string;
+    first_date: string | null;
+  }>(sql`
+    SELECT CAST(a.id AS TEXT) AS account_id, CAST(MIN(b.as_of) AS TEXT) AS first_date
+    FROM accounts a
+    LEFT JOIN balances b ON b.account_id = a.id AND b.as_of <= ${today}
+    WHERE a.family_id = ${family.id}
+      AND a.status = 'active'
+      AND a.included_in_reports = true
+      AND ${ACCESS_SQL(userId)}
+      ${accountFilter(accountIds)}
+    GROUP BY a.id
+  `);
+  const firstSnapshotByAccount = new Map<string, string>();
+  for (const r of scopeRows.rows ?? []) {
+    if (r.first_date) firstSnapshotByAccount.set(r.account_id, r.first_date.slice(0, 10));
+  }
+  const incompleteDates: { date: string; missingAccountIds: string[] }[] = [];
+  for (const date of byDate.keys()) {
+    const present = presentByDate.get(date) ?? new Set<string>();
+    const missing: string[] = [];
+    for (const [accountId, firstDate] of firstSnapshotByAccount) {
+      if (firstDate <= date && !present.has(accountId)) missing.push(accountId);
+    }
+    if (missing.length > 0) incompleteDates.push({ date, missingAccountIds: missing.sort() });
+  }
+  incompleteDates.sort((a, b) => a.date.localeCompare(b.date));
 
   const fx = completenessOf(ctx);
   await reportFxIssues(exec, ctx, family.id, "net_worth_series");
@@ -480,7 +532,8 @@ export async function netWorthSeries(
     points: [...byDate.entries()]
       .sort(([a], [b]) => a.localeCompare(b))
       .map(([date, v]) => ({ date, valueMinor: v })),
-    fx
+    fx,
+    incompleteDates
   };
 }
 

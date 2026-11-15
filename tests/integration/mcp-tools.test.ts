@@ -1,11 +1,12 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { createHash } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import {
   actorOf,
   addTxn,
   db,
   daysAgo,
+  joinFamily,
   latestBalance,
   makeAccount,
   makeUser,
@@ -791,5 +792,119 @@ describe("scope enforcement matrix", () => {
     // The same grant can still use its own scope.
     const ok = await callTool(token, "search_transactions", {});
     expect(ok.result?.isError).toBeFalsy();
+  });
+});
+
+describe("get_financial_summary grant restriction (P1-1)", () => {
+  it("excludes ceiling-excluded accounts from totals, categories, and FX", async () => {
+    const user = await makeUser({ timezone: "UTC" });
+    const a = await makeAccount(user, { openingBalanceDisplayMinor: 100_000 });
+    const b = await makeAccount(user, { openingBalanceDisplayMinor: 900_000 });
+    const categoryId = await makeCategory(user, "PRIVATE excluded category");
+    await addTxn(user, b, {
+      amountLedgerMinor: 40_000,
+      name: "Excluded spend",
+      categoryId,
+      date: daysAgo(0)
+    });
+    const flow = await connectFlow(user);
+    await setCeiling(flow.grant.id, [a]);
+
+    const { data } = await callTool(flow.tokens.accessToken, "get_financial_summary", {});
+    expect(data.accounts.map((x: { id: string }) => x.id)).toEqual([a]);
+    // Before the fix the summary reported netWorth 960000 and the
+    // excluded account's 40000 of spending + its category name.
+    expect(data.netWorth.amountMinor).toBe("100000");
+    expect(data.assets.amountMinor).toBe("100000");
+    expect(data.expensesThisMonth.amountMinor).toBe("0");
+    expect(data.incomeThisMonth.amountMinor).toBe("0");
+    expect(data.topCategories.map((c: { name: string }) => c.name)).not.toContain(
+      "PRIVATE excluded category"
+    );
+    expect(data.fx.complete).toBe(true);
+  });
+
+  it("an excluded account's missing FX rate does not pollute the summary", async () => {
+    const user = await makeUser({ timezone: "UTC" });
+    const a = await makeAccount(user, { openingBalanceDisplayMinor: 100_000 });
+    await makeAccount(user, {
+      openingBalanceDisplayMinor: 500_000,
+      currency: "EUR",
+      name: "Euro excluded"
+    });
+    const flow = await connectFlow(user);
+    await setCeiling(flow.grant.id, [a]);
+
+    const { data } = await callTool(flow.tokens.accessToken, "get_financial_summary", {});
+    expect(data.netWorth.amountMinor).toBe("100000");
+    expect(data.fx.complete).toBe(true);
+    expect(data.fx.missingRates ?? []).toEqual([]);
+  });
+
+  it("losing a share removes the account from the summary without any ceiling change", async () => {
+    const owner = await makeUser({ timezone: "UTC" });
+    await makeAccount(owner, { openingBalanceDisplayMinor: 100_000 });
+    const b = await makeAccount(owner, {
+      openingBalanceDisplayMinor: 900_000,
+      joint: false
+    });
+    const member = await makeUser({ timezone: "UTC" });
+    await joinFamily(member, owner.familyId);
+    await db().execute(
+      sql`INSERT INTO account_shares (account_id, user_id, permission) VALUES (${b}::uuid, ${member.userId}::uuid, 'read_only')`
+    );
+
+    const flow = await connectFlow(member);
+    const withShare = await callTool(flow.tokens.accessToken, "get_financial_summary", {});
+    expect(withShare.data.netWorth.amountMinor).toBe("1000000");
+
+    await db().execute(
+      sql`DELETE FROM account_shares WHERE account_id = ${b}::uuid AND user_id = ${member.userId}::uuid`
+    );
+    const withoutShare = await callTool(flow.tokens.accessToken, "get_financial_summary", {});
+    expect(withoutShare.data.netWorth.amountMinor).toBe("100000");
+    expect(withoutShare.data.accounts.map((x: { id: string }) => x.id)).not.toContain(b);
+  });
+
+  it("reports an account with no snapshots as amountMinor null, never zero (P2-7b)", async () => {
+    const user = await makeUser({ timezone: "UTC" });
+    const acct = await makeAccount(user, { openingBalanceDisplayMinor: 50_000 });
+    await db().execute(sql`DELETE FROM balances WHERE account_id = ${acct}::uuid`);
+    const flow = await connectFlow(user);
+
+    const { data } = await callTool(flow.tokens.accessToken, "get_financial_summary", {});
+    const row = data.accounts.find((x: { id: string }) => x.id === acct);
+    expect(row).toBeDefined();
+    expect(row.amountMinor).toBeNull();
+    expect(row.balanceInBaseMinor).toBeNull();
+  });
+});
+
+describe("get_net_worth_history per-account completeness (P2-7a)", () => {
+  it("marks a point partial when one account's snapshot is missing for that day", async () => {
+    const user = await makeUser({ timezone: "UTC" });
+    await makeAccount(user, { openingBalanceDisplayMinor: 100_000, openedOn: daysAgo(30) });
+    const b = await makeAccount(user, {
+      openingBalanceDisplayMinor: 900_000,
+      openedOn: daysAgo(30)
+    });
+    await db().execute(
+      sql`DELETE FROM balances WHERE account_id = ${b}::uuid AND as_of = ${daysAgo(0)}::date`
+    );
+    const flow = await connectFlow(user);
+
+    const { data } = await callTool(flow.tokens.accessToken, "get_net_worth_history", {
+      days: 1
+    });
+    // Before the fix this reported 100000 with coverage.complete=true
+    // and missingDays=0 — a partial total presented as complete.
+    expect(data.points).toHaveLength(1);
+    expect(data.points[0].date).toBe(daysAgo(0));
+    expect(data.points[0].netWorth.amountMinor).toBe("100000");
+    expect(data.points[0].complete).toBe(false);
+    expect(data.points[0].missingAccountIds).toEqual([b]);
+    expect(data.coverage.complete).toBe(false);
+    expect(data.coverage.missingDays).toBe(0);
+    expect(data.coverage.partialDays).toEqual([{ date: daysAgo(0), missingAccountIds: [b] }]);
   });
 });

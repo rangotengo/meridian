@@ -202,11 +202,19 @@ export function createMeridianMcpServer(ctx: McpRequestContext): McpServer {
     async () => {
       requireScope(TOOL_SCOPES.get_financial_summary);
 
-      const summary = await dashboardSummary(exec, family, actor.userId);
-
       // Account visibility is re-resolved per call; the grant's account
       // ceiling (empty = all accessible, the PoC default) narrows it.
+      // The restriction is passed INTO the summary service so every
+      // subquery — balances, flows, categories, FX — is computed over
+      // the visible set only. Filtering the account list afterwards
+      // would still leak excluded accounts' totals and category names.
       const visibleIds = await visibleAccountIds();
+      const summary = await dashboardSummary(
+        exec,
+        family,
+        actor.userId,
+        serviceRestriction(visibleIds)
+      );
 
       const accountRows =
         visibleIds.length > 0
@@ -228,7 +236,10 @@ export function createMeridianMcpServer(ctx: McpRequestContext): McpServer {
           id: a.id,
           name: a.name,
           type: a.type,
-          ...money(balance?.balanceMinor ?? 0, a.currency),
+          // No snapshot means the balance is UNKNOWN — null, never "0".
+          amountMinor: balance ? String(balance.balanceMinor) : null,
+          currency: a.currency,
+          currencyExponent: currencyExponent(a.currency),
           balanceInBaseMinor:
             balance == null
               ? null
@@ -711,7 +722,7 @@ export function createMeridianMcpServer(ctx: McpRequestContext): McpServer {
     {
       title: "Get net worth history",
       description:
-        "Read-only historical net worth from the household's materialized daily balance snapshots, in the household currency (integer minor units as strings). Give either a day count (default 90) or an explicit from/to date range (maximum 730 days). The coverage block states exactly which days in the range have snapshots: days without snapshots are reported as missing (with gap ranges), never interpolated or presented as zero. When fx.complete is false, some balances could not be converted on some days and those days' values exclude them.",
+        "Read-only historical net worth from the household's materialized daily balance snapshots, in the household currency (integer minor units as strings). Give either a day count (default 90) or an explicit from/to date range (maximum 730 days). The coverage block states exactly which days in the range have snapshots: days without snapshots are reported as missing (with gap ranges), never interpolated or presented as zero. Completeness is per account per day: a point where some visible account's snapshot is missing is marked complete: false with the missing account ids (and listed in coverage.partialDays), and coverage.complete is true only when every day is fully covered. When fx.complete is false, some balances could not be converted on some days and those days' values exclude them.",
       inputSchema: z.object({
         days: z.number().int().min(1).max(730).optional(),
         from: dateString.optional(),
@@ -777,16 +788,38 @@ export function createMeridianMcpServer(ctx: McpRequestContext): McpServer {
       }
       const missingDays = gaps.reduce((acc, g) => acc + g.days, 0);
 
+      // Per-account/day completeness within the requested range: a day
+      // can have a point (some accounts reported) while another visible
+      // account's snapshot is missing — such points are partial and
+      // must never be presented as complete.
+      const partialByDate = new Map(
+        res.incompleteDates
+          .filter((d) => d.date >= from && d.date <= to)
+          .map((d) => [d.date, d.missingAccountIds])
+      );
+      const partialDays = [...partialByDate.entries()]
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([date, missingAccountIds]) => ({ date, missingAccountIds }));
+
       const result = {
         ...envelope(),
         period: { from, to },
-        points: points.map((p) => ({ date: p.date, netWorth: money(p.valueMinor, base) })),
+        points: points.map((p) => {
+          const missingAccountIds = partialByDate.get(p.date);
+          return {
+            date: p.date,
+            netWorth: money(p.valueMinor, base),
+            complete: missingAccountIds === undefined,
+            ...(missingAccountIds ? { missingAccountIds } : {})
+          };
+        }),
         coverage: {
           daysInRange: spanDays,
           daysWithSnapshots: points.length,
           missingDays,
           gaps,
-          complete: missingDays === 0
+          partialDays,
+          complete: missingDays === 0 && partialDays.length === 0
         },
         fx: fxFromCompleteness(res.fx, base)
       };

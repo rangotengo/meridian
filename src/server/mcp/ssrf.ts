@@ -16,14 +16,19 @@
  *    DNS lookup), so the address that was checked is the address dialed.
  *  - Redirects are followed manually (max 3) and every hop re-runs the
  *    full policy, including DNS resolution for the new host.
- *  - Strict timeout (5 s) and response-size cap (32 KB); the response must
- *    be JSON by content type.
+ *  - One TOTAL deadline (default 5 s) covers DNS, connect, redirects,
+ *    and the body read across all hops — it is an absolute budget, not a
+ *    per-socket inactivity timer. Response-size cap 32 KB; the response
+ *    must be JSON by content type.
  *
  * Workers limitation (documented finding): workerd offers no DNS
  * resolution or connection pinning API, so on the Cloudflare backend the
- * resolver step is unavailable and the policy degrades to URL-level checks
- * plus per-hop re-validation over `fetch`. The Node posture is the full
- * one; the gap is recorded in docs/mcp-poc.md, not silently papered over.
+ * resolver step is unavailable. Callers on that backend therefore pass an
+ * operator allowlist (MCP_CIMD_ALLOWLIST) in the fetch options, and the
+ * fetcher enforces it before EVERY hop — the initial URL and every
+ * redirect target — before any network call. The Node posture needs no
+ * allowlist because the destination is enforced by pinning; the gap is
+ * recorded in docs/mcp-poc.md, not silently papered over.
  */
 import { usesCloudStorage } from "../db/dialect";
 
@@ -191,6 +196,43 @@ async function defaultResolveHost(hostname: string): Promise<string[] | null> {
   return records.map((r) => r.address);
 }
 
+/**
+ * DNS lookup callback that pins a connection to pre-validated
+ * addresses: the addresses that were checked are the addresses dialed
+ * (no DNS-rebinding window). Node's happy-eyeballs path
+ * (autoSelectFamily, default since Node 20) calls lookup with
+ * { all: true } and expects an ARRAY of { address, family }; the
+ * single-address shape is used otherwise. Returning a bare string for
+ * the all:true call makes Node throw ERR_INVALID_IP_ADDRESS before any
+ * request is sent (the P1-3 regression — every pre-existing test
+ * injected a fake transport, so the real path was never exercised).
+ * Exported for the real-transport regression tests.
+ */
+export function createPinnedLookup(pinned: string[]) {
+  return (
+    _host: string,
+    opts: { all?: boolean },
+    cb: (
+      err: Error | null,
+      address: string | { address: string; family: number }[],
+      family?: number
+    ) => void
+  ): void => {
+    if (opts?.all) {
+      cb(
+        null,
+        pinned.map((address) => ({
+          address,
+          family: address.includes(":") ? 6 : 4
+        }))
+      );
+      return;
+    }
+    const first = pinned[0]!;
+    cb(null, first, first.includes(":") ? 6 : 4);
+  };
+}
+
 const nodeTransport: MetadataTransport = async (url, pinned, { timeoutMs, maxBytes }) => {
   const https = await import("node:https");
   return new Promise<MetadataHttpResponse>((resolvePromise, rejectPromise) => {
@@ -203,16 +245,7 @@ const nodeTransport: MetadataTransport = async (url, pinned, { timeoutMs, maxByt
       timeout: timeoutMs
     };
     if (pinned) {
-      // Pin the connection to a pre-validated address: the address that
-      // was checked is the address dialed (no DNS-rebinding window).
-      options.lookup = (
-        _host: string,
-        _opts: unknown,
-        cb: (err: Error | null, address: string, family: number) => void
-      ) => {
-        const first = pinned[0]!;
-        cb(null, first, first.includes(":") ? 6 : 4);
-      };
+      options.lookup = createPinnedLookup(pinned);
     }
     const request = https.request(options as never, (response) => {
       const chunks: Buffer[] = [];
@@ -226,6 +259,7 @@ const nodeTransport: MetadataTransport = async (url, pinned, { timeoutMs, maxByt
         chunks.push(chunk);
       });
       response.on("end", () => {
+        clearTimeout(deadlineTimer);
         resolvePromise({
           status: response.statusCode ?? 0,
           contentType: response.headers["content-type"] ?? null,
@@ -233,12 +267,24 @@ const nodeTransport: MetadataTransport = async (url, pinned, { timeoutMs, maxByt
           body: Buffer.concat(chunks).toString("utf8")
         });
       });
-      response.on("error", rejectPromise);
+      response.on("error", (error) => {
+        clearTimeout(deadlineTimer);
+        rejectPromise(error);
+      });
     });
+    // Absolute deadline for this hop. The `timeout` option above is only
+    // a socket INACTIVITY timer: a slow-drip peer could otherwise hold
+    // the fetch open indefinitely while still sending bytes.
+    const deadlineTimer = setTimeout(() => {
+      request.destroy(new SsrfError(`Metadata fetch exceeded its deadline of ${timeoutMs} ms.`));
+    }, timeoutMs);
     request.on("timeout", () => {
       request.destroy(new SsrfError(`Metadata fetch timed out after ${timeoutMs} ms.`));
     });
-    request.on("error", rejectPromise);
+    request.on("error", (error) => {
+      clearTimeout(deadlineTimer);
+      rejectPromise(error);
+    });
     request.end();
   });
 };
@@ -279,6 +325,11 @@ function defaultTransport(): MetadataTransport {
   return usesCloudStorage ? fetchTransport : nodeTransport;
 }
 
+/** The real transports, exported for regression tests that must exercise
+ * the genuine network path instead of an injected fake. */
+export const nodeMetadataTransport: MetadataTransport = nodeTransport;
+export const fetchMetadataTransport: MetadataTransport = fetchTransport;
+
 // --- The policy fetch -------------------------------------------------------
 
 function validateBasicUrl(raw: string): URL {
@@ -303,8 +354,47 @@ function validateBasicUrl(raw: string): URL {
 
 export type MetadataFetcher = (
   rawUrl: string,
-  opts?: { timeoutMs?: number; maxBytes?: number; maxRedirects?: number }
+  opts?: {
+    timeoutMs?: number;
+    maxBytes?: number;
+    maxRedirects?: number;
+    /**
+     * Operator-approved exact URLs (MCP_CIMD_ALLOWLIST). Enforced on the
+     * Workers backend — where DNS pinning is impossible — before EVERY
+     * network hop, including redirect targets. Ignored on Node, where
+     * the destination is enforced by address pinning instead.
+     */
+    allowlist?: string[];
+  }
 ) => Promise<unknown>;
+
+/** Race a step against the remaining total-deadline budget. */
+async function withinBudget<T>(step: Promise<T>, remainingMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      step,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new SsrfError("Metadata fetch exceeded its total deadline.")),
+          Math.max(1, remainingMs)
+        );
+      })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function allowlistAllows(allowlist: string[], url: URL): boolean {
+  return allowlist.some((entry) => {
+    try {
+      return new URL(entry).href === url.href;
+    } catch {
+      return entry === url.href;
+    }
+  });
+}
 
 export function createMetadataFetcher(deps: MetadataFetcherDeps = {}): MetadataFetcher {
   const resolveHost = deps.resolveHost ?? defaultResolveHost;
@@ -314,11 +404,32 @@ export function createMetadataFetcher(deps: MetadataFetcherDeps = {}): MetadataF
     const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const maxBytes = opts.maxBytes ?? DEFAULT_MAX_BYTES;
     const maxRedirects = opts.maxRedirects ?? MAX_REDIRECTS;
+    // ONE total deadline for the whole fetch: DNS, connect, every
+    // redirect hop, and the body read all draw from the same budget.
+    const deadlineAt = Date.now() + timeoutMs;
+    const remaining = () => deadlineAt - Date.now();
 
     let current = rawUrl;
     for (let hop = 0; hop <= maxRedirects; hop++) {
+      if (remaining() <= 0) {
+        throw new SsrfError("Metadata fetch exceeded its total deadline.");
+      }
       const url = validateBasicUrl(current);
       const host = url.hostname.toLowerCase();
+
+      // Workers: no DNS pinning exists, so the operator allowlist is
+      // the destination control — and it applies to EVERY hop, not just
+      // the initial URL. An approved URL must not be able to redirect
+      // the fetch to an unapproved host.
+      if (
+        usesCloudStorage &&
+        opts.allowlist !== undefined &&
+        !allowlistAllows(opts.allowlist, url)
+      ) {
+        throw new SsrfError(
+          `Metadata URL ${url.href} is not in the operator allowlist for this deployment.`
+        );
+      }
 
       // Resolve first and judge EVERY address before any connection.
       let pinned: string[] | null = null;
@@ -328,7 +439,7 @@ export function createMetadataFetcher(deps: MetadataFetcherDeps = {}): MetadataF
         }
         pinned = [host];
       } else {
-        const addresses = await resolveHost(host);
+        const addresses = await withinBudget(resolveHost(host), remaining());
         if (addresses !== null) {
           if (addresses.length === 0) {
             throw new SsrfError(`Metadata host ${host} did not resolve.`);
@@ -344,7 +455,10 @@ export function createMetadataFetcher(deps: MetadataFetcherDeps = {}): MetadataF
         }
       }
 
-      const response = await transport(url, pinned, { timeoutMs, maxBytes });
+      const response = await transport(url, pinned, {
+        timeoutMs: Math.max(1, remaining()),
+        maxBytes
+      });
 
       if (response.status >= 300 && response.status < 400) {
         if (!response.location) throw new SsrfError("Metadata redirect without a Location.");

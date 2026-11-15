@@ -94,7 +94,22 @@ describe("Cloudflare SQLite storage", () => {
       consentCsrfRejected: true,
       consentSingleUse: true,
       cimdBlockedWithoutAllowlist: true,
-      cimdAllowedWithAllowlist: true
+      cimdAllowedWithAllowlist: true,
+      descendantRefreshRejected: true,
+      descendantPairDead: true,
+      resourceChangeRefreshRejected: true,
+      resourceChangeAccessRejected: true,
+      assertionFirstOk: true,
+      assertionReplayRejected: true,
+      assertionMissingExpRejected: true
+    });
+  });
+
+  it("enforces the CIMD allowlist on every redirect hop in cloud DO (P1-4)", async () => {
+    const result = await probe("mcp-ssrf-redirect");
+    expect(result).toEqual({
+      redirectToUnapprovedBlocked: true,
+      redirectWithinAllowlistAllowed: true
     });
   });
 
@@ -110,7 +125,9 @@ describe("Cloudflare SQLite storage", () => {
       searchDeniedForFinanceGrant: true,
       crossHouseholdIsolated: true,
       breakdownMerchantOk: true,
-      summaryOk: true
+      summaryOk: true,
+      summaryExcludesCeilingAccount: true,
+      netWorthPartialFlagged: true
     });
   });
 

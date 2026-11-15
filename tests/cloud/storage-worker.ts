@@ -25,6 +25,7 @@ import { createApiKey, verifyApiKey, revokeApiKey } from "../../src/server/domai
 import {
   OAuthError,
   approveAuthorizationRequest,
+  authenticateOAuthClient,
   consumeAuthorizationRequest,
   createAuthorizationRequest,
   exchangeAuthorizationCode,
@@ -37,7 +38,13 @@ import {
   validateAuthorizeRequest
 } from "../../src/server/domain/oauth";
 import type { McpConfig } from "../../src/lib/env";
-import type { MetadataFetcher } from "../../src/server/mcp/ssrf";
+import {
+  createMetadataFetcher,
+  type MetadataFetcher,
+  type MetadataTransport
+} from "../../src/server/mcp/ssrf";
+import { clearCimdCaches } from "../../src/server/mcp/cimd";
+import { SignJWT, exportJWK, generateKeyPair } from "jose";
 import { handleMcpRequest } from "../../src/server/mcp/server";
 import { createHash } from "node:crypto";
 import { parseSms } from "../../src/server/domain/sms-parser";
@@ -790,6 +797,115 @@ export class StorageProbe {
       const concurrentRefreshSingleWinner =
         refreshRace.filter((r) => r.status === "fulfilled").length === 1;
 
+      // P1-2 (cloud adaptation): after a reuse invalidation, a
+      // DESCENDANT refresh must be rejected and the descendant pair
+      // dead. The DO executor serializes whole transactions behind its
+      // mutex, so the Postgres lock interleavings have no analogue
+      // here; the invariant outcome is what is asserted.
+      const f6 = await newCode();
+      const t6 = await exchange(f6.code, f6.verifier);
+      const pair6 = await refreshOAuthToken(
+        exec,
+        { refreshToken: t6.refreshToken! },
+        client,
+        config
+      );
+      try {
+        await refreshOAuthToken(exec, { refreshToken: t6.refreshToken! }, client, config);
+      } catch {
+        /* replaying the rotated-out token: invalidates the family */
+      }
+      let descendantRefreshRejected = false;
+      try {
+        await refreshOAuthToken(exec, { refreshToken: pair6.refreshToken! }, client, config);
+      } catch (e) {
+        descendantRefreshRejected = isInvalidGrant(e);
+      }
+      const descendantPairDead = (await resolveMcpAccess(exec, pair6.accessToken, config)) === null;
+
+      // P2-8: the STORED resource governs refresh — a config change
+      // must not retarget stored credentials to the new resource.
+      const configB = { ...config, resourceUrl: "https://other-resource.test/mcp" };
+      const f7 = await newCode();
+      const t7 = await exchange(f7.code, f7.verifier);
+      let resourceChangeRefreshRejected = false;
+      try {
+        await refreshOAuthToken(
+          exec,
+          { refreshToken: t7.refreshToken!, resource: configB.resourceUrl },
+          client,
+          configB
+        );
+      } catch (e) {
+        resourceChangeRefreshRejected = isInvalidGrant(e);
+      }
+      const resourceChangeAccessRejected =
+        (await resolveMcpAccess(exec, t7.accessToken, configB)) === null;
+
+      // P2-6: private_key_jwt assertions — exp required, jti claimed
+      // exactly once (sequential replay rejected here; the concurrent
+      // claim race is covered on Postgres where connections are real).
+      clearCimdCaches();
+      const { publicKey, privateKey } = await generateKeyPair("RS256");
+      const jwk = await exportJWK(publicKey);
+      jwk.kid = "cloud-claims-key";
+      const claimsUrl = "https://claims.example.test/client.json";
+      const claimsDoc = {
+        client_id: claimsUrl,
+        client_name: "Cloud Claims",
+        redirect_uris: ["https://chatgpt.com/connector_platform_oauth_redirect"],
+        token_endpoint_auth_method: "private_key_jwt",
+        jwks: { keys: [jwk] }
+      };
+      const claimsFetcher: MetadataFetcher = async () => claimsDoc;
+      const claimsConfig = { ...config, cimdAllowlist: [claimsUrl] };
+      const assertion = await new SignJWT({})
+        .setProtectedHeader({ alg: "RS256", kid: "cloud-claims-key" })
+        .setIssuer(claimsUrl)
+        .setSubject(claimsUrl)
+        .setAudience("https://meridian.test/oauth/token")
+        .setIssuedAt()
+        .setExpirationTime("2m")
+        .setJti("cloud-jti-1")
+        .sign(privateKey);
+      const authArgs = {
+        clientId: claimsUrl,
+        clientAssertion: assertion,
+        clientAssertionType: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+      };
+      let assertionFirstOk = false;
+      try {
+        await authenticateOAuthClient(exec, authArgs, claimsConfig, claimsFetcher);
+        assertionFirstOk = true;
+      } catch {
+        assertionFirstOk = false;
+      }
+      let assertionReplayRejected = false;
+      try {
+        await authenticateOAuthClient(exec, authArgs, claimsConfig, claimsFetcher);
+      } catch (e) {
+        assertionReplayRejected = e instanceof OAuthError && e.error === "invalid_client";
+      }
+      const noExpAssertion = await new SignJWT({})
+        .setProtectedHeader({ alg: "RS256", kid: "cloud-claims-key" })
+        .setIssuer(claimsUrl)
+        .setSubject(claimsUrl)
+        .setAudience("https://meridian.test/oauth/token")
+        .setIssuedAt()
+        .setJti("cloud-jti-2")
+        .sign(privateKey);
+      let assertionMissingExpRejected = false;
+      try {
+        await authenticateOAuthClient(
+          exec,
+          { ...authArgs, clientAssertion: noExpAssertion },
+          claimsConfig,
+          claimsFetcher
+        );
+      } catch (e) {
+        assertionMissingExpRejected = e instanceof OAuthError && e.error === "invalid_client";
+      }
+
       // Household move: rejected, never redirected to the new household.
       const f5 = await newCode();
       const t5 = await exchange(f5.code, f5.verifier);
@@ -860,8 +976,75 @@ export class StorageProbe {
         consentCsrfRejected,
         consentSingleUse,
         cimdBlockedWithoutAllowlist,
-        cimdAllowedWithAllowlist
+        cimdAllowedWithAllowlist,
+        descendantRefreshRejected,
+        descendantPairDead,
+        resourceChangeRefreshRejected,
+        resourceChangeAccessRejected,
+        assertionFirstOk,
+        assertionReplayRejected,
+        assertionMissingExpRejected
       });
+    }
+    if (operation === "/mcp-ssrf-redirect") {
+      // P1-4: on the Workers path (resolveHost is null in production)
+      // the CIMD allowlist must be enforced before EVERY hop — an
+      // approved URL redirecting off-allowlist must never be fetched.
+      const APPROVED = "https://approved.example/client.json";
+      const APPROVED2 = "https://approved.example/jwks.json";
+      const UNAPPROVED = "https://unapproved.example/client.json";
+      const seenBlocked: string[] = [];
+      const redirectOut: MetadataTransport = async (url) => {
+        seenBlocked.push(url.toString());
+        if (url.toString() === APPROVED) {
+          return { status: 302, contentType: null, location: UNAPPROVED, body: "" };
+        }
+        return {
+          status: 200,
+          contentType: "application/json",
+          location: null,
+          body: "{}"
+        };
+      };
+      const fetcherBlocked = createMetadataFetcher({
+        resolveHost: async () => null,
+        transport: redirectOut
+      });
+      let blockedThrew = false;
+      try {
+        await fetcherBlocked(APPROVED, { allowlist: [APPROVED] });
+      } catch {
+        blockedThrew = true;
+      }
+      const redirectToUnapprovedBlocked = blockedThrew && !seenBlocked.includes(UNAPPROVED);
+
+      const seenOk: string[] = [];
+      const redirectIn: MetadataTransport = async (url) => {
+        seenOk.push(url.toString());
+        if (url.toString() === APPROVED) {
+          return { status: 302, contentType: null, location: APPROVED2, body: "" };
+        }
+        return {
+          status: 200,
+          contentType: "application/json",
+          location: null,
+          body: JSON.stringify({ ok: true })
+        };
+      };
+      const fetcherOk = createMetadataFetcher({
+        resolveHost: async () => null,
+        transport: redirectIn
+      });
+      let positiveDoc: unknown = null;
+      try {
+        positiveDoc = await fetcherOk(APPROVED, { allowlist: [APPROVED, APPROVED2] });
+      } catch {
+        positiveDoc = null;
+      }
+      const redirectWithinAllowlistAllowed =
+        (positiveDoc as { ok?: boolean } | null)?.ok === true && seenOk.length === 2;
+
+      return Response.json({ redirectToUnapprovedBlocked, redirectWithinAllowlistAllowed });
     }
     if (operation === "/mcp-tools") {
       const exec = db as unknown as Executor;
@@ -1077,6 +1260,78 @@ export class StorageProbe {
       const summary = await callTool(full.accessToken, "get_financial_summary");
       const summaryOk = summary.isError !== true && summary.data?.household?.baseCurrency === "NPR";
 
+      // P1-1: a ceiling-restricted summary excludes the second account
+      // from every figure, not just the account list.
+      const vault = await createAccount(exec, actor, {
+        name: "Excluded Vault",
+        type: "depository",
+        currency: "NPR",
+        openedOn: isoDaysAgo(10),
+        openingBalanceDisplayMinor: 900_000,
+        includedInReports: true,
+        joint: false
+      });
+      await addTransaction(exec, actor, {
+        accountId: vault.accountId,
+        date: isoDaysAgo(0),
+        amountLedgerMinor: 40_000,
+        name: "Vault spend"
+      });
+      const connectWithCeiling = async (accountIds: string[]) => {
+        const verifier = `${crypto.randomUUID()}${crypto.randomUUID()}`;
+        const challenge = createHash("sha256").update(verifier).digest("base64url");
+        const request = await validateAuthorizeRequest(
+          exec,
+          {
+            clientId: client.clientId,
+            redirectUri,
+            responseType: "code",
+            codeChallenge: challenge,
+            codeChallengeMethod: "S256",
+            scope: "finance:read offline_access",
+            resource: config.resourceUrl,
+            state: null
+          },
+          config
+        );
+        const { record, csrfToken } = await createAuthorizationRequest(exec, { actor, request });
+        const consumed = await consumeAuthorizationRequest(exec, {
+          requestId: record.id,
+          actor,
+          csrfToken
+        });
+        const { grant, code } = await approveAuthorizationRequest(exec, consumed, config);
+        await exec.execute(
+          sql`UPDATE oauth_grants SET account_ids = ${JSON.stringify(accountIds)} WHERE id = ${grant.id}`
+        );
+        return exchangeAuthorizationCode(
+          exec,
+          { code, redirectUri, codeVerifier: verifier, resource: config.resourceUrl },
+          client,
+          config
+        );
+      };
+      const ceilingTokens = await connectWithCeiling([account.accountId]);
+      const ceilingSummary = await callTool(ceilingTokens.accessToken, "get_financial_summary");
+      const summaryExcludesCeilingAccount =
+        ceilingSummary.data?.accounts?.length === 1 &&
+        ceilingSummary.data.netWorth?.amountMinor === "75000" &&
+        ceilingSummary.data.expensesThisMonth?.amountMinor === "25000";
+
+      // P2-7a: deleting the vault's snapshot for today makes today's
+      // net-worth point partial — it must be flagged, not complete.
+      await exec.execute(
+        sql`DELETE FROM balances WHERE account_id = ${vault.accountId} AND as_of = ${isoDaysAgo(0)}`
+      );
+      const history = await callTool(full.accessToken, "get_net_worth_history", { days: 1 });
+      const netWorthPartialFlagged =
+        history.data?.points?.length === 1 &&
+        history.data.points[0].complete === false &&
+        Array.isArray(history.data.points[0].missingAccountIds) &&
+        history.data.points[0].missingAccountIds.includes(vault.accountId) &&
+        history.data.coverage?.complete === false &&
+        history.data.coverage?.missingDays === 0;
+
       return Response.json({
         listAccountsOk,
         searchOk,
@@ -1087,7 +1342,9 @@ export class StorageProbe {
         searchDeniedForFinanceGrant,
         crossHouseholdIsolated,
         breakdownMerchantOk,
-        summaryOk
+        summaryOk,
+        summaryExcludesCeilingAccount,
+        netWorthPartialFlagged
       });
     }
     if (operation === "/mcp-settings") {

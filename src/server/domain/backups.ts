@@ -25,6 +25,12 @@ import {
   meroShareConnections,
   meroShareHoldings,
   meroShareTransactions,
+  oauthAssertionClaims,
+  oauthAuthorizationCodes,
+  oauthAuthorizationRequests,
+  oauthClients,
+  oauthGrants,
+  oauthTokens,
   recurringSeries,
   savedFilters,
   tags,
@@ -47,6 +53,13 @@ import { errors } from "@/lib/errors";
  * Ephemeral runtime state is deliberately excluded: sessions and auth tokens
  * (users sign in again after a restore), rate-limit counters, the job queue,
  * and cron schedules (the worker recreates its schedules on boot).
+ *
+ * MCP OAuth state follows the API-key precedent: the oauth_* tables ARE
+ * data-bearing (durable consent grants, like API keys) and are included,
+ * so an instance restore preserves AI-agent connections. The per-family
+ * household export is the opposite contract by design: it never contains
+ * OAuth grants, codes, or tokens — a household restored from it (even
+ * into the same instance) must reconnect its AI agents from scratch.
  *
  * Tables are listed in foreign-key order (parents before children) so a
  * restore can insert them verbatim, preserving ids, into an empty database.
@@ -92,7 +105,13 @@ const INSTANCE_TABLES: { name: string; table: Table }[] = [
   { name: "meroShareHoldings", table: meroShareHoldings },
   { name: "meroShareTransactions", table: meroShareTransactions },
   { name: "chatMessages", table: chatMessages },
-  { name: "chatProposals", table: chatProposals }
+  { name: "chatProposals", table: chatProposals },
+  { name: "oauthClients", table: oauthClients },
+  { name: "oauthGrants", table: oauthGrants },
+  { name: "oauthAuthorizationRequests", table: oauthAuthorizationRequests },
+  { name: "oauthAuthorizationCodes", table: oauthAuthorizationCodes },
+  { name: "oauthTokens", table: oauthTokens },
+  { name: "oauthAssertionClaims", table: oauthAssertionClaims }
 ];
 
 export type InstanceExport = {

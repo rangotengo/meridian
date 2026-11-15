@@ -265,6 +265,58 @@ describe("authorization request validation", () => {
     );
   });
 
+  it("loopback exception is port-only: different host, path, or query is a different callback (P1-5)", async () => {
+    const { client } = await registerOAuthClient(db(), {
+      clientName: "Loopback",
+      redirectUris: [LOOPBACK]
+    });
+    const { challenge } = pkce();
+    const base = {
+      clientId: client.id,
+      responseType: "code",
+      codeChallenge: challenge,
+      codeChallengeMethod: "S256",
+      resource: CONFIG.resourceUrl,
+      scope: "finance:read",
+      state: null
+    };
+    // RFC 8252 §7.3: a different PORT on the same loopback host, path,
+    // and query is the registered callback.
+    const okPort = await validateAuthorizeRequest(
+      db(),
+      { ...base, redirectUri: "http://127.0.0.1:9999/callback" },
+      CONFIG
+    );
+    expect(okPort.redirectUri).toBe("http://127.0.0.1:9999/callback");
+    // A different loopback HOST is not the registered callback.
+    await expectOAuthError(
+      validateAuthorizeRequest(
+        db(),
+        { ...base, redirectUri: "http://localhost:8910/callback" },
+        CONFIG
+      ),
+      "invalid_request"
+    );
+    // An added QUERY is not the registered callback.
+    await expectOAuthError(
+      validateAuthorizeRequest(
+        db(),
+        { ...base, redirectUri: "http://127.0.0.1:8910/callback?next=https://evil.test" },
+        CONFIG
+      ),
+      "invalid_request"
+    );
+    // A different PATH is not the registered callback.
+    await expectOAuthError(
+      validateAuthorizeRequest(
+        db(),
+        { ...base, redirectUri: "http://127.0.0.1:8910/other" },
+        CONFIG
+      ),
+      "invalid_request"
+    );
+  });
+
   it("rejects a wrong PKCE verifier at exchange — and the attempt consumes the code", async () => {
     const user = await makeUser();
     const { client: dcr } = await registerOAuthClient(db(), {
@@ -778,6 +830,47 @@ describe("CIMD clients", () => {
     expect(await resolveOAuthClient(db(), DOC_URL, mismatched)).toBeNull();
   });
 
+  it("rejects documents whose redirect_uris violate the safe-callback policy (P1-5)", async () => {
+    // Before the fix these were accepted as opaque strings: an exact
+    // match in redirectUriAllowed would have let a javascript: URI
+    // through authorize validation and into the browser redirect.
+    const badUris = [
+      "javascript:alert(1)",
+      "data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==",
+      "https://user:pass@chatgpt.com/connector_platform_oauth_redirect",
+      "https://chatgpt.com/connector_platform_oauth_redirect#fragment",
+      "https://evil.example.com/callback",
+      "http://localhost.evil.example.com/callback",
+      "not a url"
+    ];
+    for (const [i, bad] of badUris.entries()) {
+      clearCimdCaches();
+      const url = `https://clients.example.test/bad-${i}.json`;
+      const badFetcher: MetadataFetcher = async () => ({
+        client_id: url,
+        client_name: "Bad Redirect Client",
+        redirect_uris: [bad],
+        token_endpoint_auth_method: "none"
+      });
+      expect(
+        await resolveOAuthClient(db(), url, badFetcher),
+        `redirect_uri ${bad} must be rejected`
+      ).toBeNull();
+    }
+  });
+
+  it("passes the operator allowlist through to the metadata fetcher (P1-4 plumbing)", async () => {
+    clearCimdCaches();
+    const seenOpts: unknown[] = [];
+    const recording: MetadataFetcher = async (_url, opts) => {
+      seenOpts.push(opts);
+      return doc;
+    };
+    const resolved = await resolveOAuthClient(db(), DOC_URL, recording, ["https://a.test/x"]);
+    expect(resolved).not.toBeNull();
+    expect(seenOpts).toEqual([{ allowlist: ["https://a.test/x"] }]);
+  });
+
   it("verifies private_key_jwt assertions against the document's own JWKS", async () => {
     clearCimdCaches();
     const { publicKey, privateKey } = await generateKeyPair("RS256");
@@ -838,6 +931,77 @@ describe("CIMD clients", () => {
       ),
       "invalid_client"
     );
+  });
+
+  it("requires exp/iat/jti, caps assertion lifetime, and claims each jti once (P2-6)", async () => {
+    clearCimdCaches();
+    const { publicKey, privateKey } = await generateKeyPair("RS256");
+    const jwk = await exportJWK(publicKey);
+    jwk.kid = "claims-key";
+    const claimsDoc = {
+      client_id: DOC_URL,
+      client_name: "Claims Client",
+      redirect_uris: ["https://chatgpt.com/connector_platform_oauth_redirect"],
+      token_endpoint_auth_method: "private_key_jwt",
+      jwks: { keys: [jwk] }
+    };
+    const claimsFetcher: MetadataFetcher = async () => claimsDoc;
+    const resolved = await resolveOAuthClient(db(), DOC_URL, claimsFetcher);
+    expect(resolved?.authMethod).toBe("private_key_jwt");
+
+    const now = Math.floor(Date.now() / 1000);
+    async function sign(opts: { iat?: number; exp?: number; jti?: string }): Promise<string> {
+      const jwt = new SignJWT({})
+        .setProtectedHeader({ alg: "RS256", kid: "claims-key" })
+        .setIssuer(DOC_URL)
+        .setSubject(DOC_URL)
+        .setAudience("https://meridian.test/oauth/token");
+      if (opts.iat !== undefined) jwt.setIssuedAt(opts.iat);
+      if (opts.exp !== undefined) jwt.setExpirationTime(opts.exp);
+      if (opts.jti !== undefined) jwt.setJti(opts.jti);
+      return jwt.sign(privateKey);
+    }
+    const attempt = (assertion: string) =>
+      authenticateOAuthClient(
+        db(),
+        {
+          clientId: DOC_URL,
+          clientAssertion: assertion,
+          clientAssertionType: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+        },
+        CONFIG,
+        claimsFetcher
+      );
+
+    // RFC 7523 §3: exp is REQUIRED — jose alone validates it only when
+    // present, so an exp-less assertion used to verify cleanly.
+    await expectOAuthError(attempt(await sign({ iat: now, jti: "no-exp" })), "invalid_client");
+    await expectOAuthError(
+      attempt(await sign({ exp: now + 120, jti: "no-iat" })),
+      "invalid_client"
+    );
+    await expectOAuthError(attempt(await sign({ iat: now, exp: now + 120 })), "invalid_client");
+    // Lifetime cap: exp − iat must be ≤ 5 minutes.
+    await expectOAuthError(
+      attempt(await sign({ iat: now, exp: now + 600, jti: "too-long" })),
+      "invalid_client"
+    );
+    // Expired assertions fail even with all claims present.
+    await expectOAuthError(
+      attempt(await sign({ iat: now - 600, exp: now - 300, jti: "expired" })),
+      "invalid_client"
+    );
+
+    // A valid assertion authenticates exactly once: the SAME assertion
+    // replayed is rejected, sequentially and concurrently.
+    const good = await sign({ iat: now, exp: now + 120, jti: "good-once" });
+    expect((await attempt(good)).clientId).toBe(DOC_URL);
+    await expectOAuthError(attempt(good), "invalid_client");
+
+    const raced = await sign({ iat: now, exp: now + 120, jti: "good-raced" });
+    const results = await Promise.allSettled([attempt(raced), attempt(raced)]);
+    expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter((r) => r.status === "rejected")).toHaveLength(1);
   });
 });
 

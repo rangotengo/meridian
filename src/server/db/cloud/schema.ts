@@ -855,6 +855,7 @@ export const oauthAuthorizationCodes = sqliteTable(
     codeChallenge: text("code_challenge").notNull(),
     usedAt: isoTimestamp("used_at"),
     issuedAt: isoTimestamp("issued_at"),
+    invalidatedAt: isoTimestamp("invalidated_at"),
     expiresAt: isoTimestamp("expires_at").notNull(),
     createdAt: isoTimestamp("created_at")
       .notNull()
@@ -893,6 +894,23 @@ export const oauthTokens = sqliteTable(
     uniqueIndex("oauth_tokens_hash_unique").on(t.tokenHash),
     index("oauth_tokens_grant_idx").on(t.grantId),
     index("oauth_tokens_code_idx").on(t.codeId)
+  ]
+);
+
+/** Cloud mirror of oauth_assertion_claims (see postgres-schema.ts). */
+export const oauthAssertionClaims = sqliteTable(
+  "oauth_assertion_claims",
+  {
+    clientId: text("client_id").notNull(),
+    jti: text("jti").notNull(),
+    expiresAt: isoTimestamp("expires_at").notNull(),
+    createdAt: isoTimestamp("created_at")
+      .notNull()
+      .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`)
+  },
+  (t) => [
+    primaryKey({ columns: [t.clientId, t.jti] }),
+    index("oauth_assertion_claims_expires_idx").on(t.expiresAt)
   ]
 );
 

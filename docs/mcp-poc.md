@@ -613,3 +613,189 @@ later decision (checklist above).
   (the DELETE route 404s while unconfigured, per the Stage 2 closed-
   gate rule); the page itself renders and lists connections either
   way, and with the gate closed no token is usable regardless.
+
+---
+
+# Review fix round — PR #13 security review (2026-11-15)
+
+Eight findings from the owner's review of head `428321b`, plus three
+follow-ups. All fixes are Tier A evidence (simulated clients, both
+backends); **Tier B remains PENDING** and production enablement is
+unchanged (separate decision, gate still defaults closed).
+
+## P1-1 — summary honors the grant restriction
+
+`dashboardSummary` now takes the accessible-account intersection and
+applies it to every subquery (balances, month flows, top categories,
+recent entries) — the same restriction plumbing the report services
+already had. The MCP summary handler computes the visible set first
+and passes it through, so net worth, assets/liabilities, income,
+expenses, top categories and FX completeness cover exactly the
+accounts the connection may see; an empty intersection yields an
+all-zero, FX-complete summary (fail closed). Regression: the owner's
+exact two-account repro (A-only net worth 100000, excluded 40000 of
+spending and its category name absent), an excluded-only missing-FX
+case, and a loss-of-share case (share row deleted → account drops out
+of the summary with no ceiling change). Covered on Postgres and in
+the workerd probe.
+
+## P1-2 — durable family invalidation (the settle-wait design is gone)
+
+The 2-second settle wait and visible-row sweep are deleted. The
+replacement is persistent state plus transactional coordination:
+
+- `oauth_authorization_codes.invalidated_at` is the family marker
+  (migration PG `0011` / cloud `0012`). Every token of a family hangs
+  off exactly one code row, so one marker covers code exchange,
+  rotation descendants, and revocation.
+- Replay/reuse detection runs `applyFamilyInvalidation` in ONE
+  transaction: stamp the marker, revoke the grant, sweep the family's
+  token rows (by code, else by grant).
+- Every issuance path (code exchange, refresh rotation) inserts
+  tokens only inside a transaction that first locks the code row,
+  then the grant row, then (for refresh) the presented token row —
+  `SELECT … FOR UPDATE` on Postgres — and re-checks the marker and
+  grant status under those locks before inserting. An issuer paused
+  anywhere before its insert therefore either commits before the
+  invalidation transaction can acquire the code-row lock (and its
+  rows are then swept) or resumes inside a transaction that sees the
+  marker and refuses. There is no window in which credentials can be
+  published after invalidation.
+- Verification (`resolveMcpAccess`) also rejects any token whose code
+  row carries the marker — belt and braces behind the row sweep.
+- Cloud: the Durable Object executor serializes all storage access
+  behind a mutex and runs each `exec.transaction` inside
+  `storage.transaction`, so the same code paths are atomic by
+  construction; the PG lock interleavings have no analogue. The cloud
+  probe asserts the invariant outcome (descendant refresh rejected,
+  descendant pair dead after a reuse invalidation).
+
+Regressions reproduce BOTH owner interleavings on Postgres with real
+lock waits (a table lock pausing the winner between code consumption
+and token insertion; a row lock blocking the revocation mid-sweep
+while a descendant refresh queues behind it), asserting the marker,
+the revoked grant, and zero surviving credentials. Run repeatedly —
+stable.
+
+## P1-3 — Node pinned lookup speaks the happy-eyeballs protocol
+
+The DNS pinning lookup now returns an array of `{ address, family }`
+when Node calls it with `{ all: true }` (autoSelectFamily) and the
+single-address shape otherwise; pinning is unchanged (the dialed
+addresses are exactly the validated ones). Regression uses the REAL
+`node:https` transport against a local TLS server — only
+`resolveHost` is stubbed — fetching a document end-to-end through the
+pinned lookup; reverting the lookup to the old bare-string shape
+fails the test with the original `ERR_INVALID_IP_ADDRESS`. (In this
+sandbox the fetcher's own address policy blocks every locally
+bindable address, so the transport function is exercised directly
+rather than through `createMetadataFetcher`; the fetcher loop itself
+is covered by the deadline/redirect tests with a recording transport
+and by the workerd probe.)
+
+## P1-4 — Workers redirects: allowlist enforced per hop
+
+Chosen option: **enforce-per-hop** (not refuse-redirects). When the
+fetcher runs on the cloud backend and an allowlist is supplied, every
+hop's URL — initial and each redirect target — must exactly match an
+allowlist entry before any network I/O for that hop; CIMD passes its
+allowlist for both the document and JWKS fetches. The Node path is
+unchanged (per-hop DNS validation already applies). Workerd probe:
+an approved URL 302ing off-allowlist is rejected and the second URL
+is never fetched; a redirect to a second allowlisted URL proceeds.
+
+## P1-5 — CIMD redirect URIs validated under the DCR policy
+
+One shared policy (`oauthRedirectUriAllowed`) now backs DCR
+validation and CIMD document validation: every `redirect_uris` entry
+must parse, carry no credentials and no fragment, and be either
+HTTPS on `claude.ai`/`chatgpt.com` or HTTP on a loopback host —
+anything else (`javascript:`, `data:`, other hosts, malformed)
+rejects the whole document before consent. The loopback exception in
+`redirectUriAllowed` is tightened to the registered host + path +
+query (port may differ, for native-app loopback); previously any
+loopback registered URI authorized any loopback target.
+
+## P2-6 — private_key_jwt assertions: exp/iat/jti required, jti claimed
+
+Verification requires `exp`, `iat`, and `jti` (RFC 7523 §3), enforces
+`exp − iat ≤ 300s` with 30s clock tolerance, and — after signature
+verification — atomically claims `(client_id, jti)` in the new
+`oauth_assertion_claims` table (both databases) until the assertion's
+expiry; a conflict means replay and the authentication fails.
+Tests: missing exp/iat/jti, 10-minute lifetime, expired, sequential
+replay, and concurrent replay (exactly one of two simultaneous
+identical assertions succeeds, on Postgres; sequential replay is
+asserted in the workerd probe).
+
+## P2-7 — snapshot completeness told honestly
+
+(a) `netWorthSeries` now computes, per emitted date, which in-scope
+accounts (opened on or before that date) lack a snapshot, returning
+`incompleteDates`. The MCP handler marks those points
+`complete: false` with `missingAccountIds`, reports them under
+`coverage.partialDays`, and `coverage.complete` is true only when
+there are neither missing nor partial days. (The web reports UI uses
+the same service; the field is additive and ignored there.)
+(b) The summary's per-account `amountMinor` is `null` (unknown) when
+an account has no balance snapshot — previously a missing snapshot
+surfaced as `"0"` next to `fx.complete: true`. Tests cover both,
+including the owner's delete-one-snapshot repro.
+
+## P2-8 — stored resource is authoritative
+
+Code exchange and refresh now reject when the STORED code/token
+resource differs from the configured canonical resource, and
+`issueTokenPair` writes the stored audience (never the current
+config), so rotation preserves the original resource. A resource
+change therefore requires fresh consent: old refresh tokens return
+`invalid_grant` under the new config and stay usable under the old
+one (asserted both ways, both backends).
+
+## F1 — bounded growth
+
+- CIMD caches (documents and JWKS) are capped at 200 entries each
+  with oldest-first eviction (TTL unchanged at ≤ 1h).
+- `cleanupOAuthHousekeeping` runs in the existing
+  `maintenance:cleanup` job: expired assertion claims are deleted,
+  authorization requests expired for over a day are deleted, and DCR
+  clients older than 30 days that never produced a grant are deleted
+  (the 10/hour/IP registration cap stays). Authorization codes and
+  tokens are deliberately NOT pruned — consumed codes anchor family
+  invalidation and replay forensics.
+
+## F2 — absolute fetch deadline
+
+Metadata fetches carry a total deadline (default 5s): the fetcher
+computes one deadline up front, each hop's transport timeout is the
+shrinking remainder, DNS validation is raced against the budget, and
+the Node transport destroys the request at the absolute deadline in
+addition to its inactivity timeout; the fetch transport's
+AbortSignal carries the remainder per hop. Regression: a slow-drip
+peer (one byte per 100ms) is cut off at the deadline instead of
+holding the fetch open; a redirect chain cannot reset the budget.
+
+## F3 — backup/restore contract for OAuth state
+
+- **Household export/restore: OAuth state does NOT migrate.** The
+  household export enumerates data domain-by-domain and contains no
+  OAuth tables — verified by test (no `oauth` keys, no grant ids, no
+  token hashes in the export). After a household restore, connected
+  agents must reconnect; grants and tokens are never carried across.
+- **Operator instance backups: OAuth state IS included.** The
+  `oauth_*` tables were in fact missing from the enumerated instance
+  table list; they are now exported/restored with the rest of the
+  instance (same precedent as API keys), so a full-instance restore
+  preserves connections. Restores from backups taken before this
+  change still work (absent tables are tolerated).
+
+## Fix-round evidence (Tier A)
+
+- Postgres suite: **470/470** across 56 files (was 449) — includes
+  the new `mcp-review-fixes` file (6), the real-transport SSRF suite
+  (4), and additions to `mcp-oauth` (38→42), `mcp-tools` (20→25).
+- Cloud suite: **23/23** (was 22) — new `mcp-ssrf-redirect` probe op;
+  `mcp-oauth` and `mcp-tools` probes extended with the P1-1, P1-2,
+  P2-6, P2-7a, P2-8 flags.
+- Typecheck, lint, prettier clean; `build:next` and the OpenNext
+  cloud build both pass.

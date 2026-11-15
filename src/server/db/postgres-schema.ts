@@ -712,10 +712,14 @@ export const oauthAuthorizationCodes = pgTable(
     codeChallenge: text("code_challenge").notNull(),
     usedAt: timestamp("used_at", { withTimezone: true }),
     /** Set when the exchange that consumed this code has finished
-     * issuing (or failing). A replay that finds the code consumed waits
-     * for this marker before revoking the family, so the revoke cannot
-     * miss tokens a concurrent legitimate exchange is still inserting. */
+     * issuing (or failing). Kept as an observability marker. */
     issuedAt: timestamp("issued_at", { withTimezone: true }),
+    /** Durable family-invalidation marker: set atomically when a code
+     * replay or refresh-token reuse is detected. Token verification and
+     * every issuance path check it transactionally, so credentials can
+     * never be published — or used — after invalidation, regardless of
+     * in-flight races. */
+    invalidatedAt: timestamp("invalidated_at", { withTimezone: true }),
     expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow()
   },
@@ -751,6 +755,27 @@ export const oauthTokens = pgTable(
     uniqueIndex("oauth_tokens_hash_unique").on(t.tokenHash),
     index("oauth_tokens_grant_idx").on(t.grantId),
     index("oauth_tokens_code_idx").on(t.codeId)
+  ]
+);
+
+/**
+ * Replay claims for `private_key_jwt` client assertions (RFC 7523 §3:
+ * a jti must not be reused). Each verified assertion's (client_id, jti)
+ * is claimed with an insert against this primary key until the
+ * assertion's expiry, so a replayed assertion — even a concurrent one —
+ * can authenticate at most once.
+ */
+export const oauthAssertionClaims = pgTable(
+  "oauth_assertion_claims",
+  {
+    clientId: text("client_id").notNull(),
+    jti: text("jti").notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow()
+  },
+  (t) => [
+    primaryKey({ columns: [t.clientId, t.jti] }),
+    index("oauth_assertion_claims_expires_idx").on(t.expiresAt)
   ]
 );
 

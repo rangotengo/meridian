@@ -34,6 +34,7 @@ const TABLES = [
   "invitations",
   "instance_invitations",
   "auth_tokens",
+  "oauth_assertion_claims",
   "oauth_tokens",
   "oauth_authorization_codes",
   "oauth_authorization_requests",
