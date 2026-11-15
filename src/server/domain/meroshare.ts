@@ -78,7 +78,7 @@ export type MeroShareSnapshot = {
   accounts: MeroShareSnapshotAccount[];
   /** False when the WACC report itself failed upstream and holdings were imported without purchase cost. */
   costBasisAvailable: boolean;
-  /** Human-readable partial-success warnings, surfaced in audit metadata. */
+  /** Human-readable partial-success warnings, surfaced in audit metadata and to the user. */
   warnings: string[];
 };
 
@@ -153,10 +153,11 @@ export class MeroShareClient {
       this.waccReport(boid).then(
         (value) => ({ available: true as const, value }),
         (err: unknown) => {
-          // Only an upstream HTTP/transport failure of the WACC call
-          // itself degrades to a partial snapshot (holdings without cost
-          // basis). Authentication failures, unreadable 200 responses,
-          // and shape errors still abort the snapshot.
+          // Only a transport failure or transient availability status
+          // (429/5xx) of the WACC call itself degrades to a partial
+          // snapshot (holdings without cost basis). Authentication
+          // failures, malformed-request statuses, unreadable 200
+          // responses, and shape errors still abort the snapshot.
           if (isWaccUpstreamFailure(err)) return { available: false as const, value: null };
           throw err;
         }
@@ -229,7 +230,12 @@ export class MeroShareClient {
       }
     }
 
-    const transactions = parseTransactions(rawTransactions, boid);
+    const { transactions, droppedNoMovement } = parseTransactions(rawTransactions, boid);
+    if (droppedNoMovement > 0) {
+      warnings.push(
+        `MeroShare returned ${droppedNoMovement} transaction history row(s) with no share movement; they were skipped.`
+      );
+    }
 
     const accountName = firstText(detail.name, `BOID ${boid}`) ?? `MeroShare ${boid.slice(-4)}`;
     const totalValue =
@@ -316,7 +322,8 @@ export class MeroShareClient {
       },
       (payload) => (Array.isArray(payload.meroShareMyPortfolio) ? "meroShareMyPortfolio" : null),
       MAX_HOLDINGS,
-      "MeroShare returned more holdings than Meridian can safely import."
+      "MeroShare returned more holdings than Meridian can safely import.",
+      "MeroShare returned an incomplete portfolio response. (stage: portfolio)"
     );
     // Totals and other top-level fields come from the first page; the
     // rows key is replaced with the accumulated rows from every page.
@@ -359,7 +366,8 @@ export class MeroShareClient {
             ? "myTransactionHistory"
             : null,
       MAX_TRANSACTIONS,
-      "MeroShare returned more transactions than Meridian can safely import."
+      "MeroShare returned more transactions than Meridian can safely import.",
+      "MeroShare returned an incomplete transaction history response. (stage: transactions)"
     );
     return key === null ? first : { ...first, [key]: rows };
   }
@@ -373,6 +381,14 @@ export class MeroShareClient {
       maxBytes: MAX_RESPONSE_BYTES
     });
     if (!isRecord(payload))
+      throw errors.validation("MeroShare did not return purchase cost data. (stage: wacc)", {
+        stage: "wacc"
+      });
+    // A 200 without the report array is an error payload in disguise
+    // (e.g. { success: false, message }) — a shape error that aborts the
+    // snapshot, not an available-but-empty report. A genuine empty array
+    // is a valid report with no cost rows.
+    if (!Array.isArray(payload.waccReportResponse))
       throw errors.validation("MeroShare did not return purchase cost data. (stage: wacc)", {
         stage: "wacc"
       });
@@ -539,17 +555,26 @@ export class MeroShareClient {
 
 /**
  * Fetch every page of a paged CDSC list and accumulate its rows.
- * Termination: when the first page carries a numeric `totalItems`, stop
- * once that many rows are accumulated; otherwise continue while a page
- * returns exactly PAGE_SIZE rows. A page with no rows also stops the
- * walk (no progress). Exceeding maxRows throws the caller's overflow
- * error — imports never truncate silently.
+ *
+ * Completeness is enforced, never assumed: snapshot application deletes
+ * rows that are absent from the snapshot, so a partially captured list
+ * must throw here instead of reaching it.
+ * - When the first page carries a numeric `totalItems`, the walk ends
+ *   only when exactly that many rows have been accumulated. An empty
+ *   page, a page whose rows array is missing or under a different key,
+ *   or a count overshoot before completion is malformed and throws.
+ * - Without a total, the walk continues while pages return exactly
+ *   PAGE_SIZE rows; a valid empty or short page ends it. A later page
+ *   whose rows array is missing is malformed and throws — it is not a
+ *   terminator.
+ * Exceeding maxRows throws the caller's overflow error.
  */
 async function collectPages(
   fetchPage: (page: number) => Promise<Record<string, unknown>>,
   selectRowsKey: (payload: Record<string, unknown>) => string | null,
   maxRows: number,
-  overflowMessage: string
+  overflowMessage: string,
+  incompleteMessage: string
 ): Promise<{ first: Record<string, unknown>; key: string | null; rows: unknown[] }> {
   const first = await fetchPage(1);
   const key = selectRowsKey(first);
@@ -557,16 +582,23 @@ async function collectPages(
   let rows = [...(first[key] as unknown[])];
   if (rows.length > maxRows) throw errors.validation(overflowMessage);
   const total = totalItemsOf(first.totalItems);
+  if (total !== null && rows.length > total) throw errors.validation(incompleteMessage);
   let lastPageSize = rows.length;
-  for (let page = 2; total !== null ? rows.length < total : lastPageSize === PAGE_SIZE; page++) {
+  for (let page = 2; ; page++) {
+    const complete = total !== null ? rows.length >= total : lastPageSize < PAGE_SIZE;
+    if (complete) break;
     const payload = await fetchPage(page);
-    const pageRows = Array.isArray(payload[key]) ? (payload[key] as unknown[]) : [];
-    if (pageRows.length === 0) break;
+    // The rows array must be present under the first page's key on every
+    // page; a missing or reshaped array is malformed, never a terminator.
+    if (!Array.isArray(payload[key])) throw errors.validation(incompleteMessage);
+    const pageRows = payload[key] as unknown[];
+    if (total !== null && pageRows.length === 0) throw errors.validation(incompleteMessage);
     rows = rows.concat(pageRows);
     if (rows.length > maxRows) throw errors.validation(overflowMessage);
+    if (total !== null && rows.length > total) throw errors.validation(incompleteMessage);
     lastPageSize = pageRows.length;
-    if (total === null && pageRows.length < PAGE_SIZE) break;
   }
+  if (total !== null && rows.length !== total) throw errors.validation(incompleteMessage);
   return { first, key, rows };
 }
 
@@ -577,17 +609,21 @@ function totalItemsOf(value: unknown): number | null {
 }
 
 /**
- * True only for an upstream HTTP-status or transport failure of the WACC
- * request itself, as tagged by the request layer in the error's
- * server-side meta. 401/403 are excluded: they mean the session itself
- * was rejected — an authentication failure, not WACC unavailability —
- * and must abort the snapshot.
+ * True only when the WACC request itself could not be served: a transport
+ * failure (no response at all, tagged with a null status) or a transient
+ * availability status (429 or 5xx), as tagged by the request layer in the
+ * error's server-side meta. Every other failure aborts the snapshot —
+ * including 401/403 (the session itself was rejected) and the remaining
+ * 4xx statuses, which mean the request was malformed rather than the
+ * report unavailable. CDSC exposes no distinct "no WACC data" 4xx, so
+ * none is treated as unavailability.
  */
 function isWaccUpstreamFailure(err: unknown): boolean {
   if (!isDomainError(err)) return false;
   const meta = err.meta;
   if (!meta || meta.stage !== "wacc" || meta.upstreamFailure !== true) return false;
-  return meta.upstreamStatus !== 401 && meta.upstreamStatus !== 403;
+  const status = meta.upstreamStatus;
+  return status === null || status === 429 || (typeof status === "number" && status >= 500);
 }
 
 /**
@@ -598,12 +634,18 @@ function isWaccUpstreamFailure(err: unknown): boolean {
  * neither array is a shape we do not understand: fail loudly instead of
  * importing zero transactions silently.
  */
-function parseTransactions(payload: unknown, boid: string): MeroShareTransaction[] {
+function parseTransactions(
+  payload: unknown,
+  boid: string
+): { transactions: MeroShareTransaction[]; droppedNoMovement: number } {
   if (isRecord(payload) && Array.isArray(payload.transactionView)) {
     return parseViewTransactions(payload.transactionView, boid);
   }
   if (isRecord(payload) && Array.isArray(payload.myTransactionHistory)) {
-    return parseLegacyTransactions(payload.myTransactionHistory, boid);
+    return {
+      transactions: parseLegacyTransactions(payload.myTransactionHistory, boid),
+      droppedNoMovement: 0
+    };
   }
   throw errors.validation("MeroShare did not return transaction history. (stage: transactions)", {
     stage: "transactions"
@@ -617,8 +659,12 @@ function parseTransactions(payload: unknown, boid: string): MeroShareTransaction
  * client; `rate`/`amount` are read opportunistically for DP variants
  * that include them, otherwise price/estimatedValue stay null.
  */
-function parseViewTransactions(rows: unknown[], boid: string): MeroShareTransaction[] {
+function parseViewTransactions(
+  rows: unknown[],
+  boid: string
+): { transactions: MeroShareTransaction[]; droppedNoMovement: number } {
   const transactions: MeroShareTransaction[] = [];
+  let droppedNoMovement = 0;
   for (const row of rows) {
     if (!isRecord(row)) continue;
     const ticker = normalizeTicker(row.script);
@@ -627,28 +673,26 @@ function parseViewTransactions(rows: unknown[], boid: string): MeroShareTransact
       ? String(row.transactionDate).slice(0, 10)
       : null;
     if (!occurredOn) continue;
-    const credit = sideQuantity(row.creditQty);
-    const debit = sideQuantity(row.debitQty);
-    let quantity: string;
-    let activityLabel: MeroShareTransaction["activityLabel"];
-    if (credit > 0 && debit === 0) {
-      quantity = formatQuantity(credit);
-      activityLabel = "Buy";
-    } else if (debit > 0 && credit === 0) {
-      quantity = formatQuantity(debit);
-      activityLabel = "Sell";
-    } else if (credit === debit) {
-      // No net share movement (both sides zero/absent, or exactly
-      // offsetting): keep the history row as Other with zero quantity
-      // rather than dropping a book entry such as a fee or adjustment.
-      quantity = "0";
-      activityLabel = "Other";
-    } else {
-      // Both sides moved by different amounts: record the net position
-      // change, labelled by the larger side.
-      quantity = formatQuantity(Math.abs(credit - debit));
-      activityLabel = credit > debit ? "Buy" : "Sell";
+    const credit = sideQuantity(row.creditQty) ?? 0;
+    const debit = sideQuantity(row.debitQty) ?? 0;
+    if (credit === 0 && debit === 0) {
+      // No share movement on either side (both missing or explicitly
+      // zero): the row carries no position change, so it is dropped from
+      // the imported history instead of being fabricated as a
+      // zero-quantity entry. The count is surfaced as a snapshot warning.
+      droppedNoMovement += 1;
+      continue;
     }
+    if (credit > 0 && debit > 0) {
+      // Both sides moved: CDSC's client documents no netting rule, and
+      // netting would invent a quantity — reject the row as ambiguous.
+      throw errors.validation(
+        "MeroShare returned a transaction with both credit and debit quantities. (stage: transactions)",
+        { stage: "transactions" }
+      );
+    }
+    const quantity = formatQuantity(credit > 0 ? credit : debit);
+    const activityLabel: MeroShareTransaction["activityLabel"] = credit > 0 ? "Buy" : "Sell";
     const name = firstText(row.scriptDesc, row.companyName, ticker) ?? ticker;
     const price = optionalDecimal(row.rate, `rate for ${ticker}`);
     const estimatedValue =
@@ -681,7 +725,7 @@ function parseViewTransactions(rows: unknown[], boid: string): MeroShareTransact
       );
     }
   }
-  return transactions;
+  return { transactions, droppedNoMovement };
 }
 
 /** Legacy CDSC shape (`myTransactionHistory` rows), kept as an explicit fallback. */
@@ -741,14 +785,36 @@ function parseLegacyTransactions(rows: unknown[], boid: string): MeroShareTransa
   return transactions;
 }
 
-/** Parse one credit/debit quantity side; absent, blank, or non-positive → 0. */
-function sideQuantity(value: unknown): number {
-  const numeric = Number(
-    String(value ?? "")
-      .replace(/,/g, "")
-      .trim()
-  );
-  return Number.isFinite(numeric) && numeric > 0 ? numeric : 0;
+/**
+ * Parse one credit/debit quantity side strictly.
+ *
+ * Returns null for the explicit "no value" markers CDSC uses (missing,
+ * null, blank, "-"). A present value must be a valid non-negative
+ * decimal; anything else — non-numeric text, a negative, an infinite
+ * number — is malformed upstream data and fails closed instead of being
+ * coerced to zero.
+ */
+function sideQuantity(value: unknown): number | null {
+  const invalid = (): never => {
+    throw errors.validation(
+      "MeroShare returned an invalid transaction quantity. (stage: transactions)",
+      { stage: "transactions" }
+    );
+  };
+  if (value === null || value === undefined) return null;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || value < 0) return invalid();
+    return value;
+  }
+  if (typeof value === "string") {
+    const raw = value.replace(/,/g, "").trim();
+    if (raw === "" || raw === "-") return null;
+    if (!/^\d+(?:\.\d+)?$/.test(raw)) return invalid();
+    const numeric = Number(raw);
+    if (!Number.isFinite(numeric)) return invalid();
+    return numeric;
+  }
+  return invalid();
 }
 
 function formatQuantity(value: number): string {
@@ -760,7 +826,12 @@ export async function connectMeroShare(
   exec: Executor,
   actor: Actor,
   input: MeroShareCredentials & { capital: MeroShareCapital }
-): Promise<{ connectionId: string; accounts: number; costBasisAvailable: boolean }> {
+): Promise<{
+  connectionId: string;
+  accounts: number;
+  costBasisAvailable: boolean;
+  warnings: string[];
+}> {
   const capital = input.capital;
   if (capital.id !== input.clientId || !capital.code || !capital.name)
     throw errors.validation("Choose a valid MeroShare DP.");
@@ -803,7 +874,8 @@ export async function connectMeroShare(
   return {
     connectionId,
     accounts: snapshot.accounts.length,
-    costBasisAvailable: snapshot.costBasisAvailable
+    costBasisAvailable: snapshot.costBasisAvailable,
+    warnings: snapshot.warnings
   };
 }
 
@@ -811,7 +883,7 @@ export async function syncMeroShareConnection(
   exec: Executor,
   actor: Actor,
   connectionId: string
-): Promise<{ accounts: number; costBasisAvailable: boolean }> {
+): Promise<{ accounts: number; costBasisAvailable: boolean; warnings: string[] }> {
   const [connection] = await exec
     .select()
     .from(meroShareConnections)
@@ -844,7 +916,11 @@ export async function syncMeroShareConnection(
       ...(snapshot.warnings.length ? { warnings: snapshot.warnings } : {})
     }
   });
-  return { accounts: snapshot.accounts.length, costBasisAvailable: snapshot.costBasisAvailable };
+  return {
+    accounts: snapshot.accounts.length,
+    costBasisAvailable: snapshot.costBasisAvailable,
+    warnings: snapshot.warnings
+  };
 }
 
 export async function disconnectMeroShareConnection(
@@ -1075,7 +1151,28 @@ async function applySnapshot(
       await exec.insert(valuations).values({ entryId: entry.id, kind: "current" });
     }
 
+    // When this snapshot could not retrieve cost basis, preserve any cost
+    // basis stored by earlier syncs instead of overwriting it with null:
+    // a WACC outage must not erase known purchase costs. Holdings with no
+    // previously stored value (including brand-new ones) resolve to null.
+    const preservedCostBasis = new Map<string, number | null>();
+    if (!snapshot.costBasisAvailable) {
+      const existingHoldings = await exec
+        .select({
+          ticker: meroShareHoldings.ticker,
+          costBasisMinor: meroShareHoldings.costBasisMinor
+        })
+        .from(meroShareHoldings)
+        .where(eq(meroShareHoldings.meroShareAccountId, meroAccountId));
+      for (const row of existingHoldings) preservedCostBasis.set(row.ticker, row.costBasisMinor);
+    }
+
     for (const holding of snapshotAccount.holdings) {
+      const costBasisMinor = snapshot.costBasisAvailable
+        ? holding.costBasis
+          ? decimalToMinor(holding.costBasis, "NPR", `cost basis for ${holding.ticker}`)
+          : null
+        : (preservedCostBasis.get(holding.ticker) ?? null);
       await exec
         .insert(meroShareHoldings)
         .values({
@@ -1093,9 +1190,7 @@ async function applySnapshot(
             "NPR",
             `value for ${holding.ticker}`
           ),
-          costBasisMinor: holding.costBasis
-            ? decimalToMinor(holding.costBasis, "NPR", `cost basis for ${holding.ticker}`)
-            : null,
+          costBasisMinor,
           updatedAt: new Date()
         })
         .onConflictDoUpdate({
@@ -1113,9 +1208,7 @@ async function applySnapshot(
               "NPR",
               `value for ${holding.ticker}`
             ),
-            costBasisMinor: holding.costBasis
-              ? decimalToMinor(holding.costBasis, "NPR", `cost basis for ${holding.ticker}`)
-              : null,
+            costBasisMinor,
             updatedAt: new Date()
           }
         });

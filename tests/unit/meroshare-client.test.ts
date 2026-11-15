@@ -145,7 +145,9 @@ describe("MeroShareClient", () => {
     const snapshot = await makeClient(fetchFn).portfolioSnapshot();
 
     expect(snapshot.costBasisAvailable).toBe(true);
-    expect(snapshot.warnings).toEqual([]);
+    // The zero-movement fee row is dropped and reported, not imported.
+    expect(snapshot.warnings).toHaveLength(1);
+    expect(snapshot.warnings[0]).toContain("no share movement");
     expect(snapshot.accounts).toHaveLength(1);
     expect(snapshot.accounts[0]).toMatchObject({ boid: BOID, totalValue: "25062.50" });
     expect(snapshot.accounts[0]!.holdings[0]).toMatchObject({
@@ -156,7 +158,7 @@ describe("MeroShareClient", () => {
     });
 
     const transactions = snapshot.accounts[0]!.transactions;
-    expect(transactions).toHaveLength(3);
+    expect(transactions).toHaveLength(2);
     expect(transactions[0]).toMatchObject({
       ticker: "NABIL",
       quantity: "100",
@@ -173,8 +175,8 @@ describe("MeroShareClient", () => {
       activityLabel: "Sell",
       occurredOn: "2026-09-02"
     });
-    // No share movement on either side: kept as an Other book entry.
-    expect(transactions[2]).toMatchObject({ quantity: "0", activityLabel: "Other" });
+    // The third fixture row (credit 0 / debit 0, a demat fee) carries no
+    // share movement: it is dropped, never fabricated as an Other/0 row.
 
     // The transaction request follows CDSC's current client: `boid`, not `demat`.
     const transactionCall = calls.find((call) => call.path.endsWith("/myTransaction/"));
@@ -266,10 +268,12 @@ describe("MeroShareClient", () => {
     const snapshot = await makeClient(fetchFn).portfolioSnapshot();
 
     expect(snapshot.costBasisAvailable).toBe(false);
-    expect(snapshot.warnings).toHaveLength(1);
+    // Cost-basis warning first; the fixture's zero-movement fee row adds
+    // the skipped-rows warning after it.
+    expect(snapshot.warnings).toHaveLength(2);
     expect(snapshot.warnings[0]).toContain("Cost basis unavailable");
     expect(snapshot.accounts[0]!.holdings[0]!.costBasis).toBeNull();
-    expect(snapshot.accounts[0]!.transactions).toHaveLength(3);
+    expect(snapshot.accounts[0]!.transactions).toHaveLength(2);
   });
 
   it("does not swallow a WACC session rejection as partial success", async () => {
@@ -339,5 +343,211 @@ describe("MeroShareClient", () => {
     await expect(makeClient(fetchFn).portfolioSnapshot()).rejects.toThrow(
       "MeroShare returned more holdings than Meridian can safely import."
     );
+  });
+
+  it("rejects an empty later portfolio page when totalItems says rows are missing", async () => {
+    const { fetchFn } = makeFetch({
+      portfolio: (page) =>
+        page === 1
+          ? Response.json({
+              totalItems: 250,
+              meroShareMyPortfolio: Array.from({ length: 200 }, (_, i) => holdingRow(i))
+            })
+          : Response.json({ totalItems: 250, meroShareMyPortfolio: [] })
+    });
+    await expect(makeClient(fetchFn).portfolioSnapshot()).rejects.toThrow(
+      "MeroShare returned an incomplete portfolio response. (stage: portfolio)"
+    );
+  });
+
+  it("rejects a later transaction page that drops the rows array", async () => {
+    const { fetchFn } = makeFetch({
+      transactions: (page) =>
+        page === 1
+          ? Response.json({
+              totalItems: 250,
+              transactionView: Array.from({ length: 200 }, (_, i) => viewTransactionRow(page, i))
+            })
+          : Response.json({ totalItems: 250 })
+    });
+    await expect(makeClient(fetchFn).portfolioSnapshot()).rejects.toThrow(
+      "MeroShare returned an incomplete transaction history response. (stage: transactions)"
+    );
+  });
+
+  it("rejects a later page with a missing rows array even without a total", async () => {
+    const { fetchFn } = makeFetch({
+      transactions: (page) =>
+        page === 1
+          ? Response.json({
+              transactionView: Array.from({ length: 200 }, (_, i) => viewTransactionRow(page, i))
+            })
+          : Response.json({})
+    });
+    await expect(makeClient(fetchFn).portfolioSnapshot()).rejects.toThrow(
+      "MeroShare returned an incomplete transaction history response. (stage: transactions)"
+    );
+  });
+
+  it("does not degrade on a WACC malformed-request status (400 aborts)", async () => {
+    const { fetchFn } = makeFetch({
+      wacc: () => new Response("bad request", { status: 400 })
+    });
+    await expect(makeClient(fetchFn).portfolioSnapshot()).rejects.toThrow(
+      "MeroShare could not complete that request. (stage: wacc)"
+    );
+  });
+
+  it("proceeds without cost basis when the WACC request is rate limited (429)", async () => {
+    const { fetchFn } = makeFetch({
+      wacc: () => new Response("too many requests", { status: 429 })
+    });
+    const snapshot = await makeClient(fetchFn).portfolioSnapshot();
+
+    expect(snapshot.costBasisAvailable).toBe(false);
+    expect(snapshot.warnings[0]).toContain("Cost basis unavailable");
+    expect(snapshot.accounts[0]!.holdings[0]!.costBasis).toBeNull();
+  });
+
+  it("proceeds without cost basis when the WACC request fails in transport", async () => {
+    const { fetchFn } = makeFetch({
+      wacc: () => {
+        throw new TypeError("fetch failed");
+      }
+    });
+    const snapshot = await makeClient(fetchFn).portfolioSnapshot();
+
+    expect(snapshot.costBasisAvailable).toBe(false);
+    expect(snapshot.warnings[0]).toContain("Cost basis unavailable");
+  });
+
+  it("aborts when a WACC 200 response is an error payload without the report array", async () => {
+    const { fetchFn } = makeFetch({
+      wacc: () => Response.json({ success: false, message: "WACC not generated" })
+    });
+    await expect(makeClient(fetchFn).portfolioSnapshot()).rejects.toThrow(
+      "MeroShare did not return purchase cost data. (stage: wacc)"
+    );
+
+    const { fetchFn: emptyObjectFetch } = makeFetch({
+      wacc: () => Response.json({})
+    });
+    await expect(makeClient(emptyObjectFetch).portfolioSnapshot()).rejects.toThrow(
+      "MeroShare did not return purchase cost data. (stage: wacc)"
+    );
+  });
+
+  it("treats a genuine empty WACC report array as available", async () => {
+    const { fetchFn } = makeFetch({
+      wacc: () => Response.json({ waccReportResponse: [] })
+    });
+    const snapshot = await makeClient(fetchFn).portfolioSnapshot();
+
+    expect(snapshot.costBasisAvailable).toBe(true);
+    expect(snapshot.accounts[0]!.holdings[0]!.costBasis).toBeNull();
+    expect(snapshot.warnings.some((warning) => warning.includes("Cost basis"))).toBe(false);
+  });
+
+  it("rejects a malformed transaction quantity instead of coercing it to zero", async () => {
+    const { fetchFn } = makeFetch({
+      transactions: () =>
+        Response.json({
+          totalItems: 1,
+          transactionView: [
+            {
+              script: "NABIL",
+              scriptDesc: "Nabil Bank",
+              creditQty: "NOT-A-QUANTITY",
+              debitQty: "0",
+              transactionDate: "2026-08-20",
+              historyDesc: "Broken row",
+              transCode: "BAD"
+            }
+          ]
+        })
+    });
+    await expect(makeClient(fetchFn).portfolioSnapshot()).rejects.toThrow(
+      "MeroShare returned an invalid transaction quantity. (stage: transactions)"
+    );
+  });
+
+  it("rejects a negative transaction quantity", async () => {
+    const { fetchFn } = makeFetch({
+      transactions: () =>
+        Response.json({
+          totalItems: 1,
+          transactionView: [
+            {
+              script: "NABIL",
+              scriptDesc: "Nabil Bank",
+              creditQty: "-5",
+              debitQty: "0",
+              transactionDate: "2026-08-20",
+              historyDesc: "Negative row",
+              transCode: "NEG"
+            }
+          ]
+        })
+    });
+    await expect(makeClient(fetchFn).portfolioSnapshot()).rejects.toThrow(
+      "MeroShare returned an invalid transaction quantity. (stage: transactions)"
+    );
+  });
+
+  it("rejects a transaction with quantities on both sides as ambiguous", async () => {
+    const { fetchFn } = makeFetch({
+      transactions: () =>
+        Response.json({
+          totalItems: 1,
+          transactionView: [
+            {
+              script: "NABIL",
+              scriptDesc: "Nabil Bank",
+              creditQty: "10",
+              debitQty: "4",
+              transactionDate: "2026-08-20",
+              historyDesc: "Both sides",
+              transCode: "BOTH"
+            }
+          ]
+        })
+    });
+    await expect(makeClient(fetchFn).portfolioSnapshot()).rejects.toThrow(
+      "MeroShare returned a transaction with both credit and debit quantities. (stage: transactions)"
+    );
+  });
+
+  it("accepts explicit missing markers as an absent quantity side", async () => {
+    const markers: Array<Record<string, unknown>> = [
+      { creditQty: null },
+      { creditQty: "" },
+      { creditQty: "-" },
+      {}
+    ];
+    for (const marker of markers) {
+      const { fetchFn } = makeFetch({
+        transactions: () =>
+          Response.json({
+            totalItems: 1,
+            transactionView: [
+              {
+                script: "NABIL",
+                scriptDesc: "Nabil Bank",
+                debitQty: "25",
+                transactionDate: "2026-08-20",
+                historyDesc: "Sale with absent credit side",
+                transCode: "SALE",
+                ...marker
+              }
+            ]
+          })
+      });
+      const snapshot = await makeClient(fetchFn).portfolioSnapshot();
+      expect(snapshot.accounts[0]!.transactions).toHaveLength(1);
+      expect(snapshot.accounts[0]!.transactions[0]).toMatchObject({
+        quantity: "25",
+        activityLabel: "Sell"
+      });
+    }
   });
 });
