@@ -26,6 +26,7 @@ import {
   SettingsIcon,
   ShieldIcon,
   TargetIcon,
+  TriangleAlertIcon,
   WalletIcon
 } from "lucide-react";
 
@@ -44,6 +45,7 @@ export function AppSidebar({
   privacy,
   accounts,
   netWorthMinor,
+  fxIssues,
   currency,
   showAdmin,
   signOut,
@@ -56,6 +58,7 @@ export function AppSidebar({
   privacy: boolean;
   accounts: NavAccount[];
   netWorthMinor: number;
+  fxIssues: { base: string; quote: string }[];
   currency: string;
   showAdmin: boolean;
   signOut: () => Promise<void>;
@@ -91,6 +94,19 @@ export function AppSidebar({
           <p className="tabular-nums text-sm font-semibold">
             {privacy ? "••••••" : fmtMoney(netWorthMinor, currency)}
           </p>
+          {fxIssues.length > 0 ? (
+            <p className="mt-1 flex items-start gap-1 text-[11px] leading-snug text-warning">
+              <TriangleAlertIcon className="mt-px size-3 shrink-0" aria-hidden />
+              <span>
+                Incomplete — no rate for{" "}
+                {fxIssues.map((issue) => `${issue.base} → ${issue.quote}`).join(", ")}, so those
+                amounts are excluded.{" "}
+                <Link href="/settings/exchange-rates" className="underline underline-offset-2">
+                  Add rates
+                </Link>
+              </span>
+            </p>
+          ) : null}
         </div>
         <NavMain
           label="Daily"

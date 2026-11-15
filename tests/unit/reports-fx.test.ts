@@ -15,7 +15,7 @@ const ON = "2026-08-27";
 
 describe("netWorthMinorForAccounts", () => {
   it("sums directly when every account is already in the family currency", async () => {
-    const total = await netWorthMinorForAccounts(
+    const { netWorthMinor: total } = await netWorthMinorForAccounts(
       stubExec(null),
       family,
       [
@@ -28,7 +28,7 @@ describe("netWorthMinorForAccounts", () => {
   });
 
   it("converts foreign-currency balances through the exchange rate", async () => {
-    const total = await netWorthMinorForAccounts(
+    const { netWorthMinor: total } = await netWorthMinorForAccounts(
       stubExec("0.01"),
       family,
       [
@@ -41,7 +41,7 @@ describe("netWorthMinorForAccounts", () => {
   });
 
   it("excludes accounts with no known rate instead of raw-summing them", async () => {
-    const total = await netWorthMinorForAccounts(
+    const { netWorthMinor: total } = await netWorthMinorForAccounts(
       stubExec(null),
       family,
       [

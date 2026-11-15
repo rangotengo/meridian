@@ -104,10 +104,12 @@ const TOOLS: Tool[] = [
         to = undefined;
       }
       const range = resolveRange(family.timezone, from, to);
+      const spend = await spendingByCategory(exec, family, actor.userId, range);
       return {
         range: range,
         familyCurrency: family.currency,
-        byCategory: await spendingByCategory(exec, family, actor.userId, range)
+        byCategory: spend.categories,
+        fx: spend.fx
       };
     }
   ),
@@ -117,9 +119,11 @@ const TOOLS: Tool[] = [
     z.object({ months: z.number().int().min(1).max(36).optional() }),
     async (args, { exec, actor, family }) => {
       const months = (args.months as number | undefined) ?? 6;
+      const series = await incomeExpenseSeries(exec, family, actor.userId, months);
       return {
         familyCurrency: family.currency,
-        months: await incomeExpenseSeries(exec, family, actor.userId, months)
+        months: series.flows,
+        fx: series.fx
       };
     }
   ),
@@ -136,7 +140,15 @@ const TOOLS: Tool[] = [
         liabilitiesMinor: s.liabilitiesMinor,
         incomeThisMonthMinor: s.incomeThisMonthMinor,
         expenseThisMonthMinor: s.expenseThisMonthMinor,
-        monthKey: s.monthKey
+        monthKey: s.monthKey,
+        // Same `fx` shape as query_spending / monthly_income_expense:
+        // dashboardSummary exposes the fields flat (with undefined for
+        // empty lists), so normalize them into an FxCompleteness object.
+        fx: {
+          incompleteFx: s.incompleteFx,
+          fxIssues: s.fxIssues ?? [],
+          fxRates: s.fxRates ?? []
+        }
       };
     }
   ),

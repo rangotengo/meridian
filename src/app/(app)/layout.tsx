@@ -36,7 +36,7 @@ export default async function AppLayout({ children }: { children: React.ReactNod
   const assets = active.filter((a) => !isLiability(a.type)).map(toNav);
   const liabilities = active.filter((a) => isLiability(a.type)).map(toNav);
   const today = todayIn(family.timezone);
-  const netWorthMinor = await netWorthMinorForAccounts(
+  const { netWorthMinor, fx: sidebarFx } = await netWorthMinorForAccounts(
     db,
     family,
     reportAccounts.map((a) => ({
@@ -54,6 +54,7 @@ export default async function AppLayout({ children }: { children: React.ReactNod
       assets={assets}
       liabilities={liabilities}
       netWorthMinor={netWorthMinor}
+      fxIssues={sidebarFx.fxIssues}
       currency={family.currency}
       signOut={signOutAction}
       togglePrivacy={togglePrivacyAction}

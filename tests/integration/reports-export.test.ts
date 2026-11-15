@@ -62,7 +62,7 @@ describe("reports", () => {
       from: daysAgo(5),
       to: daysAgo(0)
     });
-    const total = spend.reduce((acc, s) => acc + s.totalMinor, 0);
+    const total = spend.categories.reduce((acc, s) => acc + s.totalMinor, 0);
     expect(total).toBe(160000);
   });
 
@@ -94,7 +94,7 @@ describe("reports", () => {
       user.userId,
       30
     );
-    const latest = series[series.length - 1]!.valueMinor;
+    const latest = series.points[series.points.length - 1]!.valueMinor;
     expect(latest).toBe(Math.round(100000 * 1.1));
   });
 
@@ -109,12 +109,12 @@ describe("reports", () => {
     });
 
     const before = await reportsSvc.netWorthSeries(db(), family, user.userId, 10);
-    const latestBefore = before[before.length - 1]?.valueMinor ?? 0;
+    const latestBefore = before.points[before.points.length - 1]?.valueMinor ?? 0;
 
     await accountsSvc.setAccountStatus(db(), actorOf(user), open, "disabled");
 
     const after = await reportsSvc.netWorthSeries(db(), family, user.userId, 10);
-    const latestAfter = after[after.length - 1]?.valueMinor ?? 0;
+    const latestAfter = after.points[after.points.length - 1]?.valueMinor ?? 0;
 
     expect(latestBefore).toBe(70000);
     expect(latestAfter).toBe(0);
