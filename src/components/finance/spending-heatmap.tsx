@@ -76,7 +76,16 @@ export function SpendingHeatmap({
         </div>
       </CardHeader>
       <CardContent className="overflow-x-auto">
-        <svg width={width} height={height} className="min-w-[680px]">
+        {/* Fluid via viewBox: the grid scales with the card instead of
+            sitting at a fixed 848px with dead space on wide screens. The
+            max width caps the scale so cells and month labels stay
+            proportionate; below 680px the container scrolls horizontally. */}
+        <svg
+          viewBox={`0 0 ${width} ${height}`}
+          className="mx-auto block h-auto w-full max-w-[1100px] min-w-[680px]"
+          role="img"
+          aria-label="Daily spending over the last year"
+        >
           {monthLabels.map((month) => (
             <text
               key={`${month.label}-${month.col}`}
