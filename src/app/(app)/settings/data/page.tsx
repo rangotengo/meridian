@@ -1,6 +1,7 @@
 import { requireVerifiedActor, currentFamily } from "@/server/auth/context";
 import { Card, PageHeader, Alert } from "@/components/ds/card";
 import { DeleteFamilyForm } from "./delete-family-form";
+import { FamilyImportForm } from "./family-import-form";
 import { SureImportForm } from "./sure-import-form";
 
 export const metadata = { title: "Your data" };
@@ -19,8 +20,8 @@ export default async function DataPage() {
       <Card>
         <h2 className="mb-1 text-base font-medium text-primary">Export everything</h2>
         <p className="mb-4 text-sm text-muted-foreground">
-          Download a complete JSON snapshot of your family: accounts, entries, categories, tags,
-          sharing, and exchange rates.
+          Download a complete JSON snapshot of your family: accounts, entries, transfers,
+          categories, tags, budgets, recurring series, saved filters, sharing, and exchange rates.
         </p>
         <a
           href="/api/export"
@@ -29,6 +30,15 @@ export default async function DataPage() {
         >
           Download export
         </a>
+      </Card>
+
+      <Card>
+        <h2 className="mb-1 text-base font-medium text-primary">Restore a Meridian export</h2>
+        <p className="mb-4 text-sm text-muted-foreground">
+          Recreate a household from a Meridian export in this family. Family admins only, and the
+          family must be empty so a restore can never merge or overwrite existing data.
+        </p>
+        <FamilyImportForm />
       </Card>
 
       <Card>
