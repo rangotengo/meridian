@@ -58,9 +58,11 @@ import { isValidCurrency } from "@/lib/money";
  *   global data as a side effect of a household restore.
  * - Transfers and splits are validated against the same invariants the
  *   transfer/split services enforce (balanced legs in one currency inside
- *   the date window; split parts inheriting and summing to the parent), and
- *   recurring configs against the recurring service's rules, before any row
- *   is written.
+ *   the date window; split parts inheriting and summing to the parent),
+ *   every entry and recurring definition against its account's currency
+ *   (creation derives currency from the account, so a mismatch can only
+ *   come from a tampered export), and recurring configs against the
+ *   recurring service's rules, before any row is written.
  * - Format v1 exports (no budgets/recurring/savedFilters/transfers arrays)
  *   still import: transfers are rebuilt from the transferId carried on each
  *   entry, using the ledger sign convention (outflow positive, inflow
@@ -644,15 +646,51 @@ function remapFilterParams(
 /**
  * Pre-write validation of the relationships the normal services enforce at
  * creation time. The importer recreates rows verbatim, so without this a
- * tampered export could persist states the domain forbids: unbalanced or
- * cross-currency transfer legs, split parts that do not sum to (or do not
- * inherit) their parent, and entries claiming transfers they are not part
- * of. Throws a validation error; the caller runs inside the import
- * transaction, so the whole restore rolls back.
+ * tampered export could persist states the domain forbids: entries or
+ * recurring definitions denominated in a currency other than their
+ * account's, unbalanced or cross-currency transfer legs, split parts that
+ * do not sum to (or do not inherit) their parent, and entries claiming
+ * transfers they are not part of. Throws a validation error; the caller
+ * runs inside the import transaction, so the whole restore rolls back.
  */
 function validateRestoredData(data: ParsedFamilyExport, pairs: ParsedTransfer[]): void {
   const entryById = new Map(data.entries.map((e) => [e.id, e]));
   const accountById = new Map(data.accounts.map((a) => [a.id, a]));
+
+  // Entry and recurring creation derive the currency from the account, so
+  // a stored record can never disagree with its account. An export whose
+  // records do disagree would have its amounts silently reinterpreted in
+  // the account's currency when balances are rebuilt (while currency-aware
+  // reports read the row's own currency), so reject the mismatch outright
+  // instead of relabeling amounts. This covers every entry kind —
+  // transactions, valuations, split parents and parts, and both transfer
+  // legs — because comparing records only with each other (as the split
+  // and transfer checks below do) cannot catch all of them flipped at once.
+  for (const entry of data.entries) {
+    const account = accountById.get(entry.accountId);
+    if (!account)
+      throw errors.validation(
+        "An entry in the export references an account that is not part of the export."
+      );
+    if (entry.currency !== account.currency) {
+      throw errors.validation(
+        `An entry in the export ("${entry.name}") uses currency ${entry.currency}, which does not match its account's currency ${account.currency}. Entry amounts are denominated in their account's currency — correct the export file or re-export the household.`
+      );
+    }
+  }
+  for (const series of data.recurring) {
+    const account = accountById.get(series.accountId);
+    if (!account)
+      throw errors.validation(
+        "A recurring series in the export references an account that is not part of the export."
+      );
+    if (series.currency !== account.currency) {
+      throw errors.validation(
+        `A recurring series in the export ("${series.name}") uses currency ${series.currency}, which does not match its account's currency ${account.currency}. Recurring amounts are denominated in their account's currency — correct the export file or re-export the household.`
+      );
+    }
+  }
+
   const childrenByParent = new Map<string, ParsedEntry[]>();
   for (const entry of data.entries) {
     if (!entry.parentEntryId) continue;

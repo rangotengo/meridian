@@ -478,12 +478,16 @@ describe("restore hardening (PR #6 review fixes)", () => {
     accounts: { id: string; currency: string }[];
     entries: {
       id: string;
+      accountId: string;
+      kind: string;
+      name: string;
       amountMinor: number;
+      currency: string;
       date: string;
       parentEntryId: string | null;
       transferId: string | null;
     }[];
-    recurring: unknown[];
+    recurring: { id: string; accountId: string; name: string; currency: string }[];
     savedFilters: { params: Record<string, unknown> }[];
   };
   const mutable = (value: unknown): MutableExport =>
@@ -669,7 +673,11 @@ describe("restore hardening (PR #6 review fixes)", () => {
       amountDisplayMinor: 5_000
     });
     const exported = mutable(await exportsSvc.buildFamilyExport(db(), actorOf(source)));
+    // Make leg B a EUR leg of a EUR account: each leg still matches its own
+    // account, so the per-record currency check passes and the transfer
+    // itself is what is cross-currency.
     exported.accounts.find((acc) => acc.id === b)!.currency = "EUR";
+    exported.entries.find((e) => e.accountId === b)!.currency = "EUR";
 
     const target = await makeUser();
     await expect(
@@ -695,6 +703,160 @@ describe("restore hardening (PR #6 review fixes)", () => {
       importFamilyExport(db(), actorOf(target), parseFamilyExport(encode(exported)))
     ).rejects.toThrow(/do not add up to the original/);
     await expectFamilyEmpty(target.familyId);
+  });
+
+  it("rejects the reviewer probe: entry and recurring currencies flipped away from their USD account", async () => {
+    const source = await makeUser();
+    const accountId = await makeAccount(source, { name: "Probe USD Account" });
+    await addTxn(source, accountId, { amountLedgerMinor: 10_000, name: "Probe txn" });
+    await recurringSvc.createSeries(db(), actorOf(source), {
+      accountId,
+      name: "Probe rent",
+      amountLedgerMinor: 10_000,
+      frequency: "monthly",
+      config: { dayOfMonth: 1 },
+      nextDue: daysAgo(-15)
+    });
+    const exported = mutable(await exportsSvc.buildFamilyExport(db(), actorOf(source)));
+    // Change only the two exported currency fields to JPY; the account
+    // itself stays USD. Before the fix this imported successfully and the
+    // JPY amounts were silently rebuilt as USD balances.
+    exported.entries.find((e) => e.name === "Probe txn")!.currency = "JPY";
+    exported.recurring[0]!.currency = "JPY";
+
+    const target = await makeUser();
+    await expect(
+      importFamilyExport(db(), actorOf(target), parseFamilyExport(encode(exported)))
+    ).rejects.toThrow(/does not match its account's currency/);
+    await expectFamilyEmpty(target.familyId);
+    const restoredSeries = await db()
+      .select()
+      .from(recurringSeries)
+      .where(eq(recurringSeries.familyId, target.familyId));
+    expect(restoredSeries).toHaveLength(0);
+  });
+
+  it("rejects a valuation whose currency differs from its account, and restores nothing", async () => {
+    const source = await makeUser();
+    const house = await makeAccount(source, { name: "Valuation House", type: "other_asset" });
+    await valuationsSvc.recordValuation(db(), actorOf(source), {
+      accountId: house,
+      date: daysAgo(1),
+      amountDisplayMinor: 900_000,
+      kind: "current",
+      name: "House valuation"
+    });
+    const exported = mutable(await exportsSvc.buildFamilyExport(db(), actorOf(source)));
+    const valuation = exported.entries.find((e) => e.kind === "valuation")!;
+    valuation.currency = "JPY";
+
+    const target = await makeUser();
+    await expect(
+      importFamilyExport(db(), actorOf(target), parseFamilyExport(encode(exported)))
+    ).rejects.toThrow(/does not match its account's currency/);
+    await expectFamilyEmpty(target.familyId);
+  });
+
+  it("rejects a recurring definition whose currency differs from its account, and restores nothing", async () => {
+    const source = await makeUser();
+    const accountId = await makeAccount(source, { name: "Recurring USD Account" });
+    await recurringSvc.createSeries(db(), actorOf(source), {
+      accountId,
+      name: "Currency-flipped rent",
+      amountLedgerMinor: 120_000,
+      frequency: "monthly",
+      config: { dayOfMonth: 1 },
+      nextDue: daysAgo(-15)
+    });
+    const exported = mutable(await exportsSvc.buildFamilyExport(db(), actorOf(source)));
+    exported.recurring[0]!.currency = "JPY";
+
+    const target = await makeUser();
+    await expect(
+      importFamilyExport(db(), actorOf(target), parseFamilyExport(encode(exported)))
+    ).rejects.toThrow(/does not match its account's currency/);
+    await expectFamilyEmpty(target.familyId);
+    const restoredSeries = await db()
+      .select()
+      .from(recurringSeries)
+      .where(eq(recurringSeries.familyId, target.familyId));
+    expect(restoredSeries).toHaveLength(0);
+  });
+
+  it("rejects a transfer whose legs both differ from their accounts' currency, and restores nothing", async () => {
+    const source = await makeUser();
+    const a = await makeAccount(source, {
+      name: "Leg Currency A",
+      openingBalanceDisplayMinor: 100_000
+    });
+    const b = await makeAccount(source, { name: "Leg Currency B" });
+    await orchestrate.makeTransferWithEntries(db(), actorOf(source), {
+      fromAccountId: a,
+      toAccountId: b,
+      date: daysAgo(0),
+      amountDisplayMinor: 5_000
+    });
+    const exported = mutable(await exportsSvc.buildFamilyExport(db(), actorOf(source)));
+    // Flip BOTH legs to JPY: they still match each other and balance, so
+    // the within-transfer checks pass — but each leg now disagrees with
+    // its own USD account.
+    for (const entry of exported.entries) entry.currency = "JPY";
+
+    const target = await makeUser();
+    await expect(
+      importFamilyExport(db(), actorOf(target), parseFamilyExport(encode(exported)))
+    ).rejects.toThrow(/does not match its account's currency/);
+    await expectFamilyEmpty(target.familyId);
+  });
+
+  it("imports a valid mixed-currency export where every record matches its own account", async () => {
+    const source = await makeUser();
+    const usd = await makeAccount(source, { name: "Mixed USD", currency: "USD" });
+    const eur = await makeAccount(source, { name: "Mixed EUR", currency: "EUR" });
+    await addTxn(source, usd, { amountLedgerMinor: 10_000, name: "USD txn" });
+    await addTxn(source, eur, { amountLedgerMinor: 20_000, name: "EUR txn" });
+    await recurringSvc.createSeries(db(), actorOf(source), {
+      accountId: eur,
+      name: "EUR series",
+      amountLedgerMinor: 30_000,
+      frequency: "monthly",
+      config: { dayOfMonth: 1 },
+      nextDue: daysAgo(-15)
+    });
+    const exported = await exportsSvc.buildFamilyExport(db(), actorOf(source));
+
+    const target = await makeUser();
+    const result = await importFamilyExport(
+      db(),
+      actorOf(target),
+      parseFamilyExport(encode(exported))
+    );
+    expect(result.accounts).toBe(2);
+    expect(result.entries).toBe(2);
+    expect(result.recurring).toBe(1);
+
+    const restoredAccounts = await db()
+      .select()
+      .from(accounts)
+      .where(eq(accounts.familyId, target.familyId));
+    const currencyByAccount = new Map(restoredAccounts.map((a) => [a.id, a.currency]));
+    expect([...currencyByAccount.values()].sort()).toEqual(["EUR", "USD"]);
+    const restoredEntries = await db()
+      .select()
+      .from(entries)
+      .where(
+        sql`${entries.accountId} IN (SELECT id FROM accounts WHERE family_id = ${target.familyId}::uuid)`
+      );
+    expect(restoredEntries).toHaveLength(2);
+    for (const entry of restoredEntries) {
+      expect(entry.currency).toBe(currencyByAccount.get(entry.accountId));
+    }
+    const restoredSeries = await db()
+      .select()
+      .from(recurringSeries)
+      .where(eq(recurringSeries.familyId, target.familyId));
+    expect(restoredSeries).toHaveLength(1);
+    expect(restoredSeries[0]!.currency).toBe(currencyByAccount.get(restoredSeries[0]!.accountId));
   });
 
   it("rejects an invalid recurring config at parse time and bounds nextOccurrence", () => {
