@@ -15,6 +15,7 @@ import type { Actor } from "../auth/context";
 import { recordAudit } from "../observability/audit";
 import { recalculateAccount } from "./balances";
 import { decryptProviderSecret, encryptProviderSecret } from "../security/secrets";
+import { lockMeroShareCredentialsForWrite } from "./meroshare-rotation";
 import { errors } from "@/lib/errors";
 import { isIsoDate, todayIn } from "@/lib/datetime";
 import { currencyExponent } from "@/lib/money";
@@ -453,6 +454,10 @@ export async function connectMeroShare(
     throw errors.validation("Choose a valid MeroShare DP.");
   const snapshot = await new MeroShareClient(input).portfolioSnapshot();
   const connectionId = await exec.transaction(async (tx) => {
+    // Serialize against key rotation: while a rotation holds the exclusive
+    // side of this lock, saving new credentials waits until it commits, so
+    // credentials are never written into the middle of a rotation.
+    await lockMeroShareCredentialsForWrite(tx);
     const [connection] = await tx
       .insert(meroShareConnections)
       .values({

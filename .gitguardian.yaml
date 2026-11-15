@@ -1,0 +1,11 @@
+# GitGuardian configuration.
+#
+# No paths are excluded from secret scanning — the whole repository,
+# including the security test files, stays scanned.
+#
+# The two fixture credentials in tests/integration/meroshare-key-rotation.test.ts
+# (GitGuardian incidents 40097894 and 40097895) are confirmed dummy test
+# data, seeded only into an isolated test database under throwaway keys.
+# They are handled by classifying those exact incidents as test credentials
+# in GitGuardian itself; local configuration deliberately does not suppress
+# them, so a real credential added to that file later would still be caught.

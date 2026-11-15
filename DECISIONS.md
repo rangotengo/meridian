@@ -46,3 +46,16 @@ implementation. Source baseline: Sure `c44408ff` (dev-upstream-sync), reviewed 2
 3. MFA/passkeys before any managed/public launch.
 4. Versioned REST API behind explicit contract ownership.
 5. Provider framework: connection + credentials + idempotent sync as one unit, no partial connectors.
+
+## Addendum — scope changes since launch (2026-11-15)
+
+The tables above record the launch decisions and are kept as history. Since
+then, the following deferred/removed items have shipped: budgets, recurring
+transactions, MeroShare portfolio sync (a provider connector with encrypted
+credentials and idempotent sync), an AI chat surface, Sure data import, and
+the Shortcuts API under `/api/v1`. A second backend (Cloudflare Workers with
+SQLite Durable Objects) is supported alongside PostgreSQL. Registration also
+became operator-controlled: `REGISTRATION_OPEN` can close public sign-up, and
+super-admin **instance invitations** (distinct from family-admin member
+invitations) are the invite-only path to a new household. Two seeded feature
+flags remain unimplemented; see `docs/follow-ups-assessment.md`.

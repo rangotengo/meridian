@@ -15,7 +15,7 @@ import { Field, FormError, Input, Select, Textarea } from "@/components/ds/form"
 import { SubmitButton } from "@/components/ds/submit-button";
 import { ConfirmDialog, Dialog } from "@/components/ds/dialog";
 import { TagPicker } from "@/components/ds/tag-picker";
-import { minorToDecimal, parseAmountToMinor } from "@/lib/money";
+import { minorToDecimal, tryParseAmountToMinor } from "@/lib/money";
 import { usePrivacy } from "@/components/layout/privacy-context";
 
 export type DetailProps = {
@@ -378,14 +378,22 @@ function SplitForm({
   const privacy = usePrivacy();
   const [state, action] = useActionState(splitEntryAction, undefined);
   const [rows, setRows] = useState([
-    { amount: 0, name: "", categoryId: "" },
-    { amount: 0, name: "", categoryId: "" }
+    { amountText: "", name: "", categoryId: "" },
+    { amountText: "", name: "", categoryId: "" }
   ]);
 
   const sign = totalMinor < 0 ? -1 : 1;
-  const parts = rows.map((row) => Math.round(row.amount) * sign);
+  // Amounts are kept as raw text while typing: intermediate input such as
+  // "-", "" or an over-precise fraction is a validation state (inline error,
+  // submit disabled), never an exception from the change handler.
+  const parsedAmounts = rows.map((row) => tryParseAmountToMinor(row.amountText, currency));
+  const invalidAmounts = rows.map(
+    (row, i) => row.amountText.trim() !== "" && parsedAmounts[i] === null
+  );
+  const parts = parsedAmounts.map((amount) => (amount ?? 0) * sign);
   const sum = parts.reduce((a, b) => a + b, 0);
   const remaining = totalMinor - sum;
+  const canSubmit = parsedAmounts.every((amount) => amount !== null) && remaining === 0;
 
   return (
     <form action={action} className="space-y-4">
@@ -394,8 +402,8 @@ function SplitForm({
         name="payload"
         value={JSON.stringify({
           parentEntryId,
-          parts: rows.map((row) => ({
-            amountLedgerMinor: Math.round(row.amount) * sign,
+          parts: rows.map((row, i) => ({
+            amountLedgerMinor: parts[i],
             name: row.name.trim() || undefined,
             categoryId: row.categoryId || null
           }))
@@ -410,16 +418,22 @@ function SplitForm({
       </p>
       {rows.map((row, i) => (
         <div key={i} className="grid gap-2 sm:grid-cols-3">
-          <Field label={`Part ${i + 1} amount`} htmlFor={`part-${i}`}>
+          <Field
+            label={`Part ${i + 1} amount`}
+            htmlFor={`part-${i}`}
+            error={invalidAmounts[i] ? "Enter a valid amount." : undefined}
+          >
             <Input
               id={`part-${i}`}
               type="text"
               inputMode="decimal"
               required
+              aria-invalid={invalidAmounts[i] || undefined}
+              value={row.amountText}
               onChange={(e) => {
-                const v = parseAmountToMinor(e.target.value, currency);
+                const amountText = e.target.value;
                 setRows((prev) =>
-                  prev.map((old, idx) => (idx === i ? { ...old, amount: v } : old))
+                  prev.map((old, idx) => (idx === i ? { ...old, amountText } : old))
                 );
               }}
             />
@@ -459,12 +473,12 @@ function SplitForm({
       <div className="flex items-center justify-between">
         <button
           type="button"
-          onClick={() => setRows((prev) => [...prev, { amount: 0, name: "", categoryId: "" }])}
+          onClick={() => setRows((prev) => [...prev, { amountText: "", name: "", categoryId: "" }])}
           className="rounded-lg border border-border px-3 py-1.5 text-xs font-medium"
         >
           Add another part
         </button>
-        <SubmitButton>Create split</SubmitButton>
+        <SubmitButton disabled={!canSubmit}>Create split</SubmitButton>
       </div>
     </form>
   );

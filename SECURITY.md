@@ -6,8 +6,13 @@
   string for future upgrades. Policy: ≥10 chars with letters and digits.
 - Sessions: 256-bit opaque tokens; only SHA-256 hashes are persisted. Cookies are httpOnly,
   SameSite=Lax, Secure in production, 30-day sliding expiry. Revocation is immediate.
-- Email verification is enforced before product access; password reset proves inbox control
-  and marks accounts verified. Reset/verification tokens are single-use, hashed, and expiring.
+- Email verification is enforced before product access when the operator sets
+  `REQUIRE_EMAIL_VERIFICATION=true` (recommended for any instance with more than one
+  household); password reset proves inbox control and marks accounts verified.
+  Reset/verification tokens are single-use, hashed, and expiring.
+- Public registration can be closed with `REGISTRATION_OPEN=false`. New households then
+  arrive only via super-admin instance invitations, and new members only via family-admin
+  invitations; the two invitation types are enforced by separate domain services.
 - Rate limits (DB-backed): login per email+IP 5/15min, password reset 5/hour, verification
   resend 3/hour.
 
@@ -34,7 +39,7 @@
 - CSRF: Next.js server actions verify Origin/Host on every mutation; cookies SameSite=Lax;
   export download is a session-gated GET with `no-store`.
 - Input validation at every action boundary (Zod); domain re-validates critical invariants.
-- Secrets are redacted recursively in logs and diagnostics. MeroShare CDSC username/password are AES-256-GCM encrypted at rest with `MERO_SHARE_ENCRYPTION_KEY`; its authorization header is in-memory for one sync only and is never persisted or logged.
+- Secrets are redacted recursively in logs and diagnostics. MeroShare CDSC username/password are AES-256-GCM encrypted at rest with `MERO_SHARE_ENCRYPTION_KEY`; its authorization header is in-memory for one sync only and is never persisted or logged. The encryption key can be rotated with `npm run meroshare:rotate-key`, which re-encrypts stored credentials transactionally (all-or-nothing) so a rotation never strands a household.
 
 ## Operations
 
