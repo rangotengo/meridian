@@ -9,16 +9,22 @@ updates everything that can be updated safely and documents what remains and why
 
 ## Method and caveat
 
-The environment this work was done in cannot run `npm audit`: the registry policy denies
-the audit endpoint (`POST /-/npm/v1/security/audits/quick` returns `policy_denied`), and
-the owner's audit JSON was not available there. Updates were therefore driven by the
-lockfile and registry metadata (`npm update`, then `npm outdated`), not by per-CVE
-targeting. **The exact CVE-to-version mapping of the 36 findings could not be verified.**
-The practical consequence: every package is now at the newest version its declared range
-allows, plus eight major-version bumps that verified cleanly — which is the strongest
-position reachable without audit data — but a follow-up `npm audit` on a machine with
-audit access should confirm the finding count actually dropped, and any stragglers should
-be triaged against this document.
+During initial implementation the managed registry denied the audit endpoint, so updates
+were driven by lockfile and registry freshness rather than individual advisories.
+
+The merge review subsequently ran a successful `npm audit` on the combined changes.
+The initial update left 17 findings (3 high, 12 moderate, 2 low). All high findings came
+from the direct Miniflare alpha pin and its `sharp` / `undici` dependencies. The review
+aligned that pin with `miniflare@5.20261113.0-beta`, already used by Wrangler, and verified
+the Cloudflare SQLite suite again (19/19).
+
+The resulting audit reports **14 findings: 0 critical, 0 high, 12 moderate, 2 low**.
+`npm audit --omit=dev` reports **3 moderate findings, no high or critical findings**,
+through OpenNext's glob/minimatch build tooling. Next's own `sharp` is patched at 0.35.5.
+Remaining full-tree findings involve glob/minimatch, typescript-eslint, and shadcn's
+registry/deepmerge tooling. npm's suggested fixes include incompatible downgrades;
+they were not applied blindly. These counts are package-level findings, not a claim
+that every advisory is reachable in the deployed application.
 
 ## What was done
 
@@ -91,16 +97,16 @@ react-day-picker) were additionally taken. The production database driver is `pg
 
 ## What remains outdated, and why
 
-| Package    | Current            | Latest | Reason                                                                                                                                                                                                                                                                                                                                   |
-| ---------- | ------------------ | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| typescript | 5.9.3              | 7.0.2  | **Blocked, not skipped.** Installation fails with an npm peer conflict: `typescript-eslint@8.72.2` requires `typescript >=4.8.4 <6.1.0`. Revisit when typescript-eslint ships a release whose peer range admits TypeScript 7 (or when the repo is ready to change its lint toolchain). Dev-only; no production exposure in the meantime. |
-| miniflare  | 5.20261001.0-alpha | 4.x    | **Deliberate pin, not behind.** The repo pins a 5.x prerelease (used by the OpenNext/Cloudflare test path) that is ahead of the latest stable 4.x line; "latest" in registry terms is a downgrade. Leave until a stable 5.x exists. Dev-only.                                                                                            |
+| Package    | Current           | Latest         | Reason                                                                                                                                                                                                                                                                                                                                   |
+| ---------- | ----------------- | -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| typescript | 5.9.3             | 7.0.2          | **Blocked, not skipped.** Installation fails with an npm peer conflict: `typescript-eslint@8.72.2` requires `typescript >=4.8.4 <6.1.0`. Revisit when typescript-eslint ships a release whose peer range admits TypeScript 7 (or when the repo is ready to change its lint toolchain). Dev-only; no production exposure in the meantime. |
+| miniflare  | 5.20261113.0-beta | 4.x stable tag | The direct preview-tooling pin was advanced to the newer 5.x beta already used by Wrangler to remove the alpha's high-severity transitive findings. The stable registry tag remains an older major.                                                                                                                                      |
 
-No other direct dependency is behind its newest release as of 2026-11-15.
+Other dependency updates remain as described above; registry tags alone do not establish advisory remediation.
 
 ## Recommended follow-up
 
-1. Run `npm audit` where the audit endpoint is reachable and confirm the 36 findings are
-   resolved or map to the two documented exceptions above.
+1. Track patched upstream versions for the remaining moderate/low findings and re-run
+   both audit modes after future lockfile changes; the current counts are recorded above.
 2. When typescript-eslint supports TypeScript 7, retry that single bump with the same
    full-verification procedure.
