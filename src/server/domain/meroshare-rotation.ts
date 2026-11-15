@@ -56,11 +56,13 @@ export async function lockMeroShareCredentialsForWrite(tx: Executor): Promise<vo
  * binary still running during a deploy) cannot be locked out, so before
  * committing, the rotation re-reads the table and verifies the stored rows
  * are exactly the re-encrypted set it produced; any row inserted, updated,
- * or deleted since the snapshot aborts the whole transaction. A rotation
- * therefore never reports success over mixed-key data — but it also cannot
- * stop an old binary from writing old-key credentials *after* it commits,
- * which is why the runbook procedure stops web + worker before rotating and
- * keeps them stopped until both run the new key.
+ * or deleted up to that final re-read aborts the whole transaction. The
+ * verification window ends at that re-read: a write that commits after it
+ * but before this transaction commits cannot be detected from inside the
+ * transaction, and neither can a write that lands after the commit. Those
+ * gaps are covered only by the runbook procedure, which stops web + worker
+ * before rotating and keeps them stopped until both run the new key — the
+ * stopped-writers barrier, not this check, is the primary protection.
  */
 export async function rotateMeroShareEncryptionKey(
   exec: Executor,
@@ -125,7 +127,10 @@ export async function rotateMeroShareEncryptionKey(
       // must be exactly the rows above with exactly the ciphertexts above.
       // Any other state means a writer that does not take the rotation lock
       // (an old binary, a manual SQL session) committed a credential write
-      // after the snapshot; abort so no mixed-key state is ever committed.
+      // after the snapshot; abort rather than commit a state this rotation
+      // did not produce. (A write committing after this re-read but before
+      // the transaction commits is outside this check's window — see the
+      // function doc comment.)
       const after = await tx
         .select({
           id: meroShareConnections.id,

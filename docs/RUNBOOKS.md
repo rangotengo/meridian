@@ -282,8 +282,12 @@ check `node bin/cloud-ops.mjs status` when investigating.
      `npm run meroshare:rotate-key -- --dry-run` (verifies every stored
      credential decrypts under the current key; writes nothing).
   4. Run `npm run meroshare:rotate-key`. The rotation is transactional: one
-     unreadable record, or any credential write that slips past the lock,
-     aborts it with nothing written and the old key keeps working.
+     unreadable record, or any credential write that slips past the lock and
+     lands before the rotation's final verification read, aborts it with
+     nothing written and the old key keeps working. A write landing in the
+     sliver between that read and the commit cannot be detected by the tool
+     — which is why step 2 (writers stopped) is the real barrier, not a
+     formality.
   5. While the apps are **still stopped**, replace
      `MERO_SHARE_ENCRYPTION_KEY` with the new key in the deployment
      environment of **both** web and worker, then redeploy/restart them.
