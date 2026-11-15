@@ -1,7 +1,7 @@
 import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import type { Executor } from "../db/client";
 import { chunkParams } from "../db/params";
-import { accountShares, accounts, entries, users } from "../db/schema";
+import { accountShares, accounts, entries, users, valuations } from "../db/schema";
 import type { Actor } from "../auth/context";
 import {
   ACCOUNT_TYPES,
@@ -285,6 +285,7 @@ export type AccountOverview = {
     name: string;
     amountMinor: number;
     kind: "transaction" | "valuation";
+    valuationKind: string | null;
   }[];
   shares: { userId: string; userName: string; userEmail: string; permission: string }[];
   valuationDriven: boolean;
@@ -328,9 +329,11 @@ export async function getAccountOverview(
       date: entries.date,
       name: entries.name,
       amountMinor: entries.amountMinor,
-      entryableType: entries.entryableType
+      entryableType: entries.entryableType,
+      valuationKind: valuations.kind
     })
     .from(entries)
+    .leftJoin(valuations, eq(valuations.entryId, entries.id))
     .where(eq(entries.accountId, accountId))
     .orderBy(desc(entries.date), desc(entries.createdAt))
     .limit(opts.activityLimit ?? 15);
@@ -360,7 +363,8 @@ export async function getAccountOverview(
       date: r.date,
       name: r.name,
       amountMinor: r.amountMinor,
-      kind: r.entryableType === "valuation" ? ("valuation" as const) : ("transaction" as const)
+      kind: r.entryableType === "valuation" ? ("valuation" as const) : ("transaction" as const),
+      valuationKind: r.valuationKind ?? null
     })),
     shares: shareRows,
     valuationDriven: isValuationDriven(account.type)

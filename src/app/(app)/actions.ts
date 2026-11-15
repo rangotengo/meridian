@@ -276,3 +276,64 @@ export async function recordValuationAction(
     return undefined;
   });
 }
+
+const updateValuationSchema = z.object({
+  entryId: z.string().uuid(),
+  date: z.string().min(8),
+  amount: z.string().min(1),
+  kind: z.enum(["current", "reconciliation", "opening"])
+});
+
+async function valuationAccount(entryId: string): Promise<{ accountId: string; currency: string }> {
+  const res = await getDb().execute<{ account_id: string; currency: string }>(
+    sql`SELECT e.account_id, a.currency FROM entries e JOIN accounts a ON a.id = e.account_id WHERE e.id = ${entryId} AND e.entryable_type = 'valuation'`
+  );
+  const row = (res.rows ?? [])[0];
+  if (!row) throw errors.notFound("Valuation");
+  return { accountId: row.account_id, currency: row.currency };
+}
+
+export async function updateValuationAction(
+  _prev: ActionState | undefined,
+  formData: FormData
+): Promise<ActionState> {
+  const parsed = updateValuationSchema.safeParse(formValues(formData));
+  if (!parsed.success)
+    return { ok: false, error: "Check the highlighted fields.", code: "validation.failed" };
+  const input = parsed.data;
+  return runAction("valuation.update", async () => {
+    const actor = await assertActor();
+    const { accountId, currency } = await valuationAccount(input.entryId);
+    const { recalculateAccount } = await import("@/server/domain/balances");
+    await withTransaction(async (tx) => {
+      const result = await valuationsSvc.updateValuation(tx, actor, {
+        entryId: input.entryId,
+        date: input.date,
+        amountDisplayMinor: parseAmountToMinor(input.amount, currency),
+        kind: input.kind
+      });
+      const from = result.previousDate < result.date ? result.previousDate : result.date;
+      await recalculateAccount(tx, result.accountId, from);
+    });
+    revalidatePath(`/accounts/${accountId}`);
+    revalidatePath("/");
+    return undefined;
+  });
+}
+
+export async function deleteValuationAction(formData: FormData): Promise<void> {
+  const entryId = String(formData.get("entryId") ?? "");
+  if (!entryId) return;
+  const actor = await assertActor();
+  const { recalculateAccount } = await import("@/server/domain/balances");
+  let accountId = "";
+  await withTransaction(async (tx) => {
+    const result = await valuationsSvc.deleteValuation(tx, actor, entryId);
+    accountId = result.accountId;
+    await recalculateAccount(tx, result.accountId, result.date);
+  });
+  if (accountId) {
+    revalidatePath(`/accounts/${accountId}`);
+    revalidatePath("/");
+  }
+}
