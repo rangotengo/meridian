@@ -551,3 +551,32 @@ describe("MeroShareClient", () => {
     }
   });
 });
+
+describe("pagination count integrity", () => {
+  it("rejects a repeated page instead of counting duplicated rows as complete", async () => {
+    const repeated = Array.from({ length: 200 }, (_, i) => holdingRow(i));
+    const { fetchFn } = makeFetch({
+      portfolio: () => Response.json({ totalItems: 400, meroShareMyPortfolio: repeated })
+    });
+    await expect(makeClient(fetchFn).portfolioSnapshot()).rejects.toThrow();
+  });
+
+  it("rejects a total that changes on a later page", async () => {
+    const { fetchFn } = makeFetch({
+      portfolio: (page) =>
+        Response.json({
+          totalItems: page === 1 ? 250 : 300,
+          meroShareMyPortfolio: Array.from({ length: page === 1 ? 200 : 50 }, (_, i) =>
+            holdingRow((page - 1) * 200 + i)
+          )
+        })
+    });
+    await expect(makeClient(fetchFn).portfolioSnapshot()).rejects.toThrow();
+  });
+  it("rejects an invalid declared total instead of treating it as omitted", async () => {
+    const { fetchFn } = makeFetch({
+      portfolio: () => Response.json({ ...basePortfolio(), totalItems: -1 })
+    });
+    await expect(makeClient(fetchFn).portfolioSnapshot()).rejects.toThrow();
+  });
+});

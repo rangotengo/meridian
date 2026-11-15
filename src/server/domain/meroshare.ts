@@ -345,6 +345,8 @@ export class MeroShareClient {
             // string), not the `demat: [boid]` array the portfolio call uses.
             boid,
             clientCode,
+            script: null,
+            requestTypeScript: false,
             page,
             size: PAGE_SIZE,
             sortAsc: false,
@@ -581,18 +583,34 @@ async function collectPages(
   if (key === null) return { first, key, rows: [] };
   let rows = [...(first[key] as unknown[])];
   if (rows.length > maxRows) throw errors.validation(overflowMessage);
-  const total = totalItemsOf(first.totalItems);
+  let total = totalItemsOf(first.totalItems);
+  if (first.totalItems != null && total === null) throw errors.validation(incompleteMessage);
+  if (total !== null && total > maxRows) throw errors.validation(overflowMessage);
   if (total !== null && rows.length > total) throw errors.validation(incompleteMessage);
+  const seenPages = new Set([JSON.stringify(rows)]);
   let lastPageSize = rows.length;
   for (let page = 2; ; page++) {
     const complete = total !== null ? rows.length >= total : lastPageSize < PAGE_SIZE;
     if (complete) break;
     const payload = await fetchPage(page);
+    const pageTotal = totalItemsOf(payload.totalItems);
+    if (payload.totalItems != null && pageTotal === null)
+      throw errors.validation(incompleteMessage);
+    if (pageTotal !== null) {
+      if (pageTotal > maxRows) throw errors.validation(overflowMessage);
+      if (total !== null && pageTotal !== total) throw errors.validation(incompleteMessage);
+      total = pageTotal;
+    }
     // The rows array must be present under the first page's key on every
     // page; a missing or reshaped array is malformed, never a terminator.
     if (!Array.isArray(payload[key])) throw errors.validation(incompleteMessage);
     const pageRows = payload[key] as unknown[];
     if (total !== null && pageRows.length === 0) throw errors.validation(incompleteMessage);
+    if (pageRows.length > 0) {
+      const fingerprint = JSON.stringify(pageRows);
+      if (seenPages.has(fingerprint)) throw errors.validation(incompleteMessage);
+      seenPages.add(fingerprint);
+    }
     rows = rows.concat(pageRows);
     if (rows.length > maxRows) throw errors.validation(overflowMessage);
     if (total !== null && rows.length > total) throw errors.validation(incompleteMessage);
@@ -605,7 +623,9 @@ async function collectPages(
 function totalItemsOf(value: unknown): number | null {
   if (typeof value !== "number" && typeof value !== "string") return null;
   const numeric = Number(value);
-  return Number.isInteger(numeric) && numeric >= 0 ? numeric : null;
+  return String(value).trim() !== "" && Number.isSafeInteger(numeric) && numeric >= 0
+    ? numeric
+    : null;
 }
 
 /**
