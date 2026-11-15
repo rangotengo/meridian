@@ -9,6 +9,9 @@ import {
   latestBalance,
   daysAgo
 } from "../helpers";
+import { eq } from "drizzle-orm";
+import { users } from "@/server/db/schema";
+import * as accountsSvc from "@/server/domain/accounts";
 import * as entriesSvc from "@/server/domain/entries";
 import * as transfersSvc from "@/server/domain/transfers";
 import * as orchestrate from "@/server/domain/orchestrate";
@@ -83,6 +86,51 @@ describe("transfers", () => {
     const suggestions = await transfersSvc.suggestTransferMatches(db(), actorOf(user), sourceId);
     expect(suggestions.length).toBeGreaterThan(0);
     expect(suggestions[0]!.name).toBe("near match");
+  });
+
+  it("returns no suggestions for a read_only member instead of throwing", async () => {
+    const owner = await makeUser({ familyName: "SuggestFam" });
+    const member = await makeUser({
+      email: `ro-member-${Date.now()}@test.local`,
+      familyName: "Other"
+    });
+    await db().update(users).set({ familyId: owner.familyId }).where(eq(users.id, member.userId));
+    member.familyId = owner.familyId;
+
+    const a = await makeAccount(owner, { joint: false });
+    const b = await makeAccount(owner, { joint: false });
+    await accountsSvc.shareAccount(db(), actorOf(owner), a, member.userId, "read_only");
+    await accountsSvc.shareAccount(db(), actorOf(owner), b, member.userId, "read_only");
+
+    const sourceId = await addTxn(owner, a, {
+      amountLedgerMinor: 7000,
+      name: "ro source",
+      date: daysAgo(3)
+    });
+    await addTxn(owner, b, { amountLedgerMinor: -7000, name: "ro match", date: daysAgo(3) });
+
+    // The transaction detail page fetches suggestions for every viewer;
+    // for a read_only member this must resolve empty, not throw forbidden.
+    await expect(
+      transfersSvc.suggestTransferMatches(db(), actorOf(member), sourceId)
+    ).resolves.toEqual([]);
+    // The read-only detail view itself still loads.
+    await expect(entriesSvc.getEntryDetail(db(), actorOf(member), sourceId)).resolves.toBeTruthy();
+    // A read_write member still receives suggestions.
+    const writer = await makeUser({
+      email: `rw-member-${Date.now()}@test.local`,
+      familyName: "Other"
+    });
+    await db().update(users).set({ familyId: owner.familyId }).where(eq(users.id, writer.userId));
+    writer.familyId = owner.familyId;
+    await accountsSvc.shareAccount(db(), actorOf(owner), a, writer.userId, "read_write");
+    await accountsSvc.shareAccount(db(), actorOf(owner), b, writer.userId, "read_write");
+    const writerSuggestions = await transfersSvc.suggestTransferMatches(
+      db(),
+      actorOf(writer),
+      sourceId
+    );
+    expect(writerSuggestions.length).toBeGreaterThan(0);
   });
 
   it("unlinking restores both legs atomically", async () => {

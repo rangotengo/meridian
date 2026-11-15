@@ -3,7 +3,7 @@ import { eq, sql } from "drizzle-orm";
 import type { Executor } from "../db/client";
 import { accounts, entries, transactions, transfers } from "../db/schema";
 import type { Actor } from "../auth/context";
-import { assertAccountAccess, assertAccountOpen } from "../authorization/access";
+import { assertAccountOpen, getAccountAccess } from "../authorization/access";
 import { errors } from "@/lib/errors";
 import { addMinor, negateMinor } from "@/lib/money";
 import { diffDays, isIsoDate } from "@/lib/datetime";
@@ -287,7 +287,13 @@ export async function findTransferCandidates(
     .where(eq(entries.id, sourceEntryId))
     .limit(1);
   if (!source || source.account.familyId !== actor.familyId) throw errors.notFound("Transaction");
-  await assertAccountAccess(exec, actor, source.account.id, "annotate");
+  // Suggestions only exist to offer a link action. An actor who cannot
+  // annotate the account (a read_only share) gets no suggestions instead of
+  // a forbidden error, so read-only viewers can still open the transaction
+  // detail page, which fetches suggestions for every viewer.
+  const access = await getAccountAccess(exec, actor, source.account.id);
+  if (!access.granted) throw errors.notFound("Account");
+  if (access.level === "read_only") return [];
 
   const targetAmount = negateMinor(source.entry.amountMinor);
 
