@@ -396,9 +396,11 @@ export const MAX_CATCHUP_OCCURRENCES_PER_RUN = 100;
  * committed occurrences are recalculated immediately, and only then is the
  * series counted as failed (so runRecurringPost still propagates the failure
  * and the queue retries the series from the first unposted occurrence).
- * The repair job is retryable even once the series is no longer due: the
- * `maintenance:balances` handler rebuilds every active account
- * independently of series due state.
+ * The repair job is retryable even once the series is no longer due: it
+ * carries an { accountIds } payload targeting just this account, so the
+ * `maintenance:balances` handler rebuilds that account independently of
+ * series due state (untargeted jobs, like the nightly cron, rebuild every
+ * active account).
  *
  * After a series posts, its account balances are recalculated. If that
  * recalculation fails, the repair enqueue is retried as a fallback (the
@@ -519,7 +521,7 @@ export async function postDueSeries(exec: Executor, now = new Date()): Promise<P
             await enqueue(
               tx,
               "maintenance:balances",
-              {},
+              { accountIds: [series.accountId] },
               {
                 dedupeKey: `balance-repair:${series.accountId}`
               }
@@ -557,7 +559,7 @@ export async function postDueSeries(exec: Executor, now = new Date()): Promise<P
             await enqueue(
               exec,
               "maintenance:balances",
-              {},
+              { accountIds: [series.accountId] },
               {
                 dedupeKey: `balance-repair:${series.accountId}`
               }

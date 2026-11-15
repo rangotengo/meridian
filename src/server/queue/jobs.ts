@@ -5,7 +5,10 @@ import { pruneRateLimitCounters } from "../security/rate-limit";
 import { pruneDebugLogs } from "../observability/debug-log";
 import { pruneFinishedJobs } from "./index";
 import { ensureSchedules, type CronDef } from "./worker-loop";
-import { recalculateAllActiveAccounts } from "../domain/balances-maintenance";
+import {
+  recalculateAllActiveAccounts,
+  recalculateTargetedAccounts
+} from "../domain/balances-maintenance";
 import { postDueSeries } from "../domain/recurring";
 import { env } from "@/lib/env";
 
@@ -33,18 +36,39 @@ export async function runRecurringPost(exec: Executor) {
 }
 
 /**
+ * Extracts the account target set from a maintenance:balances payload.
+ * Returns null for an untargeted (full-rebuild) job: no payload, no
+ * accountIds, an empty list, or a malformed value all mean "every active
+ * account", matching the nightly job's historical behaviour.
+ */
+export function balanceMaintenanceTargets(payload?: Record<string, unknown>): string[] | null {
+  const raw = payload?.accountIds;
+  if (!Array.isArray(raw)) return null;
+  const ids = raw.filter((v): v is string => typeof v === "string" && v.length > 0);
+  return ids.length > 0 ? [...new Set(ids)] : null;
+}
+
+/**
  * Runs one balance-maintenance pass and propagates per-account failures to
- * the queue. recalculateAllActiveAccounts deliberately attempts every
- * account (one failure must not block the others), but a pass with failures
- * is NOT a success: the durable repair jobs enqueued by recurring posting
- * ride on this handler, so resolving here would complete the repair job
- * while the very account needing repair stays stale — and once its series
- * is no longer due, nothing would revisit it until nightly maintenance.
+ * the queue. The recalculation deliberately attempts every account in scope
+ * (one failure must not block the others), but a pass with failures is NOT
+ * a success: the durable repair jobs enqueued by recurring posting ride on
+ * this handler, so resolving here would complete the repair job while the
+ * very account needing repair stays stale — and once its series is no
+ * longer due, nothing would revisit it until nightly maintenance.
  * Throwing routes the job through failJob's retry / dead-letter handling,
  * which preserves the repair intent until a recalculation succeeds.
+ *
+ * Scope: a payload of { accountIds: [...] } targets only those accounts
+ * (the per-account repair jobs committed by recurring posting); any other
+ * payload — including the nightly cron's {} — rebuilds every active
+ * account. A failure in any in-scope account fails the job either way.
  */
-export async function runBalanceMaintenance(exec: Executor) {
-  const result = await recalculateAllActiveAccounts(exec);
+export async function runBalanceMaintenance(exec: Executor, payload?: Record<string, unknown>) {
+  const targets = balanceMaintenanceTargets(payload);
+  const result = targets
+    ? await recalculateTargetedAccounts(exec, targets)
+    : await recalculateAllActiveAccounts(exec);
   if (result.failures.length > 0) {
     const ids = result.failures.map((f) => f.accountId).join(", ");
     throw new Error(
@@ -70,8 +94,8 @@ export async function createJobRegistry() {
     void exec;
   });
 
-  registry.set("maintenance:balances", async (_payload, exec) => {
-    await runBalanceMaintenance(exec);
+  registry.set("maintenance:balances", async (payload, exec) => {
+    await runBalanceMaintenance(exec, payload);
   });
 
   registry.set("maintenance:cleanup", async (_payload, exec) => {
