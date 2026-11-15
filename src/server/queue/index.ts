@@ -41,11 +41,71 @@ export type ClaimedJob = typeof jobs.$inferSelect;
 
 const STALE_LOCK_MINUTES = 10;
 
+/**
+ * Coalescing guard for transitions back into 'pending'.
+ *
+ * The partial unique index jobs_dedupe_active_idx allows only one pending
+ * job per (queue, dedupe_key), but a running or dead job does not block
+ * enqueue, so a newer pending job with the same key can legitimately appear
+ * while an older one is still in flight. When the older job later moves back
+ * to 'pending' (retry, stale recovery, dead-letter replay), an unguarded
+ * UPDATE violates the index and throws into the worker loop. Guarding the
+ * transition with NOT EXISTS over a live pending duplicate keeps it atomic:
+ * the pending job already represents the work, so the older job is coalesced
+ * instead — marked 'completed' with SUPERSEDED_NOTE as its last_error, which
+ * preserves its row for the admin jobs view and the finished-job pruner
+ * (deleting it would erase that history). Jobs with a NULL dedupe key never
+ * match this predicate (NULL never equals NULL), so they always transition
+ * normally.
+ */
+const pendingDuplicateExists = sql`EXISTS (
+  SELECT 1 FROM jobs AS dup
+  WHERE dup.queue = jobs.queue
+    AND dup.dedupe_key = jobs.dedupe_key
+    AND dup.status = 'pending'
+    AND dup.id <> jobs.id
+)`;
+
+const SUPERSEDED_NOTE = "Superseded by a pending job with the same dedupe key";
+
 export async function recoverStaleJobs(exec: Executor): Promise<number> {
+  const staleBefore = new Date(Date.now() - STALE_LOCK_MINUTES * 60000).toISOString();
+  // Return stale jobs to 'pending', skipping any whose dedupe key is already
+  // covered by a pending duplicate. When several stale jobs share a key, only
+  // the longest-stale one is recovered (deterministic tie-break on
+  // locked_at/created_at/id); the rest are coalesced by the second UPDATE.
   const res = await exec.execute(sql`
     UPDATE jobs SET status = 'pending', locked_at = NULL, locked_by = NULL, updated_at = ${databaseNow}
-    WHERE status = 'running' AND locked_at < ${new Date(Date.now() - STALE_LOCK_MINUTES * 60000).toISOString()}
+    WHERE status = 'running' AND locked_at < ${staleBefore}
+      AND NOT EXISTS (
+        SELECT 1 FROM jobs AS dup
+        WHERE dup.queue = jobs.queue
+          AND dup.dedupe_key = jobs.dedupe_key
+          AND dup.id <> jobs.id
+          AND (
+            dup.status = 'pending'
+            OR (
+              dup.status = 'running' AND dup.locked_at < ${staleBefore}
+              AND (
+                dup.locked_at < jobs.locked_at
+                OR (dup.locked_at = jobs.locked_at AND dup.created_at < jobs.created_at)
+                OR (dup.locked_at = jobs.locked_at AND dup.created_at = jobs.created_at AND dup.id < jobs.id)
+              )
+            )
+          )
+      )
   `);
+  // Any stale job still 'running' here was blocked by a pending duplicate —
+  // either one that already existed or the tie-break winner recovered above —
+  // so coalesce it instead of leaving it stuck behind the dedupe index.
+  await exec.execute(sql`
+    UPDATE jobs SET status = 'completed', completed_at = ${databaseNow}, locked_at = NULL, locked_by = NULL,
+      last_error = ${SUPERSEDED_NOTE}, updated_at = ${databaseNow}
+    WHERE status = 'running' AND locked_at < ${staleBefore}
+      AND ${pendingDuplicateExists}
+  `);
+  // Counts only jobs returned to 'pending'; coalesced jobs are resolved as
+  // 'completed' and are not included in the count.
   return res.rowCount ?? 0;
 }
 
@@ -90,7 +150,7 @@ export async function failJob(
   exec: Executor,
   job: ClaimedJob,
   error: unknown
-): Promise<"retry" | "dead"> {
+): Promise<"retry" | "dead" | "coalesced"> {
   const message =
     error instanceof Error
       ? `${error.name}: ${error.message}`.slice(0, 500)
@@ -109,20 +169,39 @@ export async function failJob(
     return "dead";
   }
   const delay = backoffSeconds(job.attempts + 1);
-  await exec.execute(sql`
+  const res = await exec.execute(sql`
     UPDATE jobs SET status = 'pending', last_error = ${message},
       run_after = ${new Date(Date.now() + delay * 1000).toISOString()}, updated_at = ${databaseNow}
-    WHERE id = ${job.id}
+    WHERE id = ${job.id} AND NOT ${pendingDuplicateExists}
   `);
-  return "retry";
+  if ((res.rowCount ?? 0) > 0) return "retry";
+  // A newer pending job with the same dedupe key already covers this work:
+  // coalesce instead of violating the dedupe index on the retry transition.
+  await exec.execute(sql`
+    UPDATE jobs SET status = 'completed', completed_at = ${databaseNow}, locked_at = NULL, locked_by = NULL,
+      last_error = ${`${SUPERSEDED_NOTE}; last failure: ${message}`.slice(0, 500)}, updated_at = ${databaseNow}
+    WHERE id = ${job.id} AND status = 'running'
+  `);
+  return "coalesced";
 }
 
 export async function replayDeadJob(exec: Executor, jobId: string): Promise<boolean> {
   const res = await exec.execute(sql`
     UPDATE jobs SET status = 'pending', attempts = 0, run_after = ${databaseNow}, updated_at = ${databaseNow}
+    WHERE id = ${jobId} AND status = 'dead' AND NOT ${pendingDuplicateExists}
+  `);
+  if ((res.rowCount ?? 0) > 0) return true;
+  // Coalesce: a pending duplicate already covers this job's work, so the
+  // replay resolves the dead job as 'completed' instead of violating the
+  // dedupe index. Returning true reports that the replay took effect (the
+  // job left 'dead' and its work is covered); false means the job was not
+  // in 'dead' state to begin with.
+  const coalesced = await exec.execute(sql`
+    UPDATE jobs SET status = 'completed', completed_at = ${databaseNow},
+      last_error = ${SUPERSEDED_NOTE}, updated_at = ${databaseNow}
     WHERE id = ${jobId} AND status = 'dead'
   `);
-  return (res.rowCount ?? 0) > 0;
+  return (coalesced.rowCount ?? 0) > 0;
 }
 
 export async function pruneFinishedJobs(exec: Executor, olderThanDays: number): Promise<number> {

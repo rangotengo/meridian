@@ -1,7 +1,16 @@
 import { describe, it, expect, beforeAll } from "vitest";
 import { sql } from "drizzle-orm";
 import { db, makeUser, makeAccount, addTxn, truncateAll, actorOf } from "../helpers";
-import { enqueue, runPendingNow, claimBatch, failJob, pruneFinishedJobs } from "@/server/queue";
+import {
+  enqueue,
+  runPendingNow,
+  claimBatch,
+  failJob,
+  completeJob,
+  recoverStaleJobs,
+  replayDeadJob,
+  pruneFinishedJobs
+} from "@/server/queue";
 import { createJobRegistry, registerWorkerBootstraps } from "@/server/queue/jobs";
 import { ensureSchedules, runDueCrons } from "@/server/queue/worker-loop";
 
@@ -120,6 +129,140 @@ describe("durable queue", () => {
       sql`SELECT count(*)::text AS c FROM cron_schedules`
     );
     expect(Number(rows.rows![0]!.c)).toBeGreaterThanOrEqual(2);
+  });
+});
+
+describe("dedupe coalescing", () => {
+  beforeAll(async () => {
+    await db().execute(sql`DELETE FROM jobs`);
+  });
+
+  async function jobRow(id: string) {
+    const res = await db().execute<{ status: string; last_error: string | null }>(
+      sql`SELECT status, last_error FROM jobs WHERE id = ${id}::uuid`
+    );
+    return res.rows![0]!;
+  }
+
+  async function pendingCount(queue: string, key: string) {
+    const res = await db().execute<{ c: string }>(sql`
+      SELECT count(*)::text AS c FROM jobs
+      WHERE queue = ${queue} AND dedupe_key = ${key} AND status = 'pending'
+    `);
+    return Number(res.rows![0]!.c);
+  }
+
+  async function claimOne(id: string) {
+    const batch = await claimBatch(db(), "test", 50);
+    const job = batch.find((j) => j.id === id);
+    expect(job).toBeTruthy();
+    return job!;
+  }
+
+  it("coalesces a retry when a newer pending job shares the dedupe key", async () => {
+    const a = await enqueue(db(), "coalesce-retry", {}, { dedupeKey: "retry-key" });
+    expect(a).toBeTruthy();
+    const claimedA = await claimOne(a!);
+
+    // A running job does not block enqueue: B lands as the pending duplicate.
+    const b = await enqueue(db(), "coalesce-retry", {}, { dedupeKey: "retry-key" });
+    expect(b).toBeTruthy();
+
+    const outcome = await failJob(db(), claimedA, new Error("kaboom"));
+    expect(outcome).toBe("coalesced");
+
+    const rowA = await jobRow(a!);
+    expect(rowA.status).toBe("completed");
+    expect(rowA.last_error).toContain("Superseded by a pending job");
+    expect(rowA.last_error).toContain("kaboom");
+
+    expect((await jobRow(b!)).status).toBe("pending");
+    expect(await pendingCount("coalesce-retry", "retry-key")).toBe(1);
+
+    // The surviving pending job is still claimable and completable.
+    await claimOne(b!);
+    await completeJob(db(), b!);
+    expect((await jobRow(b!)).status).toBe("completed");
+  });
+
+  it("coalesces stale-job recovery when a pending duplicate exists", async () => {
+    const a = await enqueue(db(), "coalesce-recover", {}, { dedupeKey: "recover-key" });
+    await claimOne(a!);
+    const b = await enqueue(db(), "coalesce-recover", {}, { dedupeKey: "recover-key" });
+    expect(b).toBeTruthy();
+
+    await db().execute(sql`
+      UPDATE jobs SET locked_at = now() - interval '30 minutes' WHERE id = ${a}::uuid
+    `);
+    const recovered = await recoverStaleJobs(db());
+    expect(recovered).toBe(0);
+
+    const rowA = await jobRow(a!);
+    expect(rowA.status).toBe("completed");
+    expect(rowA.last_error).toContain("Superseded by a pending job");
+    expect((await jobRow(b!)).status).toBe("pending");
+    expect(await pendingCount("coalesce-recover", "recover-key")).toBe(1);
+  });
+
+  it("coalesces a dead-letter replay when a pending duplicate exists", async () => {
+    const a = await enqueue(db(), "coalesce-replay", {}, { dedupeKey: "replay-key" });
+    await db().execute(sql`UPDATE jobs SET status = 'dead' WHERE id = ${a}::uuid`);
+    const b = await enqueue(db(), "coalesce-replay", {}, { dedupeKey: "replay-key" });
+    expect(b).toBeTruthy();
+
+    const replayed = await replayDeadJob(db(), a!);
+    expect(replayed).toBe(true);
+
+    const rowA = await jobRow(a!);
+    expect(rowA.status).toBe("completed");
+    expect(rowA.last_error).toContain("Superseded by a pending job");
+    expect((await jobRow(b!)).status).toBe("pending");
+    expect(await pendingCount("coalesce-replay", "replay-key")).toBe(1);
+  });
+
+  it("keeps the non-collision retry, recovery, and replay paths unchanged", async () => {
+    // Retry without a conflict reschedules with backoff.
+    const c = await enqueue(db(), "plain-retry", {}, { dedupeKey: "plain-key", maxAttempts: 3 });
+    const claimedC = await claimOne(c!);
+    const outcome = await failJob(db(), claimedC, new Error("transient"));
+    expect(outcome).toBe("retry");
+    const resC = await db().execute<{ status: string; delayed: boolean }>(sql`
+      SELECT status, (run_after > now()) AS delayed FROM jobs WHERE id = ${c}::uuid
+    `);
+    expect(resC.rows![0]!.status).toBe("pending");
+    expect(resC.rows![0]!.delayed).toBe(true);
+
+    // A NULL dedupe key never coalesces, even with another pending job.
+    const f = await enqueue(db(), "plain-retry", {});
+    const claimedF = await claimOne(f!);
+    const g = await enqueue(db(), "plain-retry", {});
+    expect(g).toBeTruthy();
+    expect(await failJob(db(), claimedF, new Error("transient"))).toBe("retry");
+    expect((await jobRow(f!)).status).toBe("pending");
+
+    // Stale recovery without a conflict returns the job to pending.
+    const d = await enqueue(db(), "plain-recover", {}, { dedupeKey: "plain-recover-key" });
+    await claimOne(d!);
+    await db().execute(sql`
+      UPDATE jobs SET locked_at = now() - interval '30 minutes' WHERE id = ${d}::uuid
+    `);
+    const recovered = await recoverStaleJobs(db());
+    expect(recovered).toBeGreaterThanOrEqual(1);
+    const resD = await db().execute<{ status: string; locked_at: string | null }>(sql`
+      SELECT status, locked_at FROM jobs WHERE id = ${d}::uuid
+    `);
+    expect(resD.rows![0]!.status).toBe("pending");
+    expect(resD.rows![0]!.locked_at).toBeNull();
+
+    // Replay without a conflict requeues the dead job with attempts reset.
+    const e = await enqueue(db(), "plain-replay", {}, { dedupeKey: "plain-replay-key" });
+    await db().execute(sql`UPDATE jobs SET status = 'dead', attempts = 4 WHERE id = ${e}::uuid`);
+    expect(await replayDeadJob(db(), e!)).toBe(true);
+    const resE = await db().execute<{ status: string; attempts: number }>(sql`
+      SELECT status, attempts FROM jobs WHERE id = ${e}::uuid
+    `);
+    expect(resE.rows![0]!.status).toBe("pending");
+    expect(Number(resE.rows![0]!.attempts)).toBe(0);
   });
 });
 
