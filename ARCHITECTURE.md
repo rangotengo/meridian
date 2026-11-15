@@ -20,7 +20,7 @@ lifecycle rules; database constraints are the last line of defense.
 | `src/server/db/`            | Pool/client, drizzle schema, reviewed-SQL migration runner                                                                   |
 | `src/server/auth/`          | Session cookie → `Actor` resolution per request                                                                              |
 | `src/server/authorization/` | Account access levels and family/platform role assertions                                                                    |
-| `src/server/domain/`        | Business rules: accounts, entries, transfers, splits, valuations, balances, reports, FX, exports, users/families/invitations |
+| `src/server/domain/`        | Business rules: accounts, entries, transfers, splits, valuations, balances, reports, FX, exports, users/families, family + instance invitations |
 | `src/server/security/`      | Password hashing, session store, auth tokens, rate limiting, mailer                                                          |
 | `src/server/queue/`         | Durable job queue, cron scheduler, worker loop contracts                                                                     |
 | `src/app/(auth)/`           | Public identity routes                                                                                                       |
@@ -32,6 +32,11 @@ lifecycle rules; database constraints are the last line of defense.
 
 - **Family** is the tenant boundary. Every query path filters through it; cross-family access
   is denied at service level with negative tests.
+- **Registration** is operator-gated: `REGISTRATION_OPEN=false` closes public sign-up, after
+  which new households arrive only by **instance invitation** (issued by a platform
+  super-admin; acceptance creates the family and its admin). **Family invitations** are a
+  separate flow: a family admin adds a member to an existing family. `REQUIRE_EMAIL_VERIFICATION`
+  controls whether new accounts must verify their email before access.
 - **Account** has a type (`depository`, `credit_card`, `other_asset`, `other_liability`),
   lifecycle status, optional owner, and report inclusion flag.
   - Owner set → other members need an explicit share (`full_control` / `read_write` /
@@ -57,6 +62,11 @@ claims batches with `FOR UPDATE SKIP LOCKED`, recovers stale locks, runs cron sc
 `cron_schedules`, and records failures both in-row and in `debug_log_entries`. Email delivery,
 nightly balance maintenance, and retention cleanup ship as the initial job set.
 
+Two deployment shapes run the same codebase: self-hosted on PostgreSQL (web app plus a
+standalone worker process; the Docker image picks its role via `APP_ROLE` in
+`docker-entrypoint.sh`), and Cloudflare Workers backed by SQLite in Durable Objects
+(`DATABASE_BACKEND=cloud-sqlite`), with schema and migrations maintained per backend.
+
 ## Observability
 
 Structured pino logs with action names/timings, redaction of sensitive keys, an audit trail
@@ -65,5 +75,7 @@ surfacing `debug_log_entries` plus queue health.
 
 ## Deliberate exclusions
 
-See DECISIONS.md — bank providers, investments, budgets/goals, AI, shared expenses, CSV
-import, MFA/passkeys, and public API are intentionally absent from this release scope.
+See DECISIONS.md for the original launch scope. Budgets, recurring transactions, MeroShare
+portfolio sync, an AI chat surface, Sure data import, and the Shortcuts API (`/api/v1`) have
+shipped since; bank aggregation providers, shared expenses, MFA/passkeys, and a general
+public API remain out of scope.

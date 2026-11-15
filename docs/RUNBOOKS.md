@@ -256,10 +256,22 @@ check `node bin/cloud-ops.mjs status` when investigating.
 
 - `MERIDIAN_OPS_TOKEN`: rotate freely (`wrangler secret put ...`), then
   update operator machines. No data consequences.
-- `MERO_SHARE_ENCRYPTION_KEY`: **do not rotate casually.** Replacing it makes
-  every stored MeroShare credential undecryptable; affected users must
-  re-enter credentials (there is no re-encryption path). If key compromise
-  forces rotation, expect every household using MeroShare to reconnect.
+- `MERO_SHARE_ENCRYPTION_KEY`: rotate with the re-encryption tool — never by
+  just replacing the value, which would make every stored MeroShare
+  credential undecryptable. Procedure:
+  1. Generate a new key: `openssl rand -base64 32`.
+  2. With the database reachable and the **current** key in
+     `MERO_SHARE_ENCRYPTION_KEY`, set `MERO_SHARE_NEW_ENCRYPTION_KEY` to the
+     new key and dry-run first:
+     `npm run meroshare:rotate-key -- --dry-run` (verifies every stored
+     credential decrypts under the current key; writes nothing).
+  3. Run `npm run meroshare:rotate-key`. The rotation is transactional: one
+     unreadable record aborts it with nothing written, and the old key keeps
+     working.
+  4. Replace `MERO_SHARE_ENCRYPTION_KEY` with the new key in the deployment
+     environment (both web and worker), redeploy/restart, and confirm a
+     MeroShare sync still works. Keep the old key until step 4 is verified;
+     after that it can be discarded.
 - Access/Google OAuth secrets live in the Cloudflare/Google consoles, not in
   the Worker.
 
