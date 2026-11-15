@@ -7,6 +7,7 @@ import {
 
 const recurring = SCHEDULE_EXPECTATIONS.find((e) => e.key === "recurring-post")!;
 const nightly = SCHEDULE_EXPECTATIONS.find((e) => e.key === "nightly-balances")!;
+const backup = SCHEDULE_EXPECTATIONS.find((e) => e.key === "nightly-backup")!;
 
 const NOW = new Date("2026-11-15T12:00:00.000Z");
 const minutesAgo = (m: number) => new Date(NOW.getTime() - m * 60000);
@@ -68,6 +69,22 @@ describe("evaluateScheduleCheck", () => {
     });
     expect(c.status).toBe("disabled");
     expect(c.lastRunAgeSeconds).toBeNull();
+  });
+
+  it("covers nightly-backup with the nightly budget, marked optional", () => {
+    // Optional = only checked when a cron_schedules row exists (backups
+    // are registered only where configured); the required schedules are
+    // always checked, so a missing row for them still degrades.
+    expect(backup.queue).toBe("maintenance:backup");
+    expect(backup.staleAfterSeconds).toBe(6 * 3600);
+    expect(backup.optional).toBe(true);
+    expect(recurring.optional).toBe(false);
+    expect(nightly.optional).toBe(false);
+    const c = check(backup, {
+      lastRunAt: minutesAgo(31 * 60),
+      nextRunAt: minutesAgo(7 * 60)
+    });
+    expect(c.status).toBe("stale");
   });
 
   it("accepts ISO strings as well as Date objects (SQLite backend)", () => {

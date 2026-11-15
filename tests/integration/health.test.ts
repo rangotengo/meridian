@@ -107,6 +107,97 @@ describe("health endpoint", () => {
     expect(logsAfterSecond).toHaveLength(1);
   });
 
+  it("records recovery and alerts again when the same schedule goes stale again", async () => {
+    await seedFreshSchedules();
+    const makeRecurringStale = () =>
+      db().execute(sql`
+        UPDATE cron_schedules
+        SET last_run_at = ${minutesFromNow(-150)}, next_run_at = ${minutesFromNow(-120)}
+        WHERE key = 'recurring-post'
+      `);
+    const makeRecurringFresh = () =>
+      db().execute(sql`
+        UPDATE cron_schedules
+        SET last_run_at = ${minutesFromNow(-10)}, next_run_at = ${minutesFromNow(20)}
+        WHERE key = 'recurring-post'
+      `);
+
+    // First outage: one warn entry; a repeat poll during the same outage
+    // stays deduped.
+    await makeRecurringStale();
+    await GET();
+    await GET();
+    let logs = await listDebugLogs(db(), { category: "health" });
+    expect(logs).toHaveLength(1);
+    expect(logs[0]?.level).toBe("warn");
+
+    // Recovery: the healthy read records an info entry resetting the
+    // incident state; further healthy polls add nothing.
+    await makeRecurringFresh();
+    const recovered = await GET();
+    expect(((await recovered.json()) as HealthBody).status).toBe("ok");
+    await GET();
+    logs = await listDebugLogs(db(), { category: "health" });
+    expect(logs).toHaveLength(2);
+    expect(logs[0]?.level).toBe("info");
+    expect((logs[0]?.metadata as { staleKeys?: string[] })?.staleKeys).toEqual([]);
+    expect((logs[0]?.metadata as { recoveredFrom?: string[] })?.recoveredFrom).toEqual([
+      "recurring-post"
+    ]);
+
+    // Recurrence of the SAME stale set: a new alertable warn entry, not
+    // suppressed by the first incident's log.
+    await makeRecurringStale();
+    const recurred = await GET();
+    expect(((await recurred.json()) as HealthBody).status).toBe("degraded");
+    logs = await listDebugLogs(db(), { category: "health" });
+    expect(logs).toHaveLength(3);
+    expect(logs[0]?.level).toBe("warn");
+    expect((logs[0]?.metadata as { staleKeys?: string[] })?.staleKeys).toEqual(["recurring-post"]);
+    expect(logs.filter((l) => l.level === "warn")).toHaveLength(2);
+  });
+
+  it("does not require the optional nightly-backup schedule to be registered", async () => {
+    await seedFreshSchedules();
+    const res = await GET();
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as HealthBody;
+    // Backups are only registered where configured: no row, no check, no
+    // degradation.
+    expect(body.status).toBe("ok");
+    expect(body.schedules).toHaveLength(3);
+    expect(body.schedules.find((s) => s.key === "nightly-backup")).toBeUndefined();
+  });
+
+  it("checks nightly-backup when it is registered, and degrades when it is stale", async () => {
+    await seedFreshSchedules();
+    await seedSchedule({
+      key: "nightly-backup",
+      queue: "maintenance:backup",
+      cron: "47 2 * * *",
+      lastRunAt: minutesFromNow(-60),
+      nextRunAt: minutesFromNow(600)
+    });
+    const fresh = await GET();
+    const freshBody = (await fresh.json()) as HealthBody;
+    expect(freshBody.status).toBe("ok");
+    expect(freshBody.schedules).toHaveLength(4);
+    expect(freshBody.schedules.find((s) => s.key === "nightly-backup")?.status).toBe("ok");
+
+    // 12 hours overdue is beyond the 6-hour nightly budget.
+    await db().execute(sql`
+      UPDATE cron_schedules
+      SET last_run_at = ${minutesFromNow(-36 * 60)}, next_run_at = ${minutesFromNow(-12 * 60)}
+      WHERE key = 'nightly-backup'
+    `);
+    const stale = await GET();
+    expect(stale.status).toBe(200);
+    const staleBody = (await stale.json()) as HealthBody;
+    expect(staleBody.status).toBe("degraded");
+    expect(staleBody.schedules.find((s) => s.key === "nightly-backup")?.status).toBe("stale");
+    expect(staleBody.schedules.find((s) => s.key === "recurring-post")?.status).toBe("ok");
+  });
+
   it("reports degraded when a nightly maintenance schedule is stale", async () => {
     await seedFreshSchedules();
     await db().execute(sql`

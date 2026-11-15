@@ -22,8 +22,12 @@ export const dynamic = "force-dynamic";
  *   checks named in the body. In particular a stale WORKER must not mark
  *   the WEB container unhealthy: the web app is serving fine, and
  *   restarting it would not fix the worker. The degraded state is still
- *   explicit here, on the admin operations page, and (on the flip into
- *   degraded) as a "health" debug-log entry an operator can alert on.
+ *   explicit here, on the admin operations page, and (on each flip into
+ *   or out of the degraded state) as a "health" debug-log entry an
+ *   operator can alert on. Note the schedule checks measure enqueue
+ *   freshness — the worker ticking and queueing jobs on time — not
+ *   handler success; the queue's dead-letter count above is the signal
+ *   for jobs that ran and failed.
  */
 export async function GET() {
   const dbOk = await checkDb();
@@ -56,14 +60,15 @@ export async function GET() {
       }
     }
 
-    if (freshness.staleChecks.length > 0) {
-      // Record the flip into the degraded state (once per distinct stale
-      // set) so it is alertable later; never let logging break health.
-      try {
-        await recordScheduleDegradation(db, freshness);
-      } catch {
-        // Health reporting must not fail because the audit write did.
-      }
+    // Record schedule-health transitions (once per distinct stale set,
+    // plus the recovery that resets the incident) so they are alertable
+    // later. This runs on healthy reads too: a recovery is only observed
+    // if the recorder sees the empty stale set. Never let logging break
+    // health.
+    try {
+      await recordScheduleDegradation(db, freshness);
+    } catch {
+      // Health reporting must not fail because the audit write did.
     }
 
     const isDegraded =

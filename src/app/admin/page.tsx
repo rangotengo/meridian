@@ -132,7 +132,9 @@ export default async function AdminPage() {
         <p className="mt-2 text-xs text-muted-foreground">
           A schedule counts as stale when it stays due past its freshness budget (1 hour for
           recurring posting, 6 hours for the nightly jobs) — that means the worker is not ticking.
-          Stale schedules degrade /api/health without failing it.
+          Stale schedules degrade /api/health without failing it. This measures enqueue freshness
+          only — whether jobs were queued on schedule — not whether each job then succeeded; check
+          the queue&apos;s dead-letter count for jobs that ran and failed.
         </p>
       </Card>
 

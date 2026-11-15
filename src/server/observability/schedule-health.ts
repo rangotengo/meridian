@@ -14,11 +14,38 @@ import { captureDebugLog, listDebugLogs } from "./debug-log";
  * the nightly jobs run every 24 hours, so 6 hours overdue is already far
  * beyond any normal scheduling jitter (and still flags a dead worker the
  * same morning, not a day later).
+ *
+ * This measures enqueue freshness only — that the worker ticked and queued
+ * the job on schedule — NOT that the job's handler then succeeded. A job
+ * can be enqueued on time and still fail; the complementary signal for
+ * handler success is the queue's dead-letter state (the queue stats in
+ * /api/health and the admin page).
+ *
+ * An expectation marked `optional` is only checked when a cron_schedules
+ * row exists for it. nightly-backup is registered only on deployments
+ * where operator backups are configured, so a missing row there means
+ * "feature off", not "worker never booted", and must not degrade health.
  */
 export const SCHEDULE_EXPECTATIONS = [
-  { key: "recurring-post", queue: "recurring:post", staleAfterSeconds: 3600 },
-  { key: "nightly-balances", queue: "maintenance:balances", staleAfterSeconds: 6 * 3600 },
-  { key: "nightly-cleanup", queue: "maintenance:cleanup", staleAfterSeconds: 6 * 3600 }
+  { key: "recurring-post", queue: "recurring:post", staleAfterSeconds: 3600, optional: false },
+  {
+    key: "nightly-balances",
+    queue: "maintenance:balances",
+    staleAfterSeconds: 6 * 3600,
+    optional: false
+  },
+  {
+    key: "nightly-cleanup",
+    queue: "maintenance:cleanup",
+    staleAfterSeconds: 6 * 3600,
+    optional: false
+  },
+  {
+    key: "nightly-backup",
+    queue: "maintenance:backup",
+    staleAfterSeconds: 6 * 3600,
+    optional: true
+  }
 ] as const;
 
 export type ScheduleExpectation = (typeof SCHEDULE_EXPECTATIONS)[number];
@@ -121,13 +148,19 @@ export async function getScheduleFreshness(
     })
     .from(cronSchedules);
   const byKey = new Map(rows.map((r) => [r.key, r]));
-  const checks = SCHEDULE_EXPECTATIONS.map((expectation) => {
+  const checks = SCHEDULE_EXPECTATIONS.flatMap((expectation) => {
     const row = byKey.get(expectation.key);
-    return evaluateScheduleCheck(
-      expectation,
-      row ? { lastRunAt: row.lastRunAt, nextRunAt: row.nextRunAt, enabled: row.enabled } : null,
-      now
-    );
+    // Optional schedules (nightly-backup) are only checked when registered:
+    // no row means the feature is not configured on this deployment, which
+    // is neither "missing" nor a reason to degrade health.
+    if (!row && expectation.optional) return [];
+    return [
+      evaluateScheduleCheck(
+        expectation,
+        row ? { lastRunAt: row.lastRunAt, nextRunAt: row.nextRunAt, enabled: row.enabled } : null,
+        now
+      )
+    ];
   });
   return {
     checks,
@@ -136,26 +169,50 @@ export async function getScheduleFreshness(
 }
 
 /**
- * Records a health degradation in the debug log — but only on the flip.
- * Health is polled frequently (Coolify, uptime checks), so logging every
- * degraded read would flood the log; instead, the latest "health" entry's
- * stale-key set is compared with the current one and a new entry is
- * written only when the degraded set changes. That keeps one alertable
- * record per incident while the live state stays visible in /api/health
- * and the admin page. Returns true when an entry was written.
+ * Records schedule-health transitions in the debug log — both the flip
+ * into a degraded state and the recovery back to healthy. Health is
+ * polled frequently (Coolify, uptime checks), so logging every read would
+ * flood the log; instead, the latest "health" entry's recorded stale-key
+ * set is the incident state, and an entry is written only when the
+ * current set differs from it:
+ *
+ * - degraded set changed (including a first incident) → one "warn" entry
+ *   naming the stale schedules — the alertable record for that incident;
+ * - degraded set became empty after an incident → one "info" recovery
+ *   entry whose staleKeys is [], resetting the incident state. Without
+ *   this, the latest entry would keep the old stale set forever and a
+ *   later recurrence of the same outage would compare equal to it and be
+ *   suppressed — the next outage would get no alert;
+ * - same set as last recorded (repeated polls during one outage, or
+ *   repeated healthy polls) → nothing written.
+ *
+ * That keeps exactly one alertable record per incident while the live
+ * state stays visible in /api/health and the admin page. Returns true
+ * when an entry was written. Callers must invoke this on every health
+ * read — healthy ones included — so recoveries are observed; the caller
+ * also wraps it so a failed write never breaks the health response.
  */
 export async function recordScheduleDegradation(
   exec: Executor,
   freshness: ScheduleFreshness
 ): Promise<boolean> {
   const staleKeys = freshness.staleChecks.map((c) => c.key).sort();
-  if (staleKeys.length === 0) return false;
   const [latest] = await listDebugLogs(exec, { category: "health", limit: 1 });
   const previous = (latest?.metadata as { staleKeys?: unknown } | null)?.staleKeys;
   const previousKeys = Array.isArray(previous)
     ? previous.filter((k): k is string => typeof k === "string").sort()
     : [];
   if (JSON.stringify(previousKeys) === JSON.stringify(staleKeys)) return false;
+  if (staleKeys.length === 0) {
+    await captureDebugLog(exec, {
+      category: "health",
+      level: "info",
+      message: `Health recovered: scheduled work is fresh again (was stale: ${previousKeys.join(", ")})`,
+      source: "api",
+      metadata: { staleKeys: [], recoveredFrom: previousKeys }
+    });
+    return true;
+  }
   await captureDebugLog(exec, {
     category: "health",
     level: "warn",
