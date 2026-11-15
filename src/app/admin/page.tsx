@@ -1,6 +1,7 @@
 import { requireSuperAdmin } from "@/server/auth/context";
 import { getDb } from "@/server/db/client";
 import { listDebugLogs } from "@/server/observability/debug-log";
+import { getScheduleFreshness } from "@/server/observability/schedule-health";
 import { listFlags } from "@/server/flags";
 import { listRecentJobs } from "@/server/queue";
 import { listPendingInstanceInvitations } from "@/server/domain/instance-invitations";
@@ -17,11 +18,12 @@ export default async function AdminPage() {
   const actor = await requireSuperAdmin();
   const db = getDb();
 
-  const [logs, flags, jobs, instanceInvitations] = await Promise.all([
+  const [logs, flags, jobs, instanceInvitations, freshness] = await Promise.all([
     listDebugLogs(db, { limit: 50 }),
     listFlags(db),
     listRecentJobs(db, 30),
-    listPendingInstanceInvitations(db, actor)
+    listPendingInstanceInvitations(db, actor),
+    getScheduleFreshness(db)
   ]);
 
   return (
@@ -84,6 +86,54 @@ export default async function AdminPage() {
             ))}
           </ul>
         )}
+      </Card>
+
+      <Card>
+        <h2 className="mb-3 text-base font-medium text-primary">Scheduled work</h2>
+        <ul className="divide-y divide-border">
+          {freshness.checks.map((c) => (
+            <li key={c.key} className="flex items-center justify-between gap-4 py-2.5 text-sm">
+              <div>
+                <p className="font-medium">{c.queue}</p>
+                <p className="text-xs text-muted-foreground">
+                  {c.lastRunAt
+                    ? `last ran ${new Intl.DateTimeFormat("en", { dateStyle: "short", timeStyle: "short" }).format(new Date(c.lastRunAt))}`
+                    : "never ran"}
+                  {c.nextRunAt
+                    ? ` · next due ${new Intl.DateTimeFormat("en", { dateStyle: "short", timeStyle: "short" }).format(new Date(c.nextRunAt))}`
+                    : ""}
+                  {c.status === "stale"
+                    ? ` · overdue by ${Math.round(c.overdueSeconds / 60)} min`
+                    : ""}
+                </p>
+              </div>
+              <Badge
+                tone={
+                  c.status === "ok"
+                    ? "success"
+                    : c.status === "stale"
+                      ? "destructive"
+                      : c.status === "missing"
+                        ? "warning"
+                        : "neutral"
+                }
+              >
+                {c.status === "ok"
+                  ? "on schedule"
+                  : c.status === "stale"
+                    ? "stale"
+                    : c.status === "missing"
+                      ? "not registered"
+                      : "disabled"}
+              </Badge>
+            </li>
+          ))}
+        </ul>
+        <p className="mt-2 text-xs text-muted-foreground">
+          A schedule counts as stale when it stays due past its freshness budget (1 hour for
+          recurring posting, 6 hours for the nightly jobs) — that means the worker is not ticking.
+          Stale schedules degrade /api/health without failing it.
+        </p>
       </Card>
 
       <Card>
