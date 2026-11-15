@@ -43,9 +43,7 @@ async function main() {
     console.log(
       `Rotated ${result.rotated} of ${result.connections} MeroShare connection(s) to the new key.`
     );
-    console.log(
-      "Now set MERO_SHARE_ENCRYPTION_KEY to the new key and restart web + worker."
-    );
+    console.log("Now set MERO_SHARE_ENCRYPTION_KEY to the new key and restart web + worker.");
   }
 }
 

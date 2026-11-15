@@ -14,19 +14,19 @@ lifecycle rules; database constraints are the last line of defense.
 
 ## Module map
 
-| Path                        | Responsibility                                                                                                               |
-| --------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `src/lib/`                  | Money, dates, crypto, errors, logging, env validation, i18n messages                                                         |
-| `src/server/db/`            | Pool/client, drizzle schema, reviewed-SQL migration runner                                                                   |
-| `src/server/auth/`          | Session cookie → `Actor` resolution per request                                                                              |
-| `src/server/authorization/` | Account access levels and family/platform role assertions                                                                    |
+| Path                        | Responsibility                                                                                                                                  |
+| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `src/lib/`                  | Money, dates, crypto, errors, logging, env validation, i18n messages                                                                            |
+| `src/server/db/`            | Pool/client, drizzle schema, reviewed-SQL migration runner                                                                                      |
+| `src/server/auth/`          | Session cookie → `Actor` resolution per request                                                                                                 |
+| `src/server/authorization/` | Account access levels and family/platform role assertions                                                                                       |
 | `src/server/domain/`        | Business rules: accounts, entries, transfers, splits, valuations, balances, reports, FX, exports, users/families, family + instance invitations |
-| `src/server/security/`      | Password hashing, session store, auth tokens, rate limiting, mailer                                                          |
-| `src/server/queue/`         | Durable job queue, cron scheduler, worker loop contracts                                                                     |
-| `src/app/(auth)/`           | Public identity routes                                                                                                       |
-| `src/app/(app)/`            | Authenticated product surface (dashboard, accounts, transactions, reports, settings)                                         |
-| `src/app/admin/`            | Super-admin operations console                                                                                               |
-| `src/worker/`               | Standalone job process                                                                                                       |
+| `src/server/security/`      | Password hashing, session store, auth tokens, rate limiting, mailer                                                                             |
+| `src/server/queue/`         | Durable job queue, cron scheduler, worker loop contracts                                                                                        |
+| `src/app/(auth)/`           | Public identity routes                                                                                                                          |
+| `src/app/(app)/`            | Authenticated product surface (dashboard, accounts, transactions, reports, settings)                                                            |
+| `src/app/admin/`            | Super-admin operations console                                                                                                                  |
+| `src/worker/`               | Standalone job process                                                                                                                          |
 
 ## Data model highlights
 

@@ -473,9 +473,7 @@ function SplitForm({
       <div className="flex items-center justify-between">
         <button
           type="button"
-          onClick={() =>
-            setRows((prev) => [...prev, { amountText: "", name: "", categoryId: "" }])
-          }
+          onClick={() => setRows((prev) => [...prev, { amountText: "", name: "", categoryId: "" }])}
           className="rounded-lg border border-border px-3 py-1.5 text-xs font-medium"
         >
           Add another part

@@ -1,10 +1,7 @@
 import { eq } from "drizzle-orm";
 import type { Executor } from "../db/client";
 import { meroShareConnections } from "../db/schema";
-import {
-  decryptProviderSecretWithKey,
-  encryptProviderSecretWithKey
-} from "../security/secrets";
+import { decryptProviderSecretWithKey, encryptProviderSecretWithKey } from "../security/secrets";
 import { errors } from "@/lib/errors";
 
 export type MeroShareKeyRotationResult = {

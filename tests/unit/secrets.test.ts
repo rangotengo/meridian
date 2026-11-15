@@ -23,8 +23,8 @@ describe("provider secret keys", () => {
     const parsed = parseProviderSecretKey(randomBytes(32).toString("base64"), "TEST_KEY");
     expect(parsed).toHaveLength(32);
     expect(() => parseProviderSecretKey(undefined, "TEST_KEY")).toThrow(/TEST_KEY is not set/);
-    expect(() =>
-      parseProviderSecretKey(randomBytes(16).toString("base64"), "TEST_KEY")
-    ).toThrow(/TEST_KEY must be a 32-byte base64 value/);
+    expect(() => parseProviderSecretKey(randomBytes(16).toString("base64"), "TEST_KEY")).toThrow(
+      /TEST_KEY must be a 32-byte base64 value/
+    );
   });
 });

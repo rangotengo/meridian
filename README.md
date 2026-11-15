@@ -9,15 +9,15 @@ authorization, a guarded Sure-data migration, direct CDSC MeroShare portfolio sy
 
 ## Stack
 
-| Concern    | Choice                                                                                  |
-| ---------- | --------------------------------------------------------------------------------------- |
-| Framework  | Next.js (App Router) + React + TypeScript (strict)                                      |
+| Concern    | Choice                                                                                                                             |
+| ---------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| Framework  | Next.js (App Router) + React + TypeScript (strict)                                                                                 |
 | Database   | PostgreSQL 16+ (self-hosted) or SQLite in Durable Objects (Cloudflare), via Drizzle ORM; reviewed SQL migrations for both backends |
-| Auth       | In-house sessions (scrypt passwords, hashed opaque tokens, revocation)                  |
-| Queue      | Database-backed worker process (`FOR UPDATE SKIP LOCKED`, retries, dead-letter, cron)   |
-| Validation | Zod at action boundaries; domain invariants enforced in services                        |
-| UI         | Tailwind CSS v4 with semantic design tokens                                             |
-| Tests      | Vitest unit + integration against real Postgres, plus a Cloudflare-backend suite        |
+| Auth       | In-house sessions (scrypt passwords, hashed opaque tokens, revocation)                                                             |
+| Queue      | Database-backed worker process (`FOR UPDATE SKIP LOCKED`, retries, dead-letter, cron)                                              |
+| Validation | Zod at action boundaries; domain invariants enforced in services                                                                   |
+| UI         | Tailwind CSS v4 with semantic design tokens                                                                                        |
+| Tests      | Vitest unit + integration against real Postgres, plus a Cloudflare-backend suite                                                   |
 
 ## Requirements
 
@@ -60,10 +60,10 @@ Registration is operator-controlled. Public sign-up is open by default; set
 sign-up page explains that an invitation is required and the sign-up action
 refuses. Two invitation types exist, and they are not interchangeable:
 
-- **Family invitations** — a family admin invites someone to join *their*
+- **Family invitations** — a family admin invites someone to join _their_
   household as a member.
 - **Instance invitations** — a platform super-admin invites an email address
-  to create a *new* household on the instance; accepting one creates the
+  to create a _new_ household on the instance; accepting one creates the
   family with the invitee as its admin.
 
 Set `REQUIRE_EMAIL_VERIFICATION=true` to require new accounts to verify their
@@ -72,17 +72,17 @@ configured mail transport).
 
 ## Scripts
 
-| Command                                       | Purpose                                             |
-| --------------------------------------------- | --------------------------------------------------- |
-| `npm run dev`                                 | Web app in development mode                         |
-| `npm run build` / `npm start`                 | Production build and serve                          |
-| `npm run worker`                              | Background job runner (emails, maintenance crons)   |
-| `npm run db:migrate`                          | Apply pending migrations                            |
-| `npm run db:migrate:down`                     | Revert the most recent migration                    |
-| `npm test`                                    | Unit + integration tests (needs reachable Postgres) |
-| `npm run test:cloud`                          | Cloudflare-backend (SQLite Durable Object) tests    |
+| Command                                       | Purpose                                                                                             |
+| --------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `npm run dev`                                 | Web app in development mode                                                                         |
+| `npm run build` / `npm start`                 | Production build and serve                                                                          |
+| `npm run worker`                              | Background job runner (emails, maintenance crons)                                                   |
+| `npm run db:migrate`                          | Apply pending migrations                                                                            |
+| `npm run db:migrate:down`                     | Revert the most recent migration                                                                    |
+| `npm test`                                    | Unit + integration tests (needs reachable Postgres)                                                 |
+| `npm run test:cloud`                          | Cloudflare-backend (SQLite Durable Object) tests                                                    |
 | `npm run meroshare:rotate-key`                | Re-encrypt stored MeroShare credentials to a new `MERO_SHARE_ENCRYPTION_KEY` (see docs/RUNBOOKS.md) |
-| `npm run lint` / `typecheck` / `format:check` | CI checks                                           |
+| `npm run lint` / `typecheck` / `format:check` | CI checks                                                                                           |
 
 ## Environment
 

@@ -180,8 +180,8 @@ for it in the meantime; per item 1, an unwired toggle is worse than none.
 
 ## Summary
 
-| Item                      | State today                        | Recommendation |
-| ------------------------- | ---------------------------------- | -------------- |
-| `net_worth_projections`   | Flag with no consumer              | Remove the flag |
-| `monthly_digest_email`    | Flag with no consumer; infra ready | Implement (opt-in, flag-gated) |
-| Scheduled MeroShare sync  | Manual sync only                   | Defer |
+| Item                     | State today                        | Recommendation                 |
+| ------------------------ | ---------------------------------- | ------------------------------ |
+| `net_worth_projections`  | Flag with no consumer              | Remove the flag                |
+| `monthly_digest_email`   | Flag with no consumer; infra ready | Implement (opt-in, flag-gated) |
+| Scheduled MeroShare sync | Manual sync only                   | Defer                          |
