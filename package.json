@@ -42,7 +42,7 @@
     "nodemailer": "^10.0.14",
     "pg": "^8.23.0",
     "pino": "^10.4.0",
-    "postgres": "^3.4.7",
+    "postgres": "^4.1.1",
     "react": "^19.1.0",
     "react-day-picker": "^10.0.2",
     "react-dom": "^19.1.0",
