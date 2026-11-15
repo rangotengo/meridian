@@ -1,0 +1,40 @@
+import { expect, test } from "@playwright/test";
+import { authFile } from "./fixtures";
+test.use({ storageState: authFile("admin") });
+test("loan valuations can be edited and deleted through their dialogs", async ({ page }) => {
+  await page.goto("/accounts/new");
+  await page.getByText("Other liability", { exact: true }).click();
+  await page.getByLabel("Name", { exact: true }).fill("E2E Valuation Loan");
+  await page.getByLabel("Opening balance owed").fill("100.00");
+  await page.getByRole("button", { name: "Create account", exact: true }).click();
+  await expect(page).toHaveURL(/\/accounts\/[0-9a-f-]+$/);
+  const accountUrl = page.url();
+  const record = page.locator("#valuation");
+  await record.getByLabel("Value (USD)").fill("250.50");
+  await record.getByRole("button", { name: "Record valuation" }).click();
+  const activity = page.getByRole("listitem").filter({ hasText: "Valuation update" });
+  await expect(activity.getByRole("button", { name: "Edit", exact: true })).toBeVisible();
+  await activity.getByRole("button", { name: "Edit", exact: true }).click();
+  const edit = page.locator("dialog[open]");
+  await expect(edit.getByRole("heading", { name: "Edit valuation", exact: true })).toBeVisible();
+  await expect(edit.getByLabel("Value (USD)")).toHaveValue("250.50");
+  await edit.getByLabel("Value (USD)").fill("150.25");
+  await edit.getByLabel("Kind", { exact: true }).selectOption("reconciliation");
+  await edit.getByRole("button", { name: "Save valuation", exact: true }).click();
+  await expect(edit.getByText("Valuation saved.", { exact: true })).toBeVisible();
+  await edit.getByRole("button", { name: "Close dialog" }).click();
+  await page.reload();
+  await activity.getByRole("button", { name: "Edit", exact: true }).click();
+  await expect(page.locator("dialog[open]").getByLabel("Value (USD)")).toHaveValue("150.25");
+  await expect(page.locator("dialog[open]").getByLabel("Kind", { exact: true })).toHaveValue(
+    "reconciliation"
+  );
+  await page.locator("dialog[open]").getByRole("button", { name: "Close dialog" }).click();
+  await activity.getByRole("button", { name: "Delete", exact: true }).click();
+  const confirm = page.locator("dialog[open]");
+  await expect(confirm.getByRole("heading", { name: "Delete this valuation?" })).toBeVisible();
+  await confirm.getByRole("button", { name: "Delete valuation", exact: true }).click();
+  await expect(activity).toHaveCount(0);
+  await page.goto(accountUrl);
+  await expect(page.getByText("No activity recorded yet.", { exact: true })).toBeVisible();
+});

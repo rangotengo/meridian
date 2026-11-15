@@ -12,6 +12,12 @@ import { dashboardSummary, incomeExpenseSeries } from "../../src/server/domain/r
 import { upsertRate, getRate } from "../../src/server/domain/exchange-rates";
 import { createSeries, postDueSeries } from "../../src/server/domain/recurring";
 import { recalculateAllActiveAccounts } from "../../src/server/domain/balances-maintenance";
+import { recalculateAccount } from "../../src/server/domain/balances";
+import {
+  recordValuation,
+  updateValuation,
+  deleteValuation
+} from "../../src/server/domain/valuations";
 import { createInvitation, acceptInvitationWithAccess } from "../../src/server/domain/invitations";
 import { setBudget } from "../../src/server/domain/budgets";
 import { buildFamilyExport } from "../../src/server/domain/exports";
@@ -75,7 +81,11 @@ export class StorageProbe {
     await this.ready;
     const db = this.db;
     const operation = new URL(request.url).pathname;
-    if (operation === "/ledger" || operation === "/import-meroshare") {
+    if (
+      operation === "/ledger" ||
+      operation === "/import-meroshare" ||
+      operation === "/valuation-edit"
+    ) {
       const exec = db as unknown as Executor;
       const user = await registerAccessHousehold(
         exec,
@@ -98,6 +108,44 @@ export class StorageProbe {
         emailVerified: true
       };
       const today = new Date().toISOString().slice(0, 10);
+      if (operation === "/valuation-edit") {
+        const { accountId } = await createAccount(exec, actor, {
+          name: "Valuation loan",
+          type: "other_liability",
+          currency: "NPR",
+          openedOn: today,
+          openingBalanceDisplayMinor: 10000,
+          includedInReports: true,
+          joint: false
+        });
+        const { entryId } = await recordValuation(exec, actor, {
+          accountId,
+          date: today,
+          amountDisplayMinor: 15000,
+          kind: "current"
+        });
+        await exec.transaction(async (tx) => {
+          const result = await updateValuation(tx, actor, {
+            entryId,
+            date: today,
+            amountDisplayMinor: 22500,
+            kind: "reconciliation"
+          });
+          await recalculateAccount(tx, accountId, result.previousDate);
+        });
+        const edited = await getAccountOverview(exec, actor, accountId);
+        await exec.transaction(async (tx) => {
+          const result = await deleteValuation(tx, actor, entryId);
+          await recalculateAccount(tx, accountId, result.date);
+        });
+        const deleted = await getAccountOverview(exec, actor, accountId);
+        return Response.json({
+          editedBalance: edited.displayBalanceMinor,
+          editedKind: edited.recentActivity.find((e) => e.id === entryId)?.valuationKind,
+          deletedBalance: deleted.displayBalanceMinor,
+          deletedEntryAbsent: !deleted.recentActivity.some((e) => e.id === entryId)
+        });
+      }
       if (operation === "/import-meroshare") {
         const archive = [
           {

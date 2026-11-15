@@ -56,6 +56,14 @@ describe("Cloudflare SQLite storage", () => {
   it("rolls back earlier writes when a foreign key fails after an await", async () => {
     expect(await probe("rollback")).toEqual({ rejected: true, remaining: 0 });
   });
+  it("edits and deletes loan valuations with atomic balance repair in cloud DO", async () => {
+    expect(await probe("valuation-edit")).toEqual({
+      editedBalance: -22500,
+      editedKind: "reconciliation",
+      deletedBalance: -10000,
+      deletedEntryAbsent: true
+    });
+  });
   it("does not expose uncommitted writes to concurrent readers", async () => {
     expect(await probe("concurrency")).toEqual({ observed: "original" });
   });
