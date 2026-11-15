@@ -3,6 +3,7 @@ import { databaseNow } from "@/server/db/dialect";
 import { sql } from "drizzle-orm";
 import type { Executor } from "../db/client";
 import { nextCronRun } from "./cron";
+import { lockDedupeKey } from "./index";
 
 export { recoverStaleJobs, claimBatch, completeJob, failJob } from "./index";
 
@@ -46,6 +47,11 @@ export async function runDueCrons(exec: Executor): Promise<number> {
     for (const row of due.rows ?? []) {
       const payload = typeof row.payload === "string" ? JSON.parse(row.payload) : row.payload;
       const dedupeKey = `${row.key}:${new Date(row.next_run_at).toISOString()}`;
+      // Join the per-key writer serialization (see lockDedupeKey in
+      // ./index): this raw insert is the one jobs writer that does not go
+      // through enqueue(), and it must not commit a pending duplicate
+      // underneath a concurrent retry/recovery/replay transition.
+      await lockDedupeKey(tx, row.queue, dedupeKey);
       const enq = await tx.execute(sql`
         INSERT INTO jobs (queue, payload, dedupe_key)
         VALUES (${row.queue}, ${JSON.stringify(payload)}, ${dedupeKey})
