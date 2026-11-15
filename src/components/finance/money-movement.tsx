@@ -53,7 +53,7 @@ export function MoneyMovement() {
           value={months}
           onValueChange={(value) => value && setMonths(value as "3" | "6" | "12")}
         >
-          <SelectTrigger className="h-8 w-[110px] text-xs">
+          <SelectTrigger aria-label="Money movement period" className="h-8 w-[110px] text-xs">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>

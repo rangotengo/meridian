@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { authFile, data } from "./fixtures";
+import { authFile, getData } from "./fixtures";
 
 // Permission-dependent transaction UI (the behavior PR #1 implemented):
 // access levels come from account shares — the seed shares the checking
@@ -10,7 +10,7 @@ test.describe("read-only member", () => {
   test.use({ storageState: authFile("ro") });
 
   test("transaction edit controls are disabled on the detail page", async ({ page }) => {
-    await page.goto(`/transactions/${data.entry.id}`);
+    await page.goto(`/transactions/${getData().entry.id}`);
 
     await expect(
       page.getByText("Read-only access — you can view this transaction but not edit it.")
@@ -39,7 +39,7 @@ test.describe("read-write member", () => {
   test.use({ storageState: authFile("rw") });
 
   test("can annotate a transaction but core fields stay locked", async ({ page }) => {
-    await page.goto(`/transactions/${data.entry.id}`);
+    await page.goto(`/transactions/${getData().entry.id}`);
 
     await expect(page.getByText("You can edit category, merchant and notes only.")).toBeVisible();
     await expect(page.locator("#d-name")).toBeDisabled();
@@ -54,7 +54,7 @@ test.describe("read-write member", () => {
     const saved = page.waitForResponse(
       (res) =>
         res.request().method() === "POST" &&
-        res.url().includes(`/transactions/${data.entry.id}`) &&
+        res.url().includes(`/transactions/${getData().entry.id}`) &&
         res.ok()
     );
     await notes.fill("Annotated by the read-write member.");

@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { authFile, data } from "./fixtures";
+import { authFile, getData } from "./fixtures";
 
 test.use({ storageState: authFile("admin") });
 
@@ -7,8 +7,8 @@ test("create a transfer between two accounts and see both legs linked", async ({
   await page.goto("/transactions/new");
 
   await page.getByRole("tab", { name: "transfer" }).click();
-  await page.locator("#fromAccountId").selectOption(data.accountA.id);
-  await page.locator("#toAccountId").selectOption(data.accountB.id);
+  await page.locator("#fromAccountId").selectOption(getData().accountA.id);
+  await page.locator("#toAccountId").selectOption(getData().accountB.id);
   await page.locator("#t-amount").fill("25.00");
   await page.locator("#t-name").fill("E2E Transfer");
   await page.getByRole("button", { name: "Move money" }).click();

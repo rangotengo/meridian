@@ -19,9 +19,12 @@ export type E2EData = {
   entry: { id: string; name: string };
 };
 
-export const data: E2EData = JSON.parse(
-  readFileSync(path.join(process.cwd(), "e2e", "test-data.json"), "utf8")
-) as E2EData;
+/** Read after global setup; test discovery must work before seeding. */
+export function getData(): E2EData {
+  return JSON.parse(
+    readFileSync(path.join(process.cwd(), "e2e", "test-data.json"), "utf8")
+  ) as E2EData;
+}
 
 /** tests/helpers `makeUser` registers the admin with this fixed password. */
 export const ADMIN_PASSWORD = "Sup3rSecure!Pass";
