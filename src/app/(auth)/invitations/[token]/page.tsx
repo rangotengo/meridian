@@ -2,8 +2,9 @@ import Link from "next/link";
 import { getDb } from "@/server/db/client";
 import { loadActor } from "@/server/auth/context";
 import { getInvitationByToken } from "@/server/domain/invitations";
+import { getInstanceInvitationByToken } from "@/server/domain/instance-invitations";
 import { Card } from "@/components/ds/card";
-import { AcceptExistingForm, AcceptNewAccountForm } from "./accept-forms";
+import { AcceptExistingForm, AcceptNewAccountForm, CreateHouseholdForm } from "./accept-forms";
 import { usesCloudflareAccess } from "@/server/auth/access";
 
 export const metadata = { title: "Accept invitation" };
@@ -13,6 +14,35 @@ export default async function InvitationPage({ params }: { params: Promise<{ tok
   const db = getDb();
   const actor = await loadActor();
   const invitation = await getInvitationByToken(db, token);
+
+  if (!invitation) {
+    // Not a family invitation — it may be an instance invitation, which
+    // creates a brand-new household rather than joining an existing family.
+    const instanceInvitation = usesCloudflareAccess()
+      ? null
+      : await getInstanceInvitationByToken(db, token);
+    if (instanceInvitation) {
+      return (
+        <Card>
+          <h1 className="text-lg font-semibold">Create your household</h1>
+          <p className="mt-1 text-sm text-muted-foreground">
+            {instanceInvitation.invitedByName} invited <strong>{instanceInvitation.email}</strong>{" "}
+            to start a new household on this Meridian instance.
+          </p>
+          <div className="mt-5">
+            {actor ? (
+              <p className="rounded-lg border border-warning/40 bg-warning/10 p-3 text-sm text-warning">
+                You are signed in as {actor.email}. Sign out first, then open this link again to
+                create the new household.
+              </p>
+            ) : (
+              <CreateHouseholdForm token={token} email={instanceInvitation.email} />
+            )}
+          </div>
+        </Card>
+      );
+    }
+  }
 
   if (!invitation) {
     return (

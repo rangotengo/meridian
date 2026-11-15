@@ -130,6 +130,22 @@ export const invitations = pgTable(
   (t) => [index("invitations_family_idx").on(t.familyId)]
 );
 
+export const instanceInvitations = pgTable(
+  "instance_invitations",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    email: text("email").notNull(),
+    tokenHash: text("token_hash").notNull().unique(),
+    invitedBy: uuid("invited_by")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    acceptedAt: timestamp("accepted_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow()
+  },
+  (t) => [index("instance_invitations_email_idx").on(t.email)]
+);
+
 export const categories = pgTable(
   "categories",
   {

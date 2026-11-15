@@ -25,6 +25,7 @@ const schema = z
     WORKER_POLL_MS: z.coerce.number().int().positive().default(500),
     WORKER_NAME: z.string().optional(),
     REQUIRE_EMAIL_VERIFICATION: z.enum(["true", "false"]).default("false"),
+    REGISTRATION_OPEN: z.enum(["true", "false"]).default("true"),
     AI_BASE_URL: z.string().optional(),
     AI_API_KEY: z.string().optional(),
     AI_MODEL: z.string().optional(),
@@ -75,6 +76,14 @@ export function requireEmailVerification(): boolean {
     process.env.REQUIRE_EMAIL_VERIFICATION !== undefined
       ? process.env.REQUIRE_EMAIL_VERIFICATION
       : env.REQUIRE_EMAIL_VERIFICATION;
+  return val === "true";
+}
+
+export function registrationOpen(): boolean {
+  const val =
+    process.env.REGISTRATION_OPEN !== undefined
+      ? process.env.REGISTRATION_OPEN
+      : env.REGISTRATION_OPEN;
   return val === "true";
 }
 

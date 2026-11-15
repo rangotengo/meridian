@@ -32,6 +32,7 @@ const TABLES = [
   "tags",
   "categories",
   "invitations",
+  "instance_invitations",
   "auth_tokens",
   "sessions",
   "audit_events",

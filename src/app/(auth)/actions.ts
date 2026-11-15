@@ -20,7 +20,7 @@ import {
 import { signOutAction as signOutSession } from "@/server/actions/session-actions";
 import { consumeRateLimit } from "@/server/security/rate-limit";
 import { enqueue } from "@/server/queue";
-import { env, isProd, requireEmailVerification } from "@/lib/env";
+import { env, isProd, registrationOpen, requireEmailVerification } from "@/lib/env";
 import { errors } from "@/lib/errors";
 import { runAction, type ActionState } from "@/server/actions/runner";
 
@@ -64,6 +64,12 @@ export async function signUpAction(
   formData: FormData
 ): Promise<ActionState> {
   return runAction("auth.sign_up", async () => {
+    // Invite-only instances close public registration here, at the action
+    // boundary; invited users arrive via /invitations/<token> instead. The
+    // domain registration function itself is deliberately left unchanged.
+    if (!registrationOpen()) {
+      throw errors.forbidden("Registration is invite-only on this instance.");
+    }
     const input = signUpSchema.parse(Object.fromEntries(formData));
     const db = getDb();
     const meta = await requestMeta();
