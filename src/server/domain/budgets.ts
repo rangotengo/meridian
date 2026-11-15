@@ -3,7 +3,7 @@ import type { Executor } from "../db/client";
 import { budgets, categories } from "../db/schema";
 import type { Actor, Family } from "../auth/context";
 import { recordAudit } from "../observability/audit";
-import { spendingByCategory, currentMonthRange } from "./reports";
+import { spendingByCategory, currentMonthRange, type FxCompleteness } from "./reports";
 import { errors } from "@/lib/errors";
 import { monthKeyIn } from "@/lib/datetime";
 
@@ -96,6 +96,8 @@ export type BudgetOverview = {
   overall: BudgetProgress | null;
   perCategory: BudgetProgress[];
   categoriesWithoutBudget: { id: string; name: string }[];
+  /** FX completeness of the underlying spending totals (see reports.ts). */
+  fx: FxCompleteness;
 };
 
 export async function budgetOverview(
@@ -124,9 +126,9 @@ export async function budgetOverview(
   ]);
 
   const spentByCategory = new Map(
-    spending.map((s) => [s.categoryId ?? "uncategorized", s.totalMinor])
+    spending.categories.map((s) => [s.categoryId ?? "uncategorized", s.totalMinor])
   );
-  const totalSpent = spending.reduce((acc, s) => acc + s.totalMinor, 0);
+  const totalSpent = spending.categories.reduce((acc, s) => acc + s.totalMinor, 0);
 
   const perCategory: BudgetProgress[] = [];
   let overall: BudgetProgress | null = null;
@@ -155,7 +157,8 @@ export async function budgetOverview(
     perCategory,
     categoriesWithoutBudget: allCategories
       .filter((c) => !budgetedCategoryIds.has(c.id))
-      .map((c) => ({ id: c.id, name: c.name }))
+      .map((c) => ({ id: c.id, name: c.name })),
+    fx: spending.fx
   };
 }
 

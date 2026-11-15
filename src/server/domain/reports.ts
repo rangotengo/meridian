@@ -30,7 +30,13 @@ function safeAdd(a: number, b: number): number {
   return sum;
 }
 
-export type FxIssue = { base: string; quote: string; date: string };
+export type FxIssue = {
+  base: string;
+  quote: string;
+  date: string;
+  /** Total amount (minor units of `base`) excluded because no rate existed. */
+  amountMinor: number;
+};
 
 /** A rate a report actually converted with, including its quoted-on date. */
 export type FxRateUsed = RateInfo;
@@ -44,6 +50,53 @@ export type ConversionContext = {
 
 function newConversionContext(): ConversionContext {
   return { issues: new Map(), rateCache: new Map(), usedRates: new Map() };
+}
+
+/**
+ * Completeness metadata returned alongside converted totals. When a rate is
+ * missing, the affected amounts are excluded from the totals and reported in
+ * `fxIssues` (with the excluded amount per currency pair) instead of silently
+ * understating the result; `fxRates` lists the rates that were used.
+ */
+export type FxCompleteness = {
+  incompleteFx: boolean;
+  fxIssues: FxIssue[];
+  fxRates: FxRateUsed[];
+};
+
+function completenessOf(ctx: ConversionContext): FxCompleteness {
+  return {
+    incompleteFx: ctx.issues.size > 0,
+    fxIssues: Array.from(ctx.issues.values()),
+    fxRates: Array.from(ctx.usedRates.values())
+  };
+}
+
+/**
+ * Merge completeness from several computations (e.g. every widget on a page)
+ * into one summary for a shared warning banner. Issues and rates are deduped
+ * by currency pair; an issue's `amountMinor` is per-computation and not
+ * additive across computations, so the first reporter of a pair wins.
+ */
+export function mergeFxCompleteness(...parts: FxCompleteness[]): FxCompleteness {
+  const issues = new Map<string, FxIssue>();
+  const rates = new Map<string, FxRateUsed>();
+  for (const part of parts) {
+    for (const issue of part.fxIssues) {
+      const key = `${issue.base}:${issue.quote}`;
+      if (!issues.has(key)) issues.set(key, issue);
+    }
+    for (const rate of part.fxRates) {
+      const key = `${rate.base}:${rate.quote}`;
+      const existing = rates.get(key);
+      if (!existing || rate.quotedOn > existing.quotedOn) rates.set(key, rate);
+    }
+  }
+  return {
+    incompleteFx: issues.size > 0,
+    fxIssues: [...issues.values()],
+    fxRates: [...rates.values()]
+  };
 }
 
 async function convertTo(
@@ -65,8 +118,11 @@ async function convertTo(
   }
   if (info === null) {
     const key = `${from}:${to}`;
-    if (!ctx.issues.has(key)) {
-      ctx.issues.set(key, { base: from, quote: to, date: onDate });
+    const existing = ctx.issues.get(key);
+    if (existing) {
+      existing.amountMinor = safeAdd(existing.amountMinor, amountMinor);
+    } else {
+      ctx.issues.set(key, { base: from, quote: to, date: onDate, amountMinor });
     }
     return 0;
   }
@@ -270,9 +326,9 @@ export async function dashboardSummary(
     LIMIT 8
   `);
 
-  const incompleteFx = ctx.issues.size > 0;
-  const fxIssues = incompleteFx ? Array.from(ctx.issues.values()) : undefined;
-  const fxRates = ctx.usedRates.size > 0 ? Array.from(ctx.usedRates.values()) : undefined;
+  const fx = completenessOf(ctx);
+  const fxIssues = fx.incompleteFx ? fx.fxIssues : undefined;
+  const fxRates = fx.fxRates.length > 0 ? fx.fxRates : undefined;
 
   await reportFxIssues(exec, ctx, family.id, "dashboard");
 
@@ -293,7 +349,7 @@ export async function dashboardSummary(
       transferId: r.transfer_id
     })),
     monthKey: mk,
-    incompleteFx,
+    incompleteFx: fx.incompleteFx,
     fxIssues,
     fxRates
   };
@@ -321,17 +377,23 @@ export async function reportFxIssues(
 
 export type NetWorthPoint = { date: string; valueMinor: number };
 
+export type AccountsNetWorth = {
+  netWorthMinor: number;
+  fx: FxCompleteness;
+};
+
 /**
  * Net worth for an already-loaded account list (e.g. the sidebar), converting each
  * balance into the family currency. Accounts with no known rate are excluded,
- * mirroring dashboardSummary's behavior.
+ * mirroring dashboardSummary's behavior, and reported in the returned `fx`
+ * completeness metadata.
  */
 export async function netWorthMinorForAccounts(
   exec: Executor,
   family: Pick<Family, "id" | "currency">,
   accounts: { displayBalanceMinor: number; currency: string }[],
   onDate: string
-): Promise<number> {
+): Promise<AccountsNetWorth> {
   const ctx = newConversionContext();
   let netWorth = 0;
   for (const account of accounts) {
@@ -345,16 +407,22 @@ export async function netWorthMinorForAccounts(
     );
     netWorth = safeAdd(netWorth, converted);
   }
+  const fx = completenessOf(ctx);
   await reportFxIssues(exec, ctx, family.id, "sidebar");
-  return netWorth;
+  return { netWorthMinor: netWorth, fx };
 }
+
+export type NetWorthSeriesResult = {
+  points: NetWorthPoint[];
+  fx: FxCompleteness;
+};
 
 export async function netWorthSeries(
   exec: Executor,
   family: Family,
   userId: string,
   days: number | "all" = 90
-): Promise<NetWorthPoint[]> {
+): Promise<NetWorthSeriesResult> {
   const ctx = newConversionContext();
   const today = todayIn(family.timezone);
   const cutoff =
@@ -390,20 +458,29 @@ export async function netWorthSeries(
     byDate.set(d, safeAdd(byDate.get(d) ?? 0, converted));
   }
 
+  const fx = completenessOf(ctx);
   await reportFxIssues(exec, ctx, family.id, "net_worth_series");
-  return [...byDate.entries()]
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([date, v]) => ({ date, valueMinor: v }));
+  return {
+    points: [...byDate.entries()]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([date, v]) => ({ date, valueMinor: v })),
+    fx
+  };
 }
 
 export type MonthFlow = { monthKey: string; incomeMinor: number; expenseMinor: number };
+
+export type IncomeExpenseSeriesResult = {
+  flows: MonthFlow[];
+  fx: FxCompleteness;
+};
 
 export async function incomeExpenseSeries(
   exec: Executor,
   family: Family,
   userId: string,
   months = 12
-): Promise<MonthFlow[]> {
+): Promise<IncomeExpenseSeriesResult> {
   const ctx = newConversionContext();
   const currentMk = monthKeyIn(family.timezone);
   const startMk = addMonths(currentMk, -(months - 1));
@@ -463,18 +540,31 @@ export async function incomeExpenseSeries(
     entry.incomeMinor = safeAdd(entry.incomeMinor, convertedIncome);
   }
 
+  const fx = completenessOf(ctx);
   await reportFxIssues(exec, ctx, family.id, "income_expense_series");
-  return [...byMonth.values()];
+  return { flows: [...byMonth.values()], fx };
 }
 
 export { incomeExpenseSeries as monthlyIncomeExpenseSeries };
+
+export type CategorySpending = {
+  categoryId: string | null;
+  name: string;
+  totalMinor: number;
+  share: number;
+};
+
+export type SpendingByCategoryResult = {
+  categories: CategorySpending[];
+  fx: FxCompleteness;
+};
 
 export async function spendingByCategory(
   exec: Executor,
   family: Family,
   userId: string,
   range: { from: string; to: string }
-): Promise<{ categoryId: string | null; name: string; totalMinor: number; share: number }[]> {
+): Promise<SpendingByCategoryResult> {
   const ctx = newConversionContext();
   const res = await exec.execute<{
     category_id: string | null;
@@ -521,19 +611,30 @@ export async function spendingByCategory(
     grand = safeAdd(grand, converted);
   }
 
+  const fx = completenessOf(ctx);
   await reportFxIssues(exec, ctx, family.id, "spending_by_category");
 
-  return [...totals.values()]
-    .map((v) => ({ ...v, share: grand > 0 ? v.totalMinor / grand : 0 }))
-    .sort((a, b) => b.totalMinor - a.totalMinor);
+  return {
+    categories: [...totals.values()]
+      .map((v) => ({ ...v, share: grand > 0 ? v.totalMinor / grand : 0 }))
+      .sort((a, b) => b.totalMinor - a.totalMinor),
+    fx
+  };
 }
+
+export type DailySpendingPoint = { date: string; amountMinor: number };
+
+export type DailySpendingSeriesResult = {
+  points: DailySpendingPoint[];
+  fx: FxCompleteness;
+};
 
 export async function dailySpendingSeries(
   exec: Executor,
   family: Family,
   userId: string,
   days = 365
-): Promise<{ date: string; amountMinor: number }[]> {
+): Promise<DailySpendingSeriesResult> {
   const ctx = newConversionContext();
   const today = todayIn(family.timezone);
   const from = addDays(today, -(days - 1));
@@ -567,14 +668,15 @@ export async function dailySpendingSeries(
     );
     byDate.set(d, safeAdd(byDate.get(d) ?? 0, converted));
   }
+  const fx = completenessOf(ctx);
   await reportFxIssues(exec, ctx, family.id, "daily_spending");
 
-  const points: { date: string; amountMinor: number }[] = [];
+  const points: DailySpendingPoint[] = [];
   for (let i = 0; i < days; i++) {
     const date = addDays(from, i);
     points.push({ date, amountMinor: byDate.get(date) ?? 0 });
   }
-  return points;
+  return { points, fx };
 }
 
 export function currentMonthRange(timezone: string): { from: string; to: string } {

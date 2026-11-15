@@ -4,15 +4,18 @@ import {
   netWorthSeries,
   incomeExpenseSeries,
   spendingByCategory,
-  dailySpendingSeries
+  dailySpendingSeries,
+  mergeFxCompleteness
 } from "@/server/domain/reports";
+import { isStaleRate } from "@/server/domain/exchange-rates";
 import { getUserPrivacyMode } from "@/server/domain/users";
 import { Card, PageHeader, EmptyState } from "@/components/ds/card";
 import { Amount } from "@/components/finance/amount";
 import { CategoryDonut } from "@/components/finance/category-donut";
+import { FxIssuesAlert } from "@/components/finance/fx-issues-alert";
 import { SpendingHeatmap } from "@/components/finance/spending-heatmap";
 import { fmtMonth } from "@/lib/format";
-import { addMonths, endOfMonth, monthKeyIn, startOfMonth } from "@/lib/datetime";
+import { addMonths, endOfMonth, monthKeyIn, startOfMonth, todayIn } from "@/lib/datetime";
 import { PrintButton } from "./print-button";
 import { cn } from "@/lib/utils";
 
@@ -50,12 +53,33 @@ export default async function ReportsPage({
 
   const periodDays = period === "ytd" ? Math.max(30, periodMonths * 30) : selected.days;
 
-  const [series, flows, spend, heatmap] = await Promise.all([
+  const [seriesResult, flowsResult, spendResult, heatmapResult] = await Promise.all([
     netWorthSeries(db, family, actor.userId, periodDays),
     incomeExpenseSeries(db, family, actor.userId, periodMonths),
     spendingByCategory(db, family, actor.userId, periodRange),
     dailySpendingSeries(db, family, actor.userId, 365)
   ]);
+  const series = seriesResult.points;
+  const flows = flowsResult.flows;
+  const spend = spendResult.categories;
+  const heatmap = heatmapResult.points;
+  const fxMerged = mergeFxCompleteness(
+    seriesResult.fx,
+    flowsResult.fx,
+    spendResult.fx,
+    heatmapResult.fx
+  );
+  const fxAlert = {
+    incomplete: fxMerged.incompleteFx,
+    issues: fxMerged.fxIssues,
+    rates: fxMerged.fxRates.map((r) => ({
+      base: r.base,
+      quote: r.quote,
+      rate: r.rate,
+      quotedOn: r.quotedOn,
+      stale: isStaleRate(r.quotedOn, todayIn(family.timezone))
+    }))
+  };
   const latestIncome = flows.reduce((total, flow) => total + flow.incomeMinor, 0);
   const latestExpense = flows.reduce((total, flow) => total + flow.expenseMinor, 0);
   const latestNet = latestIncome - latestExpense;
@@ -97,6 +121,8 @@ export default async function ReportsPage({
           {periodRange.from} &ndash; {periodRange.to}
         </span>
       </div>
+
+      <FxIssuesAlert fx={fxAlert} />
 
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <Card>

@@ -180,7 +180,7 @@ export class StorageProbe {
       const [family] = await db.select().from(families).where(eq(families.id, user.familyId));
       const report = await dashboardSummary(exec, family!, user.id);
       const overview = await getAccountOverview(exec, actor, account.accountId);
-      const monthly = await incomeExpenseSeries(exec, family!, user.id, 1);
+      const monthly = (await incomeExpenseSeries(exec, family!, user.id, 1)).flows;
       await upsertRate(exec, { base: "USD", quote: "NPR", rate: "100", quotedOn: today });
       const inverseRate = await getRate(exec, "NPR", "USD", today);
       await setBudget(exec, actor, { categoryId: null, amountLedgerMinor: 5000 });
