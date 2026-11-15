@@ -8,7 +8,9 @@ import { authFile } from "./fixtures";
 async function expectNoCriticalViolations(page: Page): Promise<void> {
   const results = await new AxeBuilder({ page }).analyze();
   const critical = results.violations.filter((v) => v.impact === "critical");
-  expect(critical.map((v) => `${v.id}: ${v.help}`)).toEqual([]);
+  expect(
+    critical.map((v) => ({ id: v.id, help: v.help, nodes: v.nodes.map((n) => n.html) }))
+  ).toEqual([]);
 }
 
 test("sign-in page has no critical accessibility violations", async ({ page }) => {

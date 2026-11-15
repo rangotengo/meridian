@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { Client } from "pg";
 import { e2eEnv } from "../playwright.config";
+import { assertSafeTestDatabase } from "../tests/setup/database-guard";
 
 /**
  * Playwright global setup:
@@ -12,6 +13,7 @@ import { e2eEnv } from "../playwright.config";
  *     as they do for the app code).
  */
 export default async function globalSetup(): Promise<void> {
+  assertSafeTestDatabase(e2eEnv.DATABASE_URL, process.env.APP_DATABASE_URL);
   const url = new URL(e2eEnv.DATABASE_URL);
   const dbName = url.pathname.replace(/^\//, "");
   if (!/^[a-zA-Z0-9_]{1,63}$/.test(dbName)) {

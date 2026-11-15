@@ -23,15 +23,13 @@
  */
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { assertSafeTestDatabase } from "../tests/setup/database-guard";
 
 const DATABASE_URL =
   process.env.DATABASE_URL ?? "postgresql://review_admin@127.0.0.1:55439/meridian_test_e2e";
 
 process.env.DATABASE_URL = DATABASE_URL;
 process.env.TEST_DATABASE_URL = DATABASE_URL;
-// Only used by the test-database guard as a "not the test DB" reference;
-// nothing ever connects to it.
-process.env.APP_DATABASE_URL = "postgresql://review_admin@127.0.0.1:55439/meridian_app_placeholder";
 process.env.APP_URL = process.env.APP_URL ?? "http://localhost:3100";
 process.env.AUTH_MODE = "password";
 process.env.MAIL_TRANSPORT = "console";
@@ -46,6 +44,9 @@ const DATA_FILE = path.join(ROOT, "e2e", "test-data.json");
 const AUTH_DIR = path.join(ROOT, "e2e", ".auth");
 
 async function main(): Promise<void> {
+  // Reject unsafe targets before migrations or any database writes, and
+  // retain the caller's real application URL for the same-database guard.
+  assertSafeTestDatabase(DATABASE_URL, process.env.APP_DATABASE_URL);
   const { migrateUp } = await import("../src/server/db/migrate");
   const { getDb, closeDb } = await import("../src/server/db/client");
   const helpers = await import("../tests/helpers");

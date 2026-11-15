@@ -1,5 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
-import { authFile, data } from "./fixtures";
+import { authFile, getData } from "./fixtures";
 
 // Runs in the "mobile" project (390px-wide viewport, touch enabled).
 test.use({ storageState: authFile("admin") });
@@ -20,6 +20,6 @@ test("dashboard renders at 390px without horizontal overflow", async ({ page }) 
 
 test("transactions render at 390px without horizontal overflow", async ({ page }) => {
   await page.goto("/transactions");
-  await expect(page.getByText(data.entry.name).first()).toBeVisible();
+  await expect(page.getByText(getData().entry.name).first()).toBeVisible();
   await expectNoHorizontalOverflow(page);
 });
