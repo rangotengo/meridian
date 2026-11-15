@@ -29,10 +29,17 @@ export async function meroShareCapitalsAction(): Promise<ActionState<MeroShareCa
   });
 }
 
+/** Outcome of a connect/sync, including any partial-success warnings. */
+export type MeroShareSyncResult = {
+  accounts: number;
+  costBasisAvailable: boolean;
+  warnings: string[];
+};
+
 export async function connectMeroShareAction(
-  _previous: ActionState<{ accounts: number }> | undefined,
+  _previous: ActionState<MeroShareSyncResult> | undefined,
   formData: FormData
-): Promise<ActionState<{ accounts: number }>> {
+): Promise<ActionState<MeroShareSyncResult>> {
   return runAction("meroshare.connect", async () => {
     const actor = await assertActor();
     await consumeRateLimit(getDb(), `meroshare.connect:${actor.userId}`, 10, 3600);
@@ -46,23 +53,31 @@ export async function connectMeroShareAction(
     revalidatePath("/settings/meroshare");
     revalidatePath("/accounts");
     revalidatePath("/");
-    return { accounts: result.accounts };
+    return {
+      accounts: result.accounts,
+      costBasisAvailable: result.costBasisAvailable,
+      warnings: result.warnings
+    };
   });
 }
 
 export async function syncMeroShareAction(
-  _previous: ActionState | undefined,
+  _previous: ActionState<MeroShareSyncResult> | undefined,
   formData: FormData
-): Promise<ActionState> {
+): Promise<ActionState<MeroShareSyncResult>> {
   return runAction("meroshare.sync", async () => {
     const actor = await assertActor();
     await consumeRateLimit(getDb(), `meroshare.sync:${actor.userId}`, 30, 3600);
     const connectionId = z.string().uuid().parse(formData.get("connectionId"));
-    await syncMeroShareConnection(getDb(), actor, connectionId);
+    const result = await syncMeroShareConnection(getDb(), actor, connectionId);
     revalidatePath("/settings/meroshare");
     revalidatePath("/accounts");
     revalidatePath("/");
-    return undefined;
+    return {
+      accounts: result.accounts,
+      costBasisAvailable: result.costBasisAvailable,
+      warnings: result.warnings
+    };
   });
 }
 

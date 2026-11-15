@@ -6,14 +6,42 @@ import {
   connectMeroShareAction,
   disconnectMeroShareAction,
   meroShareCapitalsAction,
-  syncMeroShareAction
+  syncMeroShareAction,
+  type MeroShareSyncResult
 } from "./actions";
+import { Alert } from "@/components/ds/card";
 import { Field, FormError, Input, Select } from "@/components/ds/form";
 import { SubmitButton } from "@/components/ds/submit-button";
 import { ConfirmDialog } from "@/components/ds/dialog";
 import { usePrivacy } from "@/components/layout/privacy-context";
 
 type Capital = { id: number; code: string; name: string };
+
+/**
+ * Shown after a connect/sync that succeeded without cost basis: the
+ * portfolio is up to date, but purchase costs could not be retrieved and
+ * previously stored values were kept.
+ */
+export function MeroShareSyncWarnings({ result }: { result?: MeroShareSyncResult }) {
+  if (!result || (result.costBasisAvailable && result.warnings.length === 0)) return null;
+  const warnings = result.warnings.length
+    ? result.warnings
+    : [
+        "MeroShare's WACC report could not be retrieved, so holdings were synced without purchase cost."
+      ];
+  return (
+    <Alert
+      title={result.costBasisAvailable ? "MeroShare sync warning" : "Cost basis unavailable"}
+      tone="warning"
+    >
+      <ul className="list-inside list-disc">
+        {warnings.map((warning, index) => (
+          <li key={index}>{warning}</li>
+        ))}
+      </ul>
+    </Alert>
+  );
+}
 type Connection = {
   connection: {
     id: string;
@@ -67,6 +95,7 @@ function ConnectionCard({ item, privacy }: { item: Connection; privacy: boolean 
     <article className="rounded-xl border border-border bg-surface p-4 shadow-sm">
       <FormError message={syncState?.ok === false ? syncState.error : undefined} />
       <FormError message={disconnectState?.ok === false ? disconnectState.error : undefined} />
+      <MeroShareSyncWarnings result={syncState?.ok ? syncState.data : undefined} />
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h2 className="font-medium text-primary">{item.connection.name}</h2>
@@ -175,6 +204,7 @@ function ConnectForm({ capitals, capitalError }: { capitals: Capital[]; capitalE
         </p>
       </div>
       <FormError message={state?.ok === false ? state.error : capitalError} />
+      <MeroShareSyncWarnings result={state?.ok ? state.data : undefined} />
       <div className="grid gap-4 sm:grid-cols-2">
         <Field label="Depository participant" htmlFor="mero-dp">
           <Select
