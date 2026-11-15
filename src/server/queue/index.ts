@@ -1,5 +1,5 @@
 import { rowLock } from "@/server/db/dialect";
-import { databaseNow } from "@/server/db/dialect";
+import { databaseNow, usesCloudStorage } from "@/server/db/dialect";
 import { sql } from "drizzle-orm";
 import type { Executor } from "../db/client";
 import { jobs } from "../db/schema";
@@ -29,17 +29,77 @@ export async function enqueue(
     maxAttempts: opts.maxAttempts ?? 5,
     ...(opts.delaySeconds ? { runAfter: new Date(Date.now() + opts.delaySeconds * 1000) } : {})
   };
-  const rows = await exec
-    .insert(jobs)
-    .values(values)
-    .onConflictDoNothing()
-    .returning({ id: jobs.id });
-  return rows[0]?.id ?? null;
+  const insertRow = async (ex: Executor): Promise<string | null> => {
+    const rows = await ex
+      .insert(jobs)
+      .values(values)
+      .onConflictDoNothing()
+      .returning({ id: jobs.id });
+    return rows[0]?.id ?? null;
+  };
+  // Coordinate with the retry/recovery/replay transitions for the same key
+  // (see withDedupeLock): without the shared lock, this insert could commit
+  // while a transition's snapshot predates it, and the transition would hit
+  // the dedupe index instead of coalescing.
+  return withDedupeLock(exec, queue, values.dedupeKey, insertRow);
 }
 
 export type ClaimedJob = typeof jobs.$inferSelect;
 
 const STALE_LOCK_MINUTES = 10;
+
+/**
+ * Per-key serialization for dedupe writers (Postgres only).
+ *
+ * The coalescing predicate below is evaluated on a READ COMMITTED statement
+ * snapshot, so on its own it cannot see a pending duplicate that another
+ * transaction has inserted but not yet committed — while the partial unique
+ * index does detect that duplicate once the other transaction commits, and
+ * raises 23505 instead of letting the transition coalesce. To close that
+ * race, every writer for a (queue, dedupeKey) pair — enqueue, failJob,
+ * recoverStaleJobs, replayDeadJob, and the cron inserter — first takes the
+ * pair's advisory transaction lock (the same hashtext pattern the Sure /
+ * family imports use for their per-family lock) and only then checks and
+ * writes, all inside one transaction. Writers for a key therefore run
+ * strictly one at a time: by the time a transition evaluates its predicate,
+ * any competing enqueue has either committed (and is visible) or has not
+ * started its insert at all.
+ *
+ * NULL dedupe keys never take a lock and never coalesce. On the
+ * Cloudflare/SQLite backend the Durable Object serializes writers, so the
+ * lock is a no-op there and callers run unwrapped, exactly as before.
+ */
+export async function lockDedupeKey(
+  exec: Executor,
+  queue: string,
+  dedupeKey: string
+): Promise<void> {
+  if (usesCloudStorage) return;
+  await exec.execute(
+    sql`SELECT pg_advisory_xact_lock(hashtext(${"jobs-dedupe:" + queue + ":" + dedupeKey}))`
+  );
+}
+
+/**
+ * Runs `fn` while holding the (queue, dedupeKey) advisory lock. When the
+ * caller already supplies a transaction executor, the lock nests inside it
+ * (Drizzle savepoint) and is held until the outer transaction ends — the
+ * lock and the guarded writes always share one transaction boundary. With a
+ * NULL key or on the cloud backend, `fn` runs on the caller's executor
+ * unchanged.
+ */
+async function withDedupeLock<T>(
+  exec: Executor,
+  queue: string,
+  dedupeKey: string | null,
+  fn: (exec: Executor) => Promise<T>
+): Promise<T> {
+  if (dedupeKey === null || usesCloudStorage) return fn(exec);
+  return exec.transaction(async (tx) => {
+    await lockDedupeKey(tx, queue, dedupeKey);
+    return fn(tx);
+  });
+}
 
 /**
  * Coalescing guard for transitions back into 'pending'.
@@ -70,6 +130,26 @@ const SUPERSEDED_NOTE = "Superseded by a pending job with the same dedupe key";
 
 export async function recoverStaleJobs(exec: Executor): Promise<number> {
   const staleBefore = new Date(Date.now() - STALE_LOCK_MINUTES * 60000).toISOString();
+  if (usesCloudStorage) return recoverStaleJobsUnderLock(exec, staleBefore);
+  // Lock every distinct stale dedupe key, in deterministic (queue, key)
+  // order, before touching any row. Single-key writers never wait on more
+  // than one lock, so this fixed global order cannot form a lock cycle;
+  // holding the keys for the whole sweep keeps the predicates below
+  // accurate against concurrent enqueues from start to finish.
+  return exec.transaction(async (tx) => {
+    const keyRows = await tx.execute<{ queue: string; dedupeKey: string }>(sql`
+      SELECT DISTINCT queue, dedupe_key AS "dedupeKey" FROM jobs
+      WHERE status = 'running' AND locked_at < ${staleBefore} AND dedupe_key IS NOT NULL
+      ORDER BY queue, dedupe_key
+    `);
+    for (const row of keyRows.rows ?? []) {
+      await lockDedupeKey(tx, row.queue, row.dedupeKey);
+    }
+    return recoverStaleJobsUnderLock(tx, staleBefore);
+  });
+}
+
+async function recoverStaleJobsUnderLock(exec: Executor, staleBefore: string): Promise<number> {
   // Return stale jobs to 'pending', skipping any whose dedupe key is already
   // covered by a pending duplicate. When several stale jobs share a key, only
   // the longest-stale one is recovered (deterministic tie-break on
@@ -151,6 +231,17 @@ export async function failJob(
   job: ClaimedJob,
   error: unknown
 ): Promise<"retry" | "dead" | "coalesced"> {
+  // Serialized per dedupe key (see withDedupeLock): the retry predicate in
+  // failJobUnderLock is only trustworthy while no enqueue for the same key
+  // can commit mid-transition.
+  return withDedupeLock(exec, job.queue, job.dedupeKey, (tx) => failJobUnderLock(tx, job, error));
+}
+
+async function failJobUnderLock(
+  exec: Executor,
+  job: ClaimedJob,
+  error: unknown
+): Promise<"retry" | "dead" | "coalesced"> {
   const message =
     error instanceof Error
       ? `${error.name}: ${error.message}`.slice(0, 500)
@@ -186,22 +277,31 @@ export async function failJob(
 }
 
 export async function replayDeadJob(exec: Executor, jobId: string): Promise<boolean> {
-  const res = await exec.execute(sql`
-    UPDATE jobs SET status = 'pending', attempts = 0, run_after = ${databaseNow}, updated_at = ${databaseNow}
-    WHERE id = ${jobId} AND status = 'dead' AND NOT ${pendingDuplicateExists}
+  // The job's dedupe key is immutable after insert, so it can be read
+  // before taking the per-key lock that serializes the transition itself.
+  const found = await exec.execute<{ queue: string; dedupeKey: string | null }>(sql`
+    SELECT queue, dedupe_key AS "dedupeKey" FROM jobs WHERE id = ${jobId}
   `);
-  if ((res.rowCount ?? 0) > 0) return true;
-  // Coalesce: a pending duplicate already covers this job's work, so the
-  // replay resolves the dead job as 'completed' instead of violating the
-  // dedupe index. Returning true reports that the replay took effect (the
-  // job left 'dead' and its work is covered); false means the job was not
-  // in 'dead' state to begin with.
-  const coalesced = await exec.execute(sql`
-    UPDATE jobs SET status = 'completed', completed_at = ${databaseNow},
-      last_error = ${SUPERSEDED_NOTE}, updated_at = ${databaseNow}
-    WHERE id = ${jobId} AND status = 'dead'
-  `);
-  return (coalesced.rowCount ?? 0) > 0;
+  const job = found.rows?.[0];
+  if (!job) return false;
+  return withDedupeLock(exec, job.queue, job.dedupeKey, async (tx) => {
+    const res = await tx.execute(sql`
+      UPDATE jobs SET status = 'pending', attempts = 0, run_after = ${databaseNow}, updated_at = ${databaseNow}
+      WHERE id = ${jobId} AND status = 'dead' AND NOT ${pendingDuplicateExists}
+    `);
+    if ((res.rowCount ?? 0) > 0) return true;
+    // Coalesce: a pending duplicate already covers this job's work, so the
+    // replay resolves the dead job as 'completed' instead of violating the
+    // dedupe index. Returning true reports that the replay took effect (the
+    // job left 'dead' and its work is covered); false means the job was not
+    // in 'dead' state to begin with.
+    const coalesced = await tx.execute(sql`
+      UPDATE jobs SET status = 'completed', completed_at = ${databaseNow},
+        last_error = ${SUPERSEDED_NOTE}, updated_at = ${databaseNow}
+      WHERE id = ${jobId} AND status = 'dead'
+    `);
+    return (coalesced.rowCount ?? 0) > 0;
+  });
 }
 
 export async function pruneFinishedJobs(exec: Executor, olderThanDays: number): Promise<number> {
