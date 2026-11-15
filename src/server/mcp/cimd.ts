@@ -174,7 +174,7 @@ export const ASSERTION_CLOCK_SKEW_SECONDS = 30;
 
 export type VerifiedAssertion = {
   jti: string;
-  /** Assertion expiry — the replay claim is held until this moment. */
+  /** End of the acceptance window, including clock tolerance. */
   expiresAt: Date;
 };
 
@@ -205,17 +205,21 @@ export async function verifyClientAssertion(
     audience: tokenEndpointUrl,
     algorithms: ["RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384"],
     requiredClaims: ["exp", "iat", "jti"],
+    maxTokenAge: ASSERTION_MAX_LIFETIME_SECONDS,
     clockTolerance: ASSERTION_CLOCK_SKEW_SECONDS
   });
   const iat = payload.iat!;
   const exp = payload.exp!;
-  if (exp - iat > ASSERTION_MAX_LIFETIME_SECONDS) {
-    throw new Error("Client assertion lifetime exceeds the maximum allowed.");
+  if (exp <= iat || exp - iat > ASSERTION_MAX_LIFETIME_SECONDS) {
+    throw new Error("Client assertion lifetime must be positive and within the maximum allowed.");
   }
   if (typeof payload.jti !== "string" || payload.jti.length === 0) {
     throw new Error("Client assertion carries no jti.");
   }
-  return { jti: payload.jti, expiresAt: new Date(exp * 1000) };
+  return {
+    jti: payload.jti,
+    expiresAt: new Date((exp + ASSERTION_CLOCK_SKEW_SECONDS) * 1000)
+  };
 }
 
 /** Exact-match redirect URI check, except loopback URIs which match

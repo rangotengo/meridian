@@ -504,7 +504,8 @@ export async function authenticateOAuthClient(
 
 /**
  * Atomically claim a verified assertion's (client_id, jti) pair until
- * the assertion's expiry. The insert races on the table's primary key,
+ * the end of its acceptance window (expiry plus clock tolerance).
+ * The insert races on the table's primary key,
  * so exactly one of any number of concurrent claims succeeds. Expired
  * claims for the same client are pruned opportunistically.
  */
@@ -932,7 +933,7 @@ export type OAuthHousekeepingResult = {
  * Bounds OAuth state growth (wired into the nightly maintenance:cleanup
  * job):
  *  - expired private_key_jwt assertion claims (they are meaningless
- *    once the assertion itself has expired);
+ *    once the assertion's clock-tolerant acceptance window has closed);
  *  - authorization-request records a day past expiry (consent records
  *    live ten minutes; the extra day is audit slack);
  *  - DCR client registrations older than 30 days that never produced a

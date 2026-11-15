@@ -762,8 +762,8 @@ export const oauthTokens = pgTable(
  * Replay claims for `private_key_jwt` client assertions (RFC 7523 §3:
  * a jti must not be reused). Each verified assertion's (client_id, jti)
  * is claimed with an insert against this primary key until the
- * assertion's expiry, so a replayed assertion — even a concurrent one —
- * can authenticate at most once.
+ * assertion's expiry plus clock tolerance, so a replayed assertion —
+ * even a concurrent one — can authenticate at most once.
  */
 export const oauthAssertionClaims = pgTable(
   "oauth_assertion_claims",

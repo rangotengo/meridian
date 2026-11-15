@@ -496,31 +496,30 @@ export async function netWorthSeries(
   }
 
   // Per-account completeness: which in-scope accounts were expected to
-  // have a snapshot on each date that produced a point.
+  // have a snapshot on each date that produced a point. Use account life,
+  // not the first surviving snapshot: missing rows must not hide gaps.
   const scopeRows = await exec.execute<{
     account_id: string;
-    first_date: string | null;
+    opened_on: string;
   }>(sql`
-    SELECT CAST(a.id AS TEXT) AS account_id, CAST(MIN(b.as_of) AS TEXT) AS first_date
+    SELECT CAST(a.id AS TEXT) AS account_id, CAST(a.opened_on AS TEXT) AS opened_on
     FROM accounts a
-    LEFT JOIN balances b ON b.account_id = a.id AND b.as_of <= ${today}
     WHERE a.family_id = ${family.id}
       AND a.status = 'active'
       AND a.included_in_reports = true
       AND ${ACCESS_SQL(userId)}
       ${accountFilter(accountIds)}
-    GROUP BY a.id
   `);
-  const firstSnapshotByAccount = new Map<string, string>();
+  const openedOnByAccount = new Map<string, string>();
   for (const r of scopeRows.rows ?? []) {
-    if (r.first_date) firstSnapshotByAccount.set(r.account_id, r.first_date.slice(0, 10));
+    openedOnByAccount.set(r.account_id, r.opened_on.slice(0, 10));
   }
   const incompleteDates: { date: string; missingAccountIds: string[] }[] = [];
   for (const date of byDate.keys()) {
     const present = presentByDate.get(date) ?? new Set<string>();
     const missing: string[] = [];
-    for (const [accountId, firstDate] of firstSnapshotByAccount) {
-      if (firstDate <= date && !present.has(accountId)) missing.push(accountId);
+    for (const [accountId, openedOn] of openedOnByAccount) {
+      if (openedOn <= date && !present.has(accountId)) missing.push(accountId);
     }
     if (missing.length > 0) incompleteDates.push({ date, missingAccountIds: missing.sort() });
   }

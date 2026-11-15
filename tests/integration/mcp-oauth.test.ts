@@ -991,6 +991,18 @@ describe("CIMD clients", () => {
       attempt(await sign({ iat: now - 600, exp: now - 300, jti: "expired" })),
       "invalid_client"
     );
+    await expect
+      .soft(attempt(await sign({ iat: now + 3600, exp: now + 3720, jti: "future-issued" })))
+      .rejects.toMatchObject({ error: "invalid_client" });
+    await expect
+      .soft(attempt(await sign({ iat: now + 10, exp: now, jti: "negative-lifetime" })))
+      .rejects.toMatchObject({ error: "invalid_client" });
+
+    // Clock tolerance still permits an assertion just past exp, so its
+    // replay claim must survive that entire acceptance window too.
+    const skewed = await sign({ iat: now - 120, exp: now - 5, jti: "clock-skew-once" });
+    expect((await attempt(skewed)).clientId).toBe(DOC_URL);
+    await expectOAuthError(attempt(skewed), "invalid_client");
 
     // A valid assertion authenticates exactly once: the SAME assertion
     // replayed is rejected, sequentially and concurrently.

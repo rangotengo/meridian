@@ -35,11 +35,11 @@ Claude / ChatGPT (MCP client)
    ▼
 Meridian (this codebase, both backends)
    ├─ src/server/domain/oauth.ts   — the authorization server + verifier
-   ├─ src/server/mcp/server.ts     — McpServer, one tool
-   ├─ src/server/mcp/ssrf.ts       — SSRF policy fetcher (Node)
+   ├─ src/server/mcp/server.ts     — McpServer, eight read-only tools
+   ├─ src/server/mcp/ssrf.ts       — SSRF policy fetcher (Node/Workers)
    ├─ src/server/mcp/cimd.ts       — CIMD resolution + private_key_jwt
    └─ tables: oauth_clients, oauth_grants, oauth_authorization_requests,
-              oauth_authorization_codes, oauth_tokens
+              oauth_authorization_codes, oauth_tokens, oauth_assertion_claims
 ```
 
 Meridian's existing session login is the only login of record. OAuth
@@ -49,17 +49,17 @@ database state.
 
 ## Endpoint inventory
 
-| Endpoint                                        | Purpose                                                       | Gate behavior         |
-| ----------------------------------------------- | ------------------------------------------------------------- | --------------------- |
-| `POST/GET/DELETE /mcp`                          | MCP streamable-HTTP endpoint (stateless)                      | 404 when unconfigured |
-| `GET /.well-known/oauth-protected-resource`     | RFC 9728 metadata                                             | 404                   |
-| `GET /.well-known/oauth-protected-resource/mcp` | RFC 9728 metadata (named in the 401 challenge)                | 404                   |
-| `GET /.well-known/oauth-authorization-server`   | RFC 8414 metadata                                             | 404                   |
-| `GET /oauth/authorize`                          | Consent page (session-gated)                                  | 404 (notFound)        |
-| `POST /oauth/token`                             | Code exchange + refresh rotation, form-encoded only           | 404                   |
-| `POST /oauth/register`                          | DCR; rate-limited 10/h/IP                                     | 404                   |
-| `POST /oauth/revoke`                            | RFC 7009; always 200 for well-formed requests                 | 404                   |
-| `DELETE /api/mcp/connections/[id]`              | Owner disconnects a connection (settings UI is a later stage) | 404                   |
+| Endpoint                                        | Purpose                                                 | Gate behavior         |
+| ----------------------------------------------- | ------------------------------------------------------- | --------------------- |
+| `POST/GET/DELETE /mcp`                          | MCP streamable-HTTP endpoint (stateless)                | 404 when unconfigured |
+| `GET /.well-known/oauth-protected-resource`     | RFC 9728 metadata                                       | 404                   |
+| `GET /.well-known/oauth-protected-resource/mcp` | RFC 9728 metadata (named in the 401 challenge)          | 404                   |
+| `GET /.well-known/oauth-authorization-server`   | RFC 8414 metadata                                       | 404                   |
+| `GET /oauth/authorize`                          | Consent page (session-gated)                            | 404 (notFound)        |
+| `POST /oauth/token`                             | Code exchange + refresh rotation, form-encoded only     | 404                   |
+| `POST /oauth/register`                          | DCR; rate-limited 10/h/IP                               | 404                   |
+| `POST /oauth/revoke`                            | RFC 7009; always 200 for well-formed requests           | 404                   |
+| `DELETE /api/mcp/connections/[id]`              | Owner disconnects a connection from Connected AI agents | 404                   |
 
 ## Config gate
 
@@ -82,8 +82,7 @@ production hostname even for local requests.
 
 ## Data model
 
-Both backends, mirrored (Postgres migrations 0009 + 0010; cloud 0010 +
-0011):
+Both backends, mirrored (Postgres migrations 0009–0011; cloud 0010–0012):
 
 - **`oauth_clients`** — DCR registrations: `id` (= client_id), name,
   redirect URIs (JSON), token-endpoint auth method, optional secret
@@ -99,8 +98,10 @@ Both backends, mirrored (Postgres migrations 0009 + 0010; cloud 0010 +
   scopes, resource, code challenge, state, hash-stored CSRF token,
   consumed-at.
 - **`oauth_authorization_codes`** — hash-stored, single-use codes
-  (5-minute TTL), with `used_at` (atomic consume) and `issued_at`
-  (issuance-settled marker, see replay semantics).
+  (5-minute TTL), with `used_at` (atomic consume), `issued_at`
+  (completed issuance), and `invalidated_at` (durable family revocation).
+- **`oauth_assertion_claims`** — atomic `(client_id, jti)` replay
+  claims retained through the assertion's expiry plus clock tolerance.
 - **`oauth_tokens`** — opaque, hash-stored access (1 h) and refresh
   (30 d) tokens: grant, originating code (token-family root), resource
   (audience), expiry, revocation, `replaced_by_id` rotation chain.
@@ -135,13 +136,13 @@ text): `oauth_grant.created`, `oauth_grant.revoked`, `mcp.tool_called`.
   and absent challenge are all rejected at authorize time.
 - **Codes are single-use** via atomic conditional UPDATE on both
   backends. A failed exchange attempt consumes the code (fail-closed).
-- **Replay defense:** presenting a consumed code revokes every token
-  minted from it. If the original exchange is still inside its issuance
-  window, the replay waits (≤2 s, polling the `issued_at` marker) for
-  issuance to settle before revoking, so the revoke cannot miss tokens
-  being inserted concurrently. Outcome under simultaneity is
-  deterministic: **exactly one exchange succeeds**, and the replay still
-  kills its tokens.
+- **Replay defense:** presenting a consumed code durably invalidates
+  its token family. Issuance and invalidation lock code → grant → token
+  rows in the same order, and token verification checks the persistent
+  marker. An exchange interrupted before issuance cannot mint a live
+  token after invalidation; an already-issued pair becomes unusable.
+  Simultaneous exchanges have at most one winner, whose tokens are
+  also revoked when replay is detected.
 - **Refresh tokens rotate** on every use. Presenting a rotated-out or
   revoked refresh token revokes the whole family (OAuth 2.1 §4.3.1).
   Under simultaneous refresh, exactly one succeeds and the loser's
@@ -348,14 +349,12 @@ No WorkOS account or dashboard setup is needed — that path is closed.
   `DELETE /api/mcp/connections/[id]`; a connections settings page is a
   later stage. _Resolved in Stage 4 (below): Connected AI agents
   settings page, with disconnect wired to that same route._
-- **CIMD cache** is in-memory per instance (≤1 h TTL); a fleet-wide
-  cache is future work. DCR registrations have no janitor yet —
-  abandoned client rows accumulate harmlessly.
+- **CIMD cache** is in-memory per instance (≤1 h TTL, 200-entry cap);
+  a fleet-wide cache is future work. Nightly cleanup removes abandoned
+  DCR registrations older than 30 days that never produced a grant.
 - The Node metadata transport pins the **first** validated address;
   all resolved addresses are validated, but connection failover across
   them is not attempted.
-- A replay arriving while the legitimate exchange is in flight waits
-  up to 2 s for issuance to settle (normal path: milliseconds).
 - At Stage 2, `get_financial_summary` was the only tool and the
   `transactions:read` / `transactions:notes` scopes were issued but
   unconsumed. Stage 3 (below) adds the remaining seven tools and
@@ -718,12 +717,16 @@ loopback registered URI authorized any loopback target.
 
 ## P2-6 — private_key_jwt assertions: exp/iat/jti required, jti claimed
 
-Verification requires `exp`, `iat`, and `jti` (RFC 7523 §3), enforces
-`exp − iat ≤ 300s` with 30s clock tolerance, and — after signature
+Verification requires `exp` per RFC 7523 §3, plus `iat` and `jti` under
+Meridian's lifetime and one-use policies. It enforces
+`0 < exp − iat ≤ 300s`, rejects future-issued assertions beyond 30s
+clock tolerance, and — after signature
 verification — atomically claims `(client_id, jti)` in the new
 `oauth_assertion_claims` table (both databases) until the assertion's
-expiry; a conflict means replay and the authentication fails.
-Tests: missing exp/iat/jti, 10-minute lifetime, expired, sequential
+expiry **plus clock tolerance**; a conflict means replay and the
+authentication fails, including during the grace window after `exp`.
+Tests: missing exp/iat/jti, 10-minute lifetime, expired, future-issued,
+negative lifetime, clock-skew replay, sequential
 replay, and concurrent replay (exactly one of two simultaneous
 identical assertions succeeds, on Postgres; sequential replay is
 asserted in the workerd probe).
@@ -740,7 +743,9 @@ the same service; the field is additive and ignored there.)
 (b) The summary's per-account `amountMinor` is `null` (unknown) when
 an account has no balance snapshot — previously a missing snapshot
 surfaced as `"0"` next to `fx.complete: true`. Tests cover both,
-including the owner's delete-one-snapshot repro.
+including the owner's delete-one-snapshot repro, deletion of all
+snapshots for one of two accounts, and a newer account whose earlier
+snapshots are correctly not expected before its opening date.
 
 ## P2-8 — stored resource is authoritative
 
@@ -791,7 +796,7 @@ holding the fetch open; a redirect chain cannot reset the budget.
 
 ## Fix-round evidence (Tier A)
 
-- Postgres suite: **470/470** across 56 files (was 449) — includes
+- Postgres suite before final re-review: **470/470** across 56 files (was 449) — includes
   the new `mcp-review-fixes` file (6), the real-transport SSRF suite
   (4), and additions to `mcp-oauth` (38→42), `mcp-tools` (20→25).
 - Cloud suite: **23/23** (was 22) — new `mcp-ssrf-redirect` probe op;
@@ -799,3 +804,11 @@ holding the fetch open; a redirect chain cannot reset the budget.
   P2-6, P2-7a, P2-8 flags.
 - Typecheck, lint, prettier clean; `build:next` and the OpenNext
   cloud build both pass.
+
+Final re-review adds two history regressions (all snapshots absent for
+one account, and the account-opening boundary), plus assertion checks
+for future issuance, negative lifetime, and replay inside clock
+tolerance. The latter replay and future-issuance checks also run in the
+workerd OAuth probe. PostgreSQL: **472/472** across 56 files; cloud:
+**23/23**. No real Claude or ChatGPT connection has been
+tested; Tier B remains pending, and enabling MCP is a separate approval.

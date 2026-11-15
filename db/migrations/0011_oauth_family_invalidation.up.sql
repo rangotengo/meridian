@@ -7,8 +7,9 @@ ALTER TABLE oauth_authorization_codes ADD COLUMN IF NOT EXISTS invalidated_at ti
 
 -- Replay claims for private_key_jwt client assertions (RFC 7523): each
 -- (client_id, jti) pair may be claimed exactly once, until the
--- assertion's own expiry. Claiming is an insert against this primary
--- key, so concurrent replays race on the database, not on app state.
+-- end of its acceptance window (expiry plus clock tolerance). Claiming
+-- is an insert against this primary key, so concurrent replays race on
+-- the database, not on app state.
 CREATE TABLE IF NOT EXISTS oauth_assertion_claims (
   client_id text NOT NULL,
   jti text NOT NULL,

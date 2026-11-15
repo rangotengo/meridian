@@ -101,6 +101,8 @@ describe("Cloudflare SQLite storage", () => {
       resourceChangeAccessRejected: true,
       assertionFirstOk: true,
       assertionReplayRejected: true,
+      assertionSkewReplayRejected: true,
+      assertionFutureRejected: true,
       assertionMissingExpRejected: true
     });
   });

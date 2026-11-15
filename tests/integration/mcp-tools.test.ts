@@ -881,6 +881,42 @@ describe("get_financial_summary grant restriction (P1-1)", () => {
 });
 
 describe("get_net_worth_history per-account completeness (P2-7a)", () => {
+  it("does not expect snapshots before an account opened", async () => {
+    const user = await makeUser({ timezone: "UTC" });
+    await makeAccount(user, { openingBalanceDisplayMinor: 100_000, openedOn: daysAgo(2) });
+    await makeAccount(user, { openingBalanceDisplayMinor: 900_000, openedOn: daysAgo(0) });
+    const flow = await connectFlow(user);
+    const { data } = await callTool(flow.tokens.accessToken, "get_net_worth_history", { days: 3 });
+    expect(
+      data.points.map((point: { netWorth: { amountMinor: string } }) => point.netWorth.amountMinor)
+    ).toEqual(["100000", "100000", "1000000"]);
+    expect(data.coverage.complete).toBe(true);
+    expect(data.coverage.partialDays).toEqual([]);
+  });
+
+  it("marks every point partial when another account has lost all snapshots", async () => {
+    const user = await makeUser({ timezone: "UTC" });
+    await makeAccount(user, { openingBalanceDisplayMinor: 100_000, openedOn: daysAgo(2) });
+    const b = await makeAccount(user, {
+      openingBalanceDisplayMinor: 900_000,
+      openedOn: daysAgo(2)
+    });
+    await db().execute(sql`DELETE FROM balances WHERE account_id = ${b}::uuid`);
+    const flow = await connectFlow(user);
+
+    const { data } = await callTool(flow.tokens.accessToken, "get_net_worth_history", {
+      days: 3
+    });
+    expect(data.points).toHaveLength(3);
+    for (const point of data.points) {
+      expect(point.netWorth.amountMinor).toBe("100000");
+      expect(point.complete).toBe(false);
+      expect(point.missingAccountIds).toEqual([b]);
+    }
+    expect(data.coverage.complete).toBe(false);
+    expect(data.coverage.partialDays).toHaveLength(3);
+  });
+
   it("marks a point partial when one account's snapshot is missing for that day", async () => {
     const user = await makeUser({ timezone: "UTC" });
     await makeAccount(user, { openingBalanceDisplayMinor: 100_000, openedOn: daysAgo(30) });

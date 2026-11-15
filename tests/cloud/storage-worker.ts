@@ -886,6 +886,48 @@ export class StorageProbe {
       } catch (e) {
         assertionReplayRejected = e instanceof OAuthError && e.error === "invalid_client";
       }
+      const assertionNow = Math.floor(Date.now() / 1000);
+      const signTimedAssertion = (iat: number, exp: number, jti: string) =>
+        new SignJWT({})
+          .setProtectedHeader({ alg: "RS256", kid: "cloud-claims-key" })
+          .setIssuer(claimsUrl)
+          .setSubject(claimsUrl)
+          .setAudience("https://meridian.test/oauth/token")
+          .setIssuedAt(iat)
+          .setExpirationTime(exp)
+          .setJti(jti)
+          .sign(privateKey);
+      const skewedAssertion = await signTimedAssertion(
+        assertionNow - 120,
+        assertionNow - 5,
+        "cloud-skew"
+      );
+      const skewedArgs = { ...authArgs, clientAssertion: skewedAssertion };
+      await authenticateOAuthClient(exec, skewedArgs, claimsConfig, claimsFetcher);
+      let assertionSkewReplayRejected = false;
+      try {
+        await authenticateOAuthClient(exec, skewedArgs, claimsConfig, claimsFetcher);
+      } catch (e) {
+        assertionSkewReplayRejected = e instanceof OAuthError && e.error === "invalid_client";
+      }
+      let assertionFutureRejected = false;
+      try {
+        await authenticateOAuthClient(
+          exec,
+          {
+            ...authArgs,
+            clientAssertion: await signTimedAssertion(
+              assertionNow + 3600,
+              assertionNow + 3720,
+              "cloud-future"
+            )
+          },
+          claimsConfig,
+          claimsFetcher
+        );
+      } catch (e) {
+        assertionFutureRejected = e instanceof OAuthError && e.error === "invalid_client";
+      }
       const noExpAssertion = await new SignJWT({})
         .setProtectedHeader({ alg: "RS256", kid: "cloud-claims-key" })
         .setIssuer(claimsUrl)
@@ -983,6 +1025,8 @@ export class StorageProbe {
         resourceChangeAccessRejected,
         assertionFirstOk,
         assertionReplayRejected,
+        assertionSkewReplayRejected,
+        assertionFutureRejected,
         assertionMissingExpRejected
       });
     }
