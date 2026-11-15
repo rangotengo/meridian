@@ -36,6 +36,15 @@ const schema = z
         (value) => !value || Buffer.from(value, "base64").length === 32,
         "MERO_SHARE_ENCRYPTION_KEY must be a 32-byte base64 value."
       ),
+    BACKUP_ENCRYPTION_KEY: z
+      .string()
+      .optional()
+      .refine(
+        (value) => !value || Buffer.from(value, "base64").length === 32,
+        "BACKUP_ENCRYPTION_KEY must be a 32-byte base64 value."
+      ),
+    BACKUP_DIR: z.string().optional(),
+    BACKUP_RETENTION: z.coerce.number().int().positive().default(7),
     NODE_ENV: z.enum(["development", "test", "production"]).default("development")
   })
   .superRefine((value, ctx) => {
@@ -89,4 +98,31 @@ export function registrationOpen(): boolean {
 
 export function aiChatEnabled(): boolean {
   return Boolean(env.AI_BASE_URL && env.AI_MODEL);
+}
+
+export type BackupConfig = {
+  /** Base64 32-byte key for encrypting backup archives; undefined disables backups. */
+  encryptionKey: string | undefined;
+  /** Directory backup archives are written to; undefined disables backups. */
+  dir: string | undefined;
+  /** How many of the most recent archives to keep. */
+  retention: number;
+};
+
+/** Read live (like requireEmailVerification) so operators and tests can set it per-process. */
+export function backupConfig(): BackupConfig {
+  const retentionRaw =
+    process.env.BACKUP_RETENTION !== undefined
+      ? Number(process.env.BACKUP_RETENTION)
+      : env.BACKUP_RETENTION;
+  return {
+    encryptionKey:
+      process.env.BACKUP_ENCRYPTION_KEY !== undefined
+        ? process.env.BACKUP_ENCRYPTION_KEY || undefined
+        : env.BACKUP_ENCRYPTION_KEY,
+    dir:
+      process.env.BACKUP_DIR !== undefined ? process.env.BACKUP_DIR || undefined : env.BACKUP_DIR,
+    retention:
+      Number.isInteger(retentionRaw) && retentionRaw > 0 ? retentionRaw : env.BACKUP_RETENTION
+  };
 }

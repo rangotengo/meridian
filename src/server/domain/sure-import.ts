@@ -439,7 +439,11 @@ async function insertTransaction(
   return { entryId: entry.id, amountMinor: input.amountMinor };
 }
 
-async function assertFamilyIsEmpty(exec: Executor, familyId: string): Promise<void> {
+export async function assertFamilyIsEmpty(
+  exec: Executor,
+  familyId: string,
+  sourceLabel = "a Sure migration"
+): Promise<void> {
   // A transaction is backed by one PostgreSQL client. Keep these reads
   // sequential to avoid overlapping client queries while preserving the
   // empty-family check's all-or-nothing boundary.
@@ -489,7 +493,7 @@ async function assertFamilyIsEmpty(exec: Executor, familyId: string): Promise<vo
   for (const check of checks) {
     if ((await check()).length > 0) {
       throw errors.conflict(
-        "For safety, a Sure migration can only start in a new empty Meridian family."
+        `For safety, ${sourceLabel} can only start in a new empty Meridian family.`
       );
     }
   }

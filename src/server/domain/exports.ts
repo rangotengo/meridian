@@ -4,13 +4,17 @@ import { chunkParams } from "../db/params";
 import {
   accountShares,
   accounts,
+  budgets,
   categories,
   entries,
   exchangeRates,
   families,
+  recurringSeries,
+  savedFilters,
   tags,
   transactionTags,
   transactions,
+  transfers,
   users,
   valuations
 } from "../db/schema";
@@ -18,7 +22,14 @@ import type { Actor } from "../auth/context";
 import { recordAudit } from "../observability/audit";
 import { listAccountsForActor } from "./accounts";
 
-export const EXPORT_VERSION = 1;
+/**
+ * Household export format version.
+ *
+ * v1: family, shares, accounts, categories, tags, entries, exchange rates.
+ * v2: adds budgets, recurring series, saved filters, an explicit transfers
+ *     list, and `recurringSeriesId` on entries. The importer accepts both.
+ */
+export const EXPORT_VERSION = 2;
 
 type FamilyRow = typeof families.$inferSelect;
 
@@ -70,10 +81,51 @@ export async function buildFamilyExport(exec: Executor, actor: Actor): Promise<F
     }
   }
 
+  const budgetRows = await exec.select().from(budgets).where(eq(budgets.familyId, familyId));
+
+  const recurringRows = [];
+  for (const chunk of chunkParams(visibleAccountIds)) {
+    const rows = await exec
+      .select()
+      .from(recurringSeries)
+      .where(
+        and(eq(recurringSeries.familyId, familyId), inArray(recurringSeries.accountId, chunk))
+      );
+    recurringRows.push(...rows);
+  }
+
+  const transferRows = [];
+  for (const chunk of chunkParams(visibleAccountIds)) {
+    const rows = await exec
+      .select({
+        id: transfers.id,
+        outflowEntryId: transfers.outflowEntryId,
+        inflowEntryId: transfers.inflowEntryId,
+        status: transfers.status
+      })
+      .from(transfers)
+      .innerJoin(entries, eq(entries.id, transfers.outflowEntryId))
+      .innerJoin(accounts, eq(accounts.id, entries.accountId))
+      .where(and(eq(accounts.familyId, familyId), inArray(accounts.id, chunk)));
+    transferRows.push(...rows);
+  }
+
   const memberRows = await exec
     .select({ id: users.id, email: users.email, name: users.name, role: users.familyRole })
     .from(users)
     .where(eq(users.familyId, familyId));
+
+  // Saved filters are private to their owner: an export carries only the
+  // exporting actor's own filters, never other members' saved searches.
+  const savedFilterRows = await exec
+    .select({
+      id: savedFilters.id,
+      userId: savedFilters.userId,
+      name: savedFilters.name,
+      params: savedFilters.params
+    })
+    .from(savedFilters)
+    .where(eq(savedFilters.userId, actor.userId));
 
   const shareRows = [];
   for (const chunk of chunkParams(visibleAccountIds)) {
@@ -97,6 +149,17 @@ export async function buildFamilyExport(exec: Executor, actor: Actor): Promise<F
     list.push(link.tagId);
     tagsByEntry.set(link.entryId, list);
   }
+
+  // A transfer is exported only when BOTH legs are in accounts the actor can
+  // see; a half-visible transfer would dangle (its other leg is not in the
+  // export) and leak the existence of an account the actor cannot access.
+  // Legs of an excluded transfer are exported as ordinary transactions with
+  // no transfer link.
+  const exportedEntryIds = new Set(entryRows.map((r) => r.entry.id));
+  const completeTransfers = transferRows.filter(
+    (t) => exportedEntryIds.has(t.outflowEntryId) && exportedEntryIds.has(t.inflowEntryId)
+  );
+  const completeTransferIds = new Set(completeTransfers.map((t) => t.id));
 
   await recordAudit(exec, {
     familyId,
@@ -145,13 +208,42 @@ export async function buildFamilyExport(exec: Executor, actor: Actor): Promise<F
         externalSource: entry.externalSource,
         externalId: entry.externalId,
         kind: entry.entryableType,
+        recurringSeriesId: entry.recurringSeriesId,
         categoryId: txnCategoryId ?? null,
         merchant: txnMerchant ?? null,
-        transferId: txnTransferId ?? null,
+        transferId: txnTransferId && completeTransferIds.has(txnTransferId) ? txnTransferId : null,
         valuationKind: valuationKind ?? null,
         tagIds: tagsByEntry.get(entry.id) ?? []
       })
     ),
+    transfers: completeTransfers,
+    budgets: budgetRows.map((b) => ({
+      id: b.id,
+      categoryId: b.categoryId,
+      amountMinor: b.amountMinor,
+      active: b.active
+    })),
+    recurring: recurringRows.map((s) => ({
+      id: s.id,
+      accountId: s.accountId,
+      createdBy: s.createdBy,
+      name: s.name,
+      merchant: s.merchant,
+      amountMinor: s.amountMinor,
+      currency: s.currency,
+      categoryId: s.categoryId,
+      frequency: s.frequency,
+      config: s.config,
+      nextDue: s.nextDue,
+      active: s.active,
+      lastPostedEntryId: s.lastPostedEntryId
+    })),
+    savedFilters: savedFilterRows.map((f) => ({
+      id: f.id,
+      userId: f.userId,
+      name: f.name,
+      params: f.params
+    })),
     exchangeRates: rateRows.map((r) => ({
       base: r.baseCurrency,
       quote: r.quoteCurrency,
@@ -176,6 +268,43 @@ function serializeFamily(
   };
 }
 
+export type ExportedTransfer = {
+  id: string;
+  outflowEntryId: string;
+  inflowEntryId: string;
+  status: string;
+};
+
+export type ExportedBudget = {
+  id: string;
+  categoryId: string | null;
+  amountMinor: number;
+  active: boolean;
+};
+
+export type ExportedRecurringSeries = {
+  id: string;
+  accountId: string;
+  createdBy: string;
+  name: string;
+  merchant: string | null;
+  amountMinor: number;
+  currency: string;
+  categoryId: string | null;
+  frequency: string;
+  config: unknown;
+  nextDue: string;
+  active: boolean;
+  lastPostedEntryId: string | null;
+};
+
+export type ExportedSavedFilter = {
+  id: string;
+  userId: string;
+  name: string;
+  params: unknown;
+};
+
 export type FamilyExport = {
   version: number;
   exportedAt: string;
@@ -185,5 +314,9 @@ export type FamilyExport = {
   categories: unknown[];
   tags: unknown[];
   entries: unknown[];
+  transfers: ExportedTransfer[];
+  budgets: ExportedBudget[];
+  recurring: ExportedRecurringSeries[];
+  savedFilters: ExportedSavedFilter[];
   exchangeRates: unknown[];
 };

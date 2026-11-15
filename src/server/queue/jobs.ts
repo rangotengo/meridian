@@ -10,6 +10,7 @@ import {
   recalculateTargetedAccounts
 } from "../domain/balances-maintenance";
 import { postDueSeries } from "../domain/recurring";
+import { runScheduledBackup } from "../domain/backups";
 import { env } from "@/lib/env";
 
 export type JobPayloads = {
@@ -109,10 +110,15 @@ export async function createJobRegistry() {
     await runRecurringPost(exec);
   });
 
+  registry.set("maintenance:backup", async (_payload, exec) => {
+    await runScheduledBackup(exec);
+  });
+
   return registry;
 }
 
 export const CRON_DEFINITIONS: CronDef[] = [
+  { key: "nightly-backup", queue: "maintenance:backup", cron: "47 2 * * *" },
   { key: "nightly-balances", queue: "maintenance:balances", cron: "2 4 * * *" },
   { key: "nightly-cleanup", queue: "maintenance:cleanup", cron: "17 3 * * *" },
   { key: "recurring-post", queue: "recurring:post", cron: "*/30 * * * *" }
