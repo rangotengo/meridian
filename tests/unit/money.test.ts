@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   parseAmountToMinor,
+  tryParseAmountToMinor,
   formatMoney,
   splitEvenly,
   currencyExponent,
@@ -62,5 +63,28 @@ describe("money", () => {
   it("guards safe-integer range in sums", () => {
     expect(sumMinors([1, 2, 3])).toBe(6);
     expect(() => sumMinors([Number.MAX_SAFE_INTEGER, 1])).toThrow();
+  });
+});
+
+describe("tryParseAmountToMinor (form input)", () => {
+  it("parses valid amounts exactly like parseAmountToMinor", () => {
+    expect(tryParseAmountToMinor("10.50", "USD")).toBe(1050);
+    expect(tryParseAmountToMinor("-3", "USD")).toBe(-300);
+    expect(tryParseAmountToMinor("1,234.56", "USD")).toBe(123456);
+    expect(tryParseAmountToMinor("1000", "JPY")).toBe(1000);
+  });
+
+  it("returns null instead of throwing for empty or partial input", () => {
+    expect(tryParseAmountToMinor("", "USD")).toBeNull();
+    expect(tryParseAmountToMinor("   ", "USD")).toBeNull();
+    expect(tryParseAmountToMinor("-", "USD")).toBeNull();
+    expect(tryParseAmountToMinor("+", "USD")).toBeNull();
+  });
+
+  it("returns null instead of throwing for invalid or over-precise input", () => {
+    expect(tryParseAmountToMinor("abc", "USD")).toBeNull();
+    expect(tryParseAmountToMinor("1.2.3", "USD")).toBeNull();
+    expect(tryParseAmountToMinor("1.999", "USD")).toBeNull();
+    expect(tryParseAmountToMinor("1000.5", "JPY")).toBeNull();
   });
 });

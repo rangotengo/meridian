@@ -99,6 +99,22 @@ export function parseAmountToMinor(input: string | number, currency: string): nu
   return negative ? -minor : minor;
 }
 
+/**
+ * Non-throwing variant of {@link parseAmountToMinor} for form fields: returns
+ * null while the text is empty, partial (e.g. "-"), over-precise for the
+ * currency, or otherwise not yet a valid amount, so inputs can surface a
+ * validation state instead of
+ * throwing on every keystroke.
+ */
+export function tryParseAmountToMinor(input: string, currency: string): number | null {
+  if (input.trim() === "") return null;
+  try {
+    return parseAmountToMinor(input, currency);
+  } catch {
+    return null;
+  }
+}
+
 export function addMinor(a: number, b: number): number {
   assertSafe(a);
   assertSafe(b);
