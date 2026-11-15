@@ -19,6 +19,7 @@
     "db:migrate:down": "tsx bin/migrate.ts down",
     "db:seed": "tsx bin/seed.ts",
     "admin:promote": "tsx bin/promote-admin.ts",
+    "meroshare:rotate-key": "tsx bin/rotate-meroshare-key.ts",
     "cf:build": "opennextjs-cloudflare build",
     "cf:preview": "opennextjs-cloudflare build && wrangler dev --port 8787 --test-scheduled",
     "cf:deploy": "opennextjs-cloudflare build && opennextjs-cloudflare deploy",
