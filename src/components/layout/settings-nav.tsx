@@ -10,7 +10,8 @@ const sections = [
     links: [
       { href: "/settings", label: "Profile & preferences", exact: true },
       { href: "/settings/security", label: "Security" },
-      { href: "/settings/api-keys", label: "API keys & Shortcuts" }
+      { href: "/settings/api-keys", label: "API keys & Shortcuts" },
+      { href: "/settings/ai-agents", label: "Connected AI agents" }
     ]
   },
   {

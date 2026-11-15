@@ -22,6 +22,31 @@ import { mockMeroShareFetch } from "./meroshare-fixture";
 import { splitEntry } from "../../src/server/domain/splits";
 import { claimBatch, completeJob, enqueue } from "../../src/server/queue";
 import { createApiKey, verifyApiKey, revokeApiKey } from "../../src/server/domain/api-keys";
+import {
+  OAuthError,
+  approveAuthorizationRequest,
+  authenticateOAuthClient,
+  consumeAuthorizationRequest,
+  createAuthorizationRequest,
+  exchangeAuthorizationCode,
+  listConnectionsForUser,
+  refreshOAuthToken,
+  registerOAuthClient,
+  revokeGrant,
+  resolveMcpAccess,
+  resolveOAuthClient,
+  validateAuthorizeRequest
+} from "../../src/server/domain/oauth";
+import type { McpConfig } from "../../src/lib/env";
+import {
+  createMetadataFetcher,
+  type MetadataFetcher,
+  type MetadataTransport
+} from "../../src/server/mcp/ssrf";
+import { clearCimdCaches } from "../../src/server/mcp/cimd";
+import { SignJWT, exportJWK, generateKeyPair } from "jose";
+import { handleMcpRequest } from "../../src/server/mcp/server";
+import { createHash } from "node:crypto";
 import { parseSms } from "../../src/server/domain/sms-parser";
 import { matchAccountForSms } from "../../src/server/domain/account-matcher";
 
@@ -636,6 +661,908 @@ export class StorageProbe {
         repairJobsPending: Number(jobRows.rows[0]!.count),
         balanceMinor: Number(balanceRows.rows[0]!.balance_minor),
         again
+      });
+    }
+    if (operation === "/mcp-oauth") {
+      const exec = db as unknown as Executor;
+      const config: McpConfig = {
+        resourceUrl: "https://meridian.test/mcp",
+        issuerUrl: "https://meridian.test",
+        cimdAllowlist: [],
+        accessTokenTtlSeconds: 3600,
+        refreshTokenTtlSeconds: 30 * 24 * 3600,
+        authorizationCodeTtlSeconds: 300,
+        grantTtlSeconds: 90 * 24 * 3600
+      };
+      const user = await registerAccessHousehold(
+        exec,
+        { subject: "cloud-mcp-user", email: "mcp@example.test" },
+        { name: "MCP Tester", familyName: "MCP Family", currency: "NPR", timezone: "UTC" }
+      );
+      const other = await registerAccessHousehold(
+        exec,
+        { subject: "cloud-mcp-other", email: "mcp-other@example.test" },
+        { name: "Other", familyName: "Other Family", currency: "NPR", timezone: "UTC" }
+      );
+      const actor: Actor = {
+        userId: user.id,
+        familyId: user.familyId,
+        email: user.email,
+        name: user.name,
+        familyRole: "admin",
+        platformRole: "user",
+        sessionId: "cloud-session",
+        emailVerified: true
+      };
+      const redirectUri = "http://127.0.0.1:8910/callback";
+      const { client: dcr } = await registerOAuthClient(exec, {
+        clientName: "Cloud Claude",
+        redirectUris: [redirectUri]
+      });
+      const client = (await resolveOAuthClient(exec, dcr.id))!;
+      const pkcePair = () => {
+        const verifier = `${crypto.randomUUID()}${crypto.randomUUID()}`;
+        const challenge = createHash("sha256").update(verifier).digest("base64url");
+        return { verifier, challenge };
+      };
+      const newCode = async () => {
+        const { verifier, challenge } = pkcePair();
+        const request = await validateAuthorizeRequest(
+          exec,
+          {
+            clientId: client.clientId,
+            redirectUri,
+            responseType: "code",
+            codeChallenge: challenge,
+            codeChallengeMethod: "S256",
+            scope: "finance:read offline_access",
+            resource: config.resourceUrl,
+            state: null
+          },
+          config
+        );
+        const { record, csrfToken } = await createAuthorizationRequest(exec, { actor, request });
+        const consumed = await consumeAuthorizationRequest(exec, {
+          requestId: record.id,
+          actor,
+          csrfToken
+        });
+        const { code } = await approveAuthorizationRequest(exec, consumed, config);
+        return { code, verifier };
+      };
+      const exchange = (code: string, verifier: string) =>
+        exchangeAuthorizationCode(
+          exec,
+          { code, redirectUri, codeVerifier: verifier, resource: config.resourceUrl },
+          client,
+          config
+        );
+      const isInvalidGrant = (e: unknown) => e instanceof OAuthError && e.error === "invalid_grant";
+
+      // Happy path + per-call resolution.
+      const f1 = await newCode();
+      const t1 = await exchange(f1.code, f1.verifier);
+      const access1 = await resolveMcpAccess(exec, t1.accessToken, config);
+
+      // Sequential code replay kills the family.
+      let codeReplayRejected = false;
+      try {
+        await exchange(f1.code, f1.verifier);
+      } catch (e) {
+        codeReplayRejected = isInvalidGrant(e);
+      }
+      const replayKillsTokens = (await resolveMcpAccess(exec, t1.accessToken, config)) === null;
+
+      // Concurrent exchange of one code: exactly one winner, family revoked.
+      const f2 = await newCode();
+      const race = await Promise.allSettled([
+        exchange(f2.code, f2.verifier),
+        exchange(f2.code, f2.verifier)
+      ]);
+      const raceWinners = race.filter((r) => r.status === "fulfilled");
+      const concurrentExchangeSingleWinner = raceWinners.length === 1;
+      const winnerTokens =
+        raceWinners.length === 1
+          ? (raceWinners[0] as PromiseFulfilledResult<typeof t1>).value
+          : null;
+      const concurrentExchangeFamilyRevoked = winnerTokens
+        ? (await resolveMcpAccess(exec, winnerTokens.accessToken, config)) === null
+        : false;
+
+      // Refresh rotation + sequential reuse detection.
+      const f3 = await newCode();
+      const t3 = await exchange(f3.code, f3.verifier);
+      const pair2 = await refreshOAuthToken(
+        exec,
+        { refreshToken: t3.refreshToken! },
+        client,
+        config
+      );
+      let refreshReuseRejected = false;
+      try {
+        await refreshOAuthToken(exec, { refreshToken: t3.refreshToken! }, client, config);
+      } catch (e) {
+        refreshReuseRejected = isInvalidGrant(e);
+      }
+      const refreshReuseKillsFamily =
+        (await resolveMcpAccess(exec, pair2.accessToken, config)) === null;
+
+      // Concurrent refresh with one token: exactly one winner.
+      const f4 = await newCode();
+      const t4 = await exchange(f4.code, f4.verifier);
+      const refreshRace = await Promise.allSettled([
+        refreshOAuthToken(exec, { refreshToken: t4.refreshToken! }, client, config),
+        refreshOAuthToken(exec, { refreshToken: t4.refreshToken! }, client, config)
+      ]);
+      const concurrentRefreshSingleWinner =
+        refreshRace.filter((r) => r.status === "fulfilled").length === 1;
+
+      // P1-2 (cloud adaptation): after a reuse invalidation, a
+      // DESCENDANT refresh must be rejected and the descendant pair
+      // dead. The DO executor serializes whole transactions behind its
+      // mutex, so the Postgres lock interleavings have no analogue
+      // here; the invariant outcome is what is asserted.
+      const f6 = await newCode();
+      const t6 = await exchange(f6.code, f6.verifier);
+      const pair6 = await refreshOAuthToken(
+        exec,
+        { refreshToken: t6.refreshToken! },
+        client,
+        config
+      );
+      try {
+        await refreshOAuthToken(exec, { refreshToken: t6.refreshToken! }, client, config);
+      } catch {
+        /* replaying the rotated-out token: invalidates the family */
+      }
+      let descendantRefreshRejected = false;
+      try {
+        await refreshOAuthToken(exec, { refreshToken: pair6.refreshToken! }, client, config);
+      } catch (e) {
+        descendantRefreshRejected = isInvalidGrant(e);
+      }
+      const descendantPairDead = (await resolveMcpAccess(exec, pair6.accessToken, config)) === null;
+
+      // P2-8: the STORED resource governs refresh — a config change
+      // must not retarget stored credentials to the new resource.
+      const configB = { ...config, resourceUrl: "https://other-resource.test/mcp" };
+      const f7 = await newCode();
+      const t7 = await exchange(f7.code, f7.verifier);
+      let resourceChangeRefreshRejected = false;
+      try {
+        await refreshOAuthToken(
+          exec,
+          { refreshToken: t7.refreshToken!, resource: configB.resourceUrl },
+          client,
+          configB
+        );
+      } catch (e) {
+        resourceChangeRefreshRejected = isInvalidGrant(e);
+      }
+      const resourceChangeAccessRejected =
+        (await resolveMcpAccess(exec, t7.accessToken, configB)) === null;
+
+      // P2-6: private_key_jwt assertions — exp required, jti claimed
+      // exactly once (sequential replay rejected here; the concurrent
+      // claim race is covered on Postgres where connections are real).
+      clearCimdCaches();
+      const { publicKey, privateKey } = await generateKeyPair("RS256");
+      const jwk = await exportJWK(publicKey);
+      jwk.kid = "cloud-claims-key";
+      const claimsUrl = "https://claims.example.test/client.json";
+      const claimsDoc = {
+        client_id: claimsUrl,
+        client_name: "Cloud Claims",
+        redirect_uris: ["https://chatgpt.com/connector_platform_oauth_redirect"],
+        token_endpoint_auth_method: "private_key_jwt",
+        jwks: { keys: [jwk] }
+      };
+      const claimsFetcher: MetadataFetcher = async () => claimsDoc;
+      const claimsConfig = { ...config, cimdAllowlist: [claimsUrl] };
+      const assertion = await new SignJWT({})
+        .setProtectedHeader({ alg: "RS256", kid: "cloud-claims-key" })
+        .setIssuer(claimsUrl)
+        .setSubject(claimsUrl)
+        .setAudience("https://meridian.test/oauth/token")
+        .setIssuedAt()
+        .setExpirationTime("2m")
+        .setJti("cloud-jti-1")
+        .sign(privateKey);
+      const authArgs = {
+        clientId: claimsUrl,
+        clientAssertion: assertion,
+        clientAssertionType: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+      };
+      let assertionFirstOk = false;
+      try {
+        await authenticateOAuthClient(exec, authArgs, claimsConfig, claimsFetcher);
+        assertionFirstOk = true;
+      } catch {
+        assertionFirstOk = false;
+      }
+      let assertionReplayRejected = false;
+      try {
+        await authenticateOAuthClient(exec, authArgs, claimsConfig, claimsFetcher);
+      } catch (e) {
+        assertionReplayRejected = e instanceof OAuthError && e.error === "invalid_client";
+      }
+      const assertionNow = Math.floor(Date.now() / 1000);
+      const signTimedAssertion = (iat: number, exp: number, jti: string) =>
+        new SignJWT({})
+          .setProtectedHeader({ alg: "RS256", kid: "cloud-claims-key" })
+          .setIssuer(claimsUrl)
+          .setSubject(claimsUrl)
+          .setAudience("https://meridian.test/oauth/token")
+          .setIssuedAt(iat)
+          .setExpirationTime(exp)
+          .setJti(jti)
+          .sign(privateKey);
+      const skewedAssertion = await signTimedAssertion(
+        assertionNow - 120,
+        assertionNow - 5,
+        "cloud-skew"
+      );
+      const skewedArgs = { ...authArgs, clientAssertion: skewedAssertion };
+      await authenticateOAuthClient(exec, skewedArgs, claimsConfig, claimsFetcher);
+      let assertionSkewReplayRejected = false;
+      try {
+        await authenticateOAuthClient(exec, skewedArgs, claimsConfig, claimsFetcher);
+      } catch (e) {
+        assertionSkewReplayRejected = e instanceof OAuthError && e.error === "invalid_client";
+      }
+      let assertionFutureRejected = false;
+      try {
+        await authenticateOAuthClient(
+          exec,
+          {
+            ...authArgs,
+            clientAssertion: await signTimedAssertion(
+              assertionNow + 3600,
+              assertionNow + 3720,
+              "cloud-future"
+            )
+          },
+          claimsConfig,
+          claimsFetcher
+        );
+      } catch (e) {
+        assertionFutureRejected = e instanceof OAuthError && e.error === "invalid_client";
+      }
+      const noExpAssertion = await new SignJWT({})
+        .setProtectedHeader({ alg: "RS256", kid: "cloud-claims-key" })
+        .setIssuer(claimsUrl)
+        .setSubject(claimsUrl)
+        .setAudience("https://meridian.test/oauth/token")
+        .setIssuedAt()
+        .setJti("cloud-jti-2")
+        .sign(privateKey);
+      let assertionMissingExpRejected = false;
+      try {
+        await authenticateOAuthClient(
+          exec,
+          { ...authArgs, clientAssertion: noExpAssertion },
+          claimsConfig,
+          claimsFetcher
+        );
+      } catch (e) {
+        assertionMissingExpRejected = e instanceof OAuthError && e.error === "invalid_client";
+      }
+
+      // Household move: rejected, never redirected to the new household.
+      const f5 = await newCode();
+      const t5 = await exchange(f5.code, f5.verifier);
+      await exec.execute(sql`UPDATE users SET family_id = ${other.familyId} WHERE id = ${user.id}`);
+      const householdMoveRejected = (await resolveMcpAccess(exec, t5.accessToken, config)) === null;
+
+      // Consent record bindings: CSRF + single use.
+      const { challenge } = pkcePair();
+      const request6 = await validateAuthorizeRequest(
+        exec,
+        {
+          clientId: client.clientId,
+          redirectUri,
+          responseType: "code",
+          codeChallenge: challenge,
+          codeChallengeMethod: "S256",
+          scope: "finance:read",
+          resource: config.resourceUrl,
+          state: null
+        },
+        config
+      );
+      const { record: rec6, csrfToken: csrf6 } = await createAuthorizationRequest(exec, {
+        actor,
+        request: request6
+      });
+      let consentCsrfRejected = false;
+      try {
+        await consumeAuthorizationRequest(exec, { requestId: rec6.id, actor, csrfToken: "bogus" });
+      } catch {
+        consentCsrfRejected = true;
+      }
+      await consumeAuthorizationRequest(exec, { requestId: rec6.id, actor, csrfToken: csrf6 });
+      let consentSingleUse = false;
+      try {
+        await consumeAuthorizationRequest(exec, { requestId: rec6.id, actor, csrfToken: csrf6 });
+      } catch {
+        consentSingleUse = true;
+      }
+
+      // CIMD gate on the Workers backend: fetching is restricted to
+      // operator-allowlisted URLs (no DNS pinning exists here).
+      const docUrl = "https://clients.example.test/client.json";
+      const fakeFetcher: MetadataFetcher = async () => ({
+        client_id: docUrl,
+        client_name: "CIMD",
+        redirect_uris: ["https://chatgpt.com/connector_platform_oauth_redirect"],
+        token_endpoint_auth_method: "none"
+      });
+      const cimdBlockedWithoutAllowlist =
+        (await resolveOAuthClient(exec, docUrl, fakeFetcher, [])) === null;
+      const cimdAllowedWithAllowlist =
+        (await resolveOAuthClient(exec, docUrl, fakeFetcher, [docUrl])) !== null;
+
+      return Response.json({
+        resolved:
+          access1 !== null &&
+          access1.actor.familyId === user.familyId &&
+          access1.actor.platformRole === "user",
+        codeReplayRejected,
+        replayKillsTokens,
+        concurrentExchangeSingleWinner,
+        concurrentExchangeFamilyRevoked,
+        refreshReuseRejected,
+        refreshReuseKillsFamily,
+        concurrentRefreshSingleWinner,
+        householdMoveRejected,
+        consentCsrfRejected,
+        consentSingleUse,
+        cimdBlockedWithoutAllowlist,
+        cimdAllowedWithAllowlist,
+        descendantRefreshRejected,
+        descendantPairDead,
+        resourceChangeRefreshRejected,
+        resourceChangeAccessRejected,
+        assertionFirstOk,
+        assertionReplayRejected,
+        assertionSkewReplayRejected,
+        assertionFutureRejected,
+        assertionMissingExpRejected
+      });
+    }
+    if (operation === "/mcp-ssrf-redirect") {
+      // P1-4: on the Workers path (resolveHost is null in production)
+      // the CIMD allowlist must be enforced before EVERY hop — an
+      // approved URL redirecting off-allowlist must never be fetched.
+      const APPROVED = "https://approved.example/client.json";
+      const APPROVED2 = "https://approved.example/jwks.json";
+      const UNAPPROVED = "https://unapproved.example/client.json";
+      const seenBlocked: string[] = [];
+      const redirectOut: MetadataTransport = async (url) => {
+        seenBlocked.push(url.toString());
+        if (url.toString() === APPROVED) {
+          return { status: 302, contentType: null, location: UNAPPROVED, body: "" };
+        }
+        return {
+          status: 200,
+          contentType: "application/json",
+          location: null,
+          body: "{}"
+        };
+      };
+      const fetcherBlocked = createMetadataFetcher({
+        resolveHost: async () => null,
+        transport: redirectOut
+      });
+      let blockedThrew = false;
+      try {
+        await fetcherBlocked(APPROVED, { allowlist: [APPROVED] });
+      } catch {
+        blockedThrew = true;
+      }
+      const redirectToUnapprovedBlocked = blockedThrew && !seenBlocked.includes(UNAPPROVED);
+
+      const seenOk: string[] = [];
+      const redirectIn: MetadataTransport = async (url) => {
+        seenOk.push(url.toString());
+        if (url.toString() === APPROVED) {
+          return { status: 302, contentType: null, location: APPROVED2, body: "" };
+        }
+        return {
+          status: 200,
+          contentType: "application/json",
+          location: null,
+          body: JSON.stringify({ ok: true })
+        };
+      };
+      const fetcherOk = createMetadataFetcher({
+        resolveHost: async () => null,
+        transport: redirectIn
+      });
+      let positiveDoc: unknown = null;
+      try {
+        positiveDoc = await fetcherOk(APPROVED, { allowlist: [APPROVED, APPROVED2] });
+      } catch {
+        positiveDoc = null;
+      }
+      const redirectWithinAllowlistAllowed =
+        (positiveDoc as { ok?: boolean } | null)?.ok === true && seenOk.length === 2;
+
+      return Response.json({ redirectToUnapprovedBlocked, redirectWithinAllowlistAllowed });
+    }
+    if (operation === "/mcp-tools") {
+      const exec = db as unknown as Executor;
+      const config: McpConfig = {
+        resourceUrl: "https://meridian.test/mcp",
+        issuerUrl: "https://meridian.test",
+        cimdAllowlist: [],
+        accessTokenTtlSeconds: 3600,
+        refreshTokenTtlSeconds: 30 * 24 * 3600,
+        authorizationCodeTtlSeconds: 300,
+        grantTtlSeconds: 90 * 24 * 3600
+      };
+      const user = await registerAccessHousehold(
+        exec,
+        { subject: "cloud-mcp-tools-user", email: "mcp-tools@example.test" },
+        { name: "Tools Tester", familyName: "Tools Family", currency: "NPR", timezone: "UTC" }
+      );
+      const other = await registerAccessHousehold(
+        exec,
+        { subject: "cloud-mcp-tools-other", email: "mcp-tools-other@example.test" },
+        { name: "Other", familyName: "Other Tools Family", currency: "NPR", timezone: "UTC" }
+      );
+      const actorFor = (u: typeof user, sessionId: string): Actor => ({
+        userId: u.id,
+        familyId: u.familyId,
+        email: u.email,
+        name: u.name,
+        familyRole: "admin",
+        platformRole: "user",
+        sessionId,
+        emailVerified: true
+      });
+      const actor = actorFor(user, "cloud-tools-session");
+      const otherActor = actorFor(other, "cloud-tools-other-session");
+      const account = await createAccount(exec, actor, {
+        name: "Tools Cash",
+        type: "depository",
+        currency: "NPR",
+        openedOn: isoDaysAgo(10),
+        openingBalanceDisplayMinor: 100_000,
+        includedInReports: true,
+        joint: false
+      });
+      await addTransaction(exec, actor, {
+        accountId: account.accountId,
+        date: isoDaysAgo(0),
+        amountLedgerMinor: 25_000,
+        name: "Weekly shop",
+        merchant: "SuperStore",
+        notes: "cloud-secret-note"
+      });
+      const otherAccount = await createAccount(exec, otherActor, {
+        name: "Other Cash",
+        type: "depository",
+        currency: "NPR",
+        openedOn: isoDaysAgo(10),
+        openingBalanceDisplayMinor: 50_000,
+        includedInReports: true,
+        joint: false
+      });
+      await addTransaction(exec, otherActor, {
+        accountId: otherAccount.accountId,
+        date: isoDaysAgo(0),
+        amountLedgerMinor: 9_999,
+        name: "Other purchase",
+        merchant: "OtherFamMerchant"
+      });
+
+      const redirectUri = "http://127.0.0.1:8910/callback";
+      const { client: dcr } = await registerOAuthClient(exec, {
+        clientName: "Cloud Tools",
+        redirectUris: [redirectUri]
+      });
+      const client = (await resolveOAuthClient(exec, dcr.id))!;
+      const connect = async (scope: string) => {
+        const verifier = `${crypto.randomUUID()}${crypto.randomUUID()}`;
+        const challenge = createHash("sha256").update(verifier).digest("base64url");
+        const request = await validateAuthorizeRequest(
+          exec,
+          {
+            clientId: client.clientId,
+            redirectUri,
+            responseType: "code",
+            codeChallenge: challenge,
+            codeChallengeMethod: "S256",
+            scope,
+            resource: config.resourceUrl,
+            state: null
+          },
+          config
+        );
+        const { record, csrfToken } = await createAuthorizationRequest(exec, { actor, request });
+        const consumed = await consumeAuthorizationRequest(exec, {
+          requestId: record.id,
+          actor,
+          csrfToken
+        });
+        const { code } = await approveAuthorizationRequest(exec, consumed, config);
+        return exchangeAuthorizationCode(
+          exec,
+          { code, redirectUri, codeVerifier: verifier, resource: config.resourceUrl },
+          client,
+          config
+        );
+      };
+      type ToolOutcome = {
+        isError?: boolean;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        data?: any;
+      };
+      const callTool = async (
+        accessToken: string,
+        name: string,
+        args: Record<string, unknown> = {}
+      ): Promise<ToolOutcome> => {
+        const access = await resolveMcpAccess(exec, accessToken, config);
+        if (!access) return { isError: true };
+        const res = await handleMcpRequest(
+          new Request("https://meridian.test/mcp", {
+            method: "POST",
+            headers: {
+              host: "meridian.test",
+              "content-type": "application/json",
+              accept: "application/json, text/event-stream"
+            },
+            body: JSON.stringify({
+              jsonrpc: "2.0",
+              id: 1,
+              method: "tools/call",
+              params: { name, arguments: args }
+            })
+          }),
+          { exec, access, config }
+        );
+        const text = await res.text();
+        let parsed: { result?: { isError?: boolean; structuredContent?: unknown } } | null = null;
+        if (res.headers.get("content-type")?.includes("text/event-stream")) {
+          for (const line of text.split("\n")) {
+            if (line.startsWith("data:")) {
+              try {
+                parsed = JSON.parse(line.slice(5));
+              } catch {
+                /* keep scanning */
+              }
+            }
+          }
+        } else if (text) {
+          try {
+            parsed = JSON.parse(text);
+          } catch {
+            parsed = null;
+          }
+        }
+        return { isError: parsed?.result?.isError, data: parsed?.result?.structuredContent };
+      };
+
+      const full = await connect(
+        "finance:read transactions:read transactions:notes offline_access"
+      );
+      const txnOnly = await connect("transactions:read offline_access");
+      const financeOnly = await connect("finance:read offline_access");
+
+      const accountsRes = await callTool(full.accessToken, "list_accounts");
+      const listAccountsOk =
+        accountsRes.data?.accounts?.length === 1 &&
+        accountsRes.data.accounts[0].amountMinor === "75000" &&
+        accountsRes.data.accounts[0].currency === "NPR";
+
+      const searchRes = await callTool(full.accessToken, "search_transactions", {
+        query: "Weekly"
+      });
+      const searchOk =
+        searchRes.data?.page?.totalMatching === 1 &&
+        searchRes.data.transactions[0].amountMinor === "25000";
+
+      const noNotesList = await callTool(txnOnly.accessToken, "search_transactions", {});
+      const notesExcludedWithoutScope =
+        noNotesList.data?.notesIncluded === false &&
+        Array.isArray(noNotesList.data?.transactions) &&
+        noNotesList.data.transactions.every((t: { notes: unknown }) => t.notes === null);
+      const noNotesSearch = await callTool(txnOnly.accessToken, "search_transactions", {
+        query: "cloud-secret-note"
+      });
+      const noteTextNotSearchable = noNotesSearch.data?.page?.totalMatching === 0;
+      const withNotes = await callTool(full.accessToken, "search_transactions", {
+        query: "cloud-secret-note"
+      });
+      const notesIncludedWithScope =
+        withNotes.data?.notesIncluded === true &&
+        withNotes.data?.page?.totalMatching === 1 &&
+        withNotes.data.transactions[0].notes === "cloud-secret-note";
+
+      const financeDenied = await callTool(txnOnly.accessToken, "list_accounts");
+      const financeDeniedForTransactionsGrant = financeDenied.isError === true;
+      const searchDenied = await callTool(financeOnly.accessToken, "search_transactions");
+      const searchDeniedForFinanceGrant = searchDenied.isError === true;
+
+      const cross = await callTool(full.accessToken, "search_transactions", {
+        query: "OtherFamMerchant"
+      });
+      const crossHouseholdIsolated = cross.data?.page?.totalMatching === 0;
+
+      const breakdown = await callTool(full.accessToken, "get_spending_breakdown", {
+        groupBy: "merchant"
+      });
+      const breakdownMerchantOk =
+        Array.isArray(breakdown.data?.groups) &&
+        breakdown.data.groups.some(
+          (g: { merchant: string; total: { amountMinor: string } }) =>
+            g.merchant === "SuperStore" && g.total.amountMinor === "25000"
+        );
+
+      const summary = await callTool(full.accessToken, "get_financial_summary");
+      const summaryOk = summary.isError !== true && summary.data?.household?.baseCurrency === "NPR";
+
+      // P1-1: a ceiling-restricted summary excludes the second account
+      // from every figure, not just the account list.
+      const vault = await createAccount(exec, actor, {
+        name: "Excluded Vault",
+        type: "depository",
+        currency: "NPR",
+        openedOn: isoDaysAgo(10),
+        openingBalanceDisplayMinor: 900_000,
+        includedInReports: true,
+        joint: false
+      });
+      await addTransaction(exec, actor, {
+        accountId: vault.accountId,
+        date: isoDaysAgo(0),
+        amountLedgerMinor: 40_000,
+        name: "Vault spend"
+      });
+      const connectWithCeiling = async (accountIds: string[]) => {
+        const verifier = `${crypto.randomUUID()}${crypto.randomUUID()}`;
+        const challenge = createHash("sha256").update(verifier).digest("base64url");
+        const request = await validateAuthorizeRequest(
+          exec,
+          {
+            clientId: client.clientId,
+            redirectUri,
+            responseType: "code",
+            codeChallenge: challenge,
+            codeChallengeMethod: "S256",
+            scope: "finance:read offline_access",
+            resource: config.resourceUrl,
+            state: null
+          },
+          config
+        );
+        const { record, csrfToken } = await createAuthorizationRequest(exec, { actor, request });
+        const consumed = await consumeAuthorizationRequest(exec, {
+          requestId: record.id,
+          actor,
+          csrfToken
+        });
+        const { grant, code } = await approveAuthorizationRequest(exec, consumed, config);
+        await exec.execute(
+          sql`UPDATE oauth_grants SET account_ids = ${JSON.stringify(accountIds)} WHERE id = ${grant.id}`
+        );
+        return exchangeAuthorizationCode(
+          exec,
+          { code, redirectUri, codeVerifier: verifier, resource: config.resourceUrl },
+          client,
+          config
+        );
+      };
+      const ceilingTokens = await connectWithCeiling([account.accountId]);
+      const ceilingSummary = await callTool(ceilingTokens.accessToken, "get_financial_summary");
+      const summaryExcludesCeilingAccount =
+        ceilingSummary.data?.accounts?.length === 1 &&
+        ceilingSummary.data.netWorth?.amountMinor === "75000" &&
+        ceilingSummary.data.expensesThisMonth?.amountMinor === "25000";
+
+      // P2-7a: deleting the vault's snapshot for today makes today's
+      // net-worth point partial — it must be flagged, not complete.
+      await exec.execute(
+        sql`DELETE FROM balances WHERE account_id = ${vault.accountId} AND as_of = ${isoDaysAgo(0)}`
+      );
+      const history = await callTool(full.accessToken, "get_net_worth_history", { days: 1 });
+      const netWorthPartialFlagged =
+        history.data?.points?.length === 1 &&
+        history.data.points[0].complete === false &&
+        Array.isArray(history.data.points[0].missingAccountIds) &&
+        history.data.points[0].missingAccountIds.includes(vault.accountId) &&
+        history.data.coverage?.complete === false &&
+        history.data.coverage?.missingDays === 0;
+
+      return Response.json({
+        listAccountsOk,
+        searchOk,
+        notesExcludedWithoutScope,
+        noteTextNotSearchable,
+        notesIncludedWithScope,
+        financeDeniedForTransactionsGrant,
+        searchDeniedForFinanceGrant,
+        crossHouseholdIsolated,
+        breakdownMerchantOk,
+        summaryOk,
+        summaryExcludesCeilingAccount,
+        netWorthPartialFlagged
+      });
+    }
+    if (operation === "/mcp-settings") {
+      // Stage 4: consent account picker + Connected AI agents settings
+      // data (listConnectionsForUser) on the cloud backend.
+      const exec = db as unknown as Executor;
+      const config: McpConfig = {
+        resourceUrl: "https://meridian.test/mcp",
+        issuerUrl: "https://meridian.test",
+        cimdAllowlist: [],
+        accessTokenTtlSeconds: 3600,
+        refreshTokenTtlSeconds: 30 * 24 * 3600,
+        authorizationCodeTtlSeconds: 300,
+        grantTtlSeconds: 90 * 24 * 3600
+      };
+      const user = await registerAccessHousehold(
+        exec,
+        { subject: "cloud-mcp-settings-user", email: "mcp-settings@example.test" },
+        { name: "Settings Tester", familyName: "Settings Family", currency: "NPR", timezone: "UTC" }
+      );
+      const other = await registerAccessHousehold(
+        exec,
+        { subject: "cloud-mcp-settings-other", email: "mcp-settings-other@example.test" },
+        { name: "Other", familyName: "Other Settings Family", currency: "NPR", timezone: "UTC" }
+      );
+      const actorFor = (u: typeof user, sessionId: string): Actor => ({
+        userId: u.id,
+        familyId: u.familyId,
+        email: u.email,
+        name: u.name,
+        familyRole: "admin",
+        platformRole: "user",
+        sessionId,
+        emailVerified: true
+      });
+      const actor = actorFor(user, "cloud-settings-session");
+      const otherActor = actorFor(other, "cloud-settings-other-session");
+      const accountArgs = {
+        type: "depository" as const,
+        currency: "NPR",
+        openedOn: isoDaysAgo(10),
+        openingBalanceDisplayMinor: 100_000,
+        includedInReports: true,
+        joint: false
+      };
+      const kept = await createAccount(exec, actor, { ...accountArgs, name: "Settings Cash" });
+      await createAccount(exec, actor, { ...accountArgs, name: "Settings Vault" });
+      const foreign = await createAccount(exec, otherActor, {
+        ...accountArgs,
+        name: "Foreign Cash"
+      });
+
+      const redirectUri = "http://127.0.0.1:8910/callback";
+      const { client: dcr } = await registerOAuthClient(exec, {
+        clientName: "Cloud Settings",
+        redirectUris: [redirectUri]
+      });
+      const client = (await resolveOAuthClient(exec, dcr.id))!;
+      const newRequest = async () => {
+        const verifier = `${crypto.randomUUID()}${crypto.randomUUID()}`;
+        const challenge = createHash("sha256").update(verifier).digest("base64url");
+        const request = await validateAuthorizeRequest(
+          exec,
+          {
+            clientId: client.clientId,
+            redirectUri,
+            responseType: "code",
+            codeChallenge: challenge,
+            codeChallengeMethod: "S256",
+            scope: "finance:read offline_access",
+            resource: config.resourceUrl,
+            state: null
+          },
+          config
+        );
+        const { record, csrfToken } = await createAuthorizationRequest(exec, { actor, request });
+        const consumed = await consumeAuthorizationRequest(exec, {
+          requestId: record.id,
+          actor,
+          csrfToken
+        });
+        return { consumed, verifier };
+      };
+
+      // Picker: a foreign account id rejects the whole approval.
+      let selectionRejectsForeign = false;
+      try {
+        const { consumed } = await newRequest();
+        await approveAuthorizationRequest(exec, consumed, config, {
+          actor,
+          accountIds: [foreign.accountId]
+        });
+      } catch (e) {
+        selectionRejectsForeign = e instanceof OAuthError && e.error === "invalid_request";
+      }
+
+      // Picker: the validated subset is stored on the grant.
+      const { consumed, verifier } = await newRequest();
+      const { grant, code } = await approveAuthorizationRequest(exec, consumed, config, {
+        actor,
+        accountIds: [kept.accountId]
+      });
+      const ceilingStored = grant.accountIds.length === 1 && grant.accountIds[0] === kept.accountId;
+
+      const before = await listConnectionsForUser(exec, user.id);
+      const listShowsConnection =
+        before.length === 1 &&
+        before[0]!.grant.id === grant.id &&
+        before[0]!.familyName === "Settings Family" &&
+        before[0]!.status === "active" &&
+        before[0]!.grant.lastUsedAt === null &&
+        before[0]!.accounts?.length === 1 &&
+        before[0]!.accounts[0]!.name === "Settings Cash" &&
+        before[0]!.history.map((h) => h.action).join(",") === "oauth_grant.created";
+      const otherUserListEmpty = (await listConnectionsForUser(exec, other.id)).length === 0;
+
+      // A real tool call advances last-used and lands in the history.
+      const tokens = await exchangeAuthorizationCode(
+        exec,
+        { code, redirectUri, codeVerifier: verifier, resource: config.resourceUrl },
+        client,
+        config
+      );
+      const access = await resolveMcpAccess(exec, tokens.accessToken, config);
+      let toolCalled = false;
+      let toolResponseText = "";
+      if (access) {
+        const res = await handleMcpRequest(
+          new Request("https://meridian.test/mcp", {
+            method: "POST",
+            headers: {
+              host: "meridian.test",
+              "content-type": "application/json",
+              accept: "application/json, text/event-stream"
+            },
+            body: JSON.stringify({
+              jsonrpc: "2.0",
+              id: 1,
+              method: "tools/call",
+              params: { name: "get_financial_summary", arguments: {} }
+            })
+          }),
+          { exec, access, config }
+        );
+        // The body must be consumed: the handler's trailing work (the
+        // audit insert) completes as the SSE stream is read, exactly as
+        // a real client reading the response would observe.
+        toolResponseText = await res.text();
+        toolCalled = res.status === 200 && !toolResponseText.includes('"isError":true');
+      }
+      const afterCall = await listConnectionsForUser(exec, user.id);
+      const lastUsedAdvances =
+        toolCalled &&
+        afterCall[0]!.grant.lastUsedAt !== null &&
+        afterCall[0]!.history.some(
+          (h) => h.action === "mcp.tool_called" && h.tool === "get_financial_summary"
+        );
+
+      // Disconnect: status flips, history records it, tokens die.
+      await revokeGrant(exec, grant.id, user.id);
+      const afterRevoke = await listConnectionsForUser(exec, user.id);
+      const revokedStatusShown =
+        afterRevoke[0]!.status === "revoked" &&
+        afterRevoke[0]!.history[0]!.action === "oauth_grant.revoked";
+      const revokeKillsAccess = (await resolveMcpAccess(exec, tokens.accessToken, config)) === null;
+
+      return Response.json({
+        ceilingStored,
+        selectionRejectsForeign,
+        listShowsConnection,
+        otherUserListEmpty,
+        lastUsedAdvances,
+        revokedStatusShown,
+        revokeKillsAccess
       });
     }
     return new Response("Unknown probe", { status: 404 });

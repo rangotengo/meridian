@@ -11,6 +11,7 @@ import {
 } from "../domain/balances-maintenance";
 import { postDueSeries } from "../domain/recurring";
 import { runScheduledBackup } from "../domain/backups";
+import { cleanupOAuthHousekeeping } from "../domain/oauth";
 import { env } from "@/lib/env";
 
 export type JobPayloads = {
@@ -101,6 +102,7 @@ export async function createJobRegistry() {
 
   registry.set("maintenance:cleanup", async (_payload, exec) => {
     await purgeExpiredSessions(exec);
+    await cleanupOAuthHousekeeping(exec);
     await pruneRateLimitCounters(exec);
     await pruneDebugLogs(exec, env.DEBUG_LOG_RETENTION_DAYS);
     await pruneFinishedJobs(exec, 14);

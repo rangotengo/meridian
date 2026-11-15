@@ -786,3 +786,161 @@ export const meroShareTransactions = sqliteTable(
     )
   ]
 );
+
+/**
+ * MCP OAuth 2.1 authorization-server tables — cloud mirror of the Postgres
+ * schema (see postgres-schema.ts for the design notes).
+ */
+export const oauthClients = sqliteTable("oauth_clients", {
+  id: text("id").primaryKey(),
+  clientName: text("client_name").notNull(),
+  redirectUris: text("redirect_uris", { mode: "json" }).$type<string[]>().notNull().default([]),
+  tokenEndpointAuthMethod: text("token_endpoint_auth_method").notNull().default("none"),
+  secretHash: text("secret_hash"),
+  createdAt: isoTimestamp("created_at")
+    .notNull()
+    .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`),
+  updatedAt: isoTimestamp("updated_at")
+    .notNull()
+    .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`)
+});
+
+export const oauthGrants = sqliteTable(
+  "oauth_grants",
+  {
+    id: text("id")
+      .primaryKey()
+      .$defaultFn(() => crypto.randomUUID()),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    familyId: text("family_id")
+      .notNull()
+      .references(() => families.id, { onDelete: "cascade" }),
+    clientId: text("client_id").notNull(),
+    clientName: text("client_name").notNull(),
+    scopes: text("scopes", { mode: "json" }).$type<string[]>().notNull().default([]),
+    accountIds: text("account_ids", { mode: "json" }).$type<string[]>().notNull().default([]),
+    status: text("status").notNull().default("active"),
+    expiresAt: isoTimestamp("expires_at").notNull(),
+    lastUsedAt: isoTimestamp("last_used_at"),
+    revokedAt: isoTimestamp("revoked_at"),
+    createdAt: isoTimestamp("created_at")
+      .notNull()
+      .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`),
+    updatedAt: isoTimestamp("updated_at")
+      .notNull()
+      .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`)
+  },
+  (t) => [
+    index("oauth_grants_user_idx").on(t.userId),
+    index("oauth_grants_client_idx").on(t.clientId),
+    index("oauth_grants_family_idx").on(t.familyId)
+  ]
+);
+
+export const oauthAuthorizationCodes = sqliteTable(
+  "oauth_authorization_codes",
+  {
+    id: text("id")
+      .primaryKey()
+      .$defaultFn(() => crypto.randomUUID()),
+    codeHash: text("code_hash").notNull().unique(),
+    grantId: text("grant_id")
+      .notNull()
+      .references(() => oauthGrants.id, { onDelete: "cascade" }),
+    clientId: text("client_id").notNull(),
+    redirectUri: text("redirect_uri").notNull(),
+    resource: text("resource").notNull(),
+    codeChallenge: text("code_challenge").notNull(),
+    usedAt: isoTimestamp("used_at"),
+    issuedAt: isoTimestamp("issued_at"),
+    invalidatedAt: isoTimestamp("invalidated_at"),
+    expiresAt: isoTimestamp("expires_at").notNull(),
+    createdAt: isoTimestamp("created_at")
+      .notNull()
+      .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`)
+  },
+  (t) => [
+    uniqueIndex("oauth_authorization_codes_hash_unique").on(t.codeHash),
+    index("oauth_authorization_codes_grant_idx").on(t.grantId)
+  ]
+);
+
+export const oauthTokens = sqliteTable(
+  "oauth_tokens",
+  {
+    id: text("id")
+      .primaryKey()
+      .$defaultFn(() => crypto.randomUUID()),
+    tokenHash: text("token_hash").notNull().unique(),
+    grantId: text("grant_id")
+      .notNull()
+      .references(() => oauthGrants.id, { onDelete: "cascade" }),
+    codeId: text("code_id").references(() => oauthAuthorizationCodes.id, {
+      onDelete: "set null"
+    }),
+    kind: text("kind").notNull(),
+    resource: text("resource").notNull(),
+    expiresAt: isoTimestamp("expires_at").notNull(),
+    revokedAt: isoTimestamp("revoked_at"),
+    replacedById: text("replaced_by_id"),
+    lastUsedAt: isoTimestamp("last_used_at"),
+    createdAt: isoTimestamp("created_at")
+      .notNull()
+      .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`)
+  },
+  (t) => [
+    uniqueIndex("oauth_tokens_hash_unique").on(t.tokenHash),
+    index("oauth_tokens_grant_idx").on(t.grantId),
+    index("oauth_tokens_code_idx").on(t.codeId)
+  ]
+);
+
+/** Cloud mirror of oauth_assertion_claims (see postgres-schema.ts). */
+export const oauthAssertionClaims = sqliteTable(
+  "oauth_assertion_claims",
+  {
+    clientId: text("client_id").notNull(),
+    jti: text("jti").notNull(),
+    expiresAt: isoTimestamp("expires_at").notNull(),
+    createdAt: isoTimestamp("created_at")
+      .notNull()
+      .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`)
+  },
+  (t) => [
+    primaryKey({ columns: [t.clientId, t.jti] }),
+    index("oauth_assertion_claims_expires_idx").on(t.expiresAt)
+  ]
+);
+
+/** Cloud mirror of oauth_authorization_requests (see postgres-schema.ts). */
+export const oauthAuthorizationRequests = sqliteTable(
+  "oauth_authorization_requests",
+  {
+    id: text("id")
+      .primaryKey()
+      .$defaultFn(() => crypto.randomUUID()),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    familyId: text("family_id")
+      .notNull()
+      .references(() => families.id, { onDelete: "cascade" }),
+    sessionId: text("session_id").notNull(),
+    clientId: text("client_id").notNull(),
+    clientName: text("client_name").notNull(),
+    redirectUri: text("redirect_uri").notNull(),
+    scopes: text("scopes", { mode: "json" }).$type<string[]>().notNull().default([]),
+    resource: text("resource").notNull(),
+    codeChallenge: text("code_challenge").notNull(),
+    state: text("state"),
+    csrfTokenHash: text("csrf_token_hash").notNull(),
+    expiresAt: isoTimestamp("expires_at").notNull(),
+    consumedAt: isoTimestamp("consumed_at"),
+    createdAt: isoTimestamp("created_at")
+      .notNull()
+      .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`)
+  },
+  (t) => [index("oauth_authorization_requests_user_idx").on(t.userId)]
+);

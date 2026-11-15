@@ -8,6 +8,9 @@ import migration5 from "../../../../db/cloud-migrations/0006_cloudflare_access.u
 import migration6 from "../../../../db/cloud-migrations/0007_storage_guards.up.sql";
 import migration7 from "../../../../db/cloud-migrations/0008_api_keys.up.sql";
 import migration8 from "../../../../db/cloud-migrations/0009_instance_invitations.up.sql";
+import migration9 from "../../../../db/cloud-migrations/0010_mcp_oauth.up.sql";
+import migration10 from "../../../../db/cloud-migrations/0011_oauth_authorization_requests.up.sql";
+import migration11 from "../../../../db/cloud-migrations/0012_oauth_family_invalidation.up.sql";
 
 export const cloudMigrations = [
   { name: "0001_init", sql: migration0 },
@@ -18,5 +21,8 @@ export const cloudMigrations = [
   { name: "0006_cloudflare_access", sql: migration5 },
   { name: "0007_storage_guards", sql: migration6 },
   { name: "0008_api_keys", sql: migration7 },
-  { name: "0009_instance_invitations", sql: migration8 }
+  { name: "0009_instance_invitations", sql: migration8 },
+  { name: "0010_mcp_oauth", sql: migration9 },
+  { name: "0011_oauth_authorization_requests", sql: migration10 },
+  { name: "0012_oauth_family_invalidation", sql: migration11 }
 ];

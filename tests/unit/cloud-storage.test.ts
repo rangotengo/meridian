@@ -79,6 +79,73 @@ describe("Cloudflare SQLite storage", () => {
     });
   });
 
+  it("runs the MCP OAuth authorization flow (replay, rotation, concurrency, CIMD gate) in cloud DO", async () => {
+    const result = await probe("mcp-oauth");
+    expect(result).toEqual({
+      resolved: true,
+      codeReplayRejected: true,
+      replayKillsTokens: true,
+      concurrentExchangeSingleWinner: true,
+      concurrentExchangeFamilyRevoked: true,
+      refreshReuseRejected: true,
+      refreshReuseKillsFamily: true,
+      concurrentRefreshSingleWinner: true,
+      householdMoveRejected: true,
+      consentCsrfRejected: true,
+      consentSingleUse: true,
+      cimdBlockedWithoutAllowlist: true,
+      cimdAllowedWithAllowlist: true,
+      descendantRefreshRejected: true,
+      descendantPairDead: true,
+      resourceChangeRefreshRejected: true,
+      resourceChangeAccessRejected: true,
+      assertionFirstOk: true,
+      assertionReplayRejected: true,
+      assertionSkewReplayRejected: true,
+      assertionFutureRejected: true,
+      assertionMissingExpRejected: true
+    });
+  });
+
+  it("enforces the CIMD allowlist on every redirect hop in cloud DO (P1-4)", async () => {
+    const result = await probe("mcp-ssrf-redirect");
+    expect(result).toEqual({
+      redirectToUnapprovedBlocked: true,
+      redirectWithinAllowlistAllowed: true
+    });
+  });
+
+  it("serves the Stage 3 MCP tools (scopes, notes gating, isolation) in cloud DO", async () => {
+    const result = await probe("mcp-tools");
+    expect(result).toEqual({
+      listAccountsOk: true,
+      searchOk: true,
+      notesExcludedWithoutScope: true,
+      noteTextNotSearchable: true,
+      notesIncludedWithScope: true,
+      financeDeniedForTransactionsGrant: true,
+      searchDeniedForFinanceGrant: true,
+      crossHouseholdIsolated: true,
+      breakdownMerchantOk: true,
+      summaryOk: true,
+      summaryExcludesCeilingAccount: true,
+      netWorthPartialFlagged: true
+    });
+  });
+
+  it("serves the Stage 4 settings data and consent account picker in cloud DO", async () => {
+    const result = await probe("mcp-settings");
+    expect(result).toEqual({
+      ceilingStored: true,
+      selectionRejectsForeign: true,
+      listShowsConnection: true,
+      otherUserListEmpty: true,
+      lastUsedAdvances: true,
+      revokedStatusShown: true,
+      revokeKillsAccess: true
+    });
+  });
+
   it("recalculates 500+ days of balances and bulk Sure imports on workerd", async () => {
     const result = await probe("bulk-history");
     expect(result.longHistoryDays).toBeGreaterThanOrEqual(400);

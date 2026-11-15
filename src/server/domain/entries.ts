@@ -1,5 +1,5 @@
 import { caseInsensitiveLike } from "@/server/db/dialect";
-import { and, asc, desc, eq, exists, gte, inArray, lte, or, sql } from "drizzle-orm";
+import { and, asc, count, desc, eq, exists, gte, inArray, lte, or, sql } from "drizzle-orm";
 import type { Executor } from "../db/client";
 import { chunkParams, chunkRows } from "../db/params";
 import { accounts, categories, entries, tags, transactionTags, transactions } from "../db/schema";
@@ -421,15 +421,23 @@ export async function deleteEntry(exec: Executor, actor: Actor, entryId: string)
 
 export type EntryListFilters = {
   accountId?: string;
+  /** Restrict to this account set (combined with the actor's own access). */
+  accountIds?: string[];
   categoryId?: string;
   tagId?: string;
   search?: string;
+  /** When false, text search matches name and merchant only — never the
+   * free-text notes (used by callers without a notes permission). */
+  searchNotes?: boolean;
   kind?: "expense" | "income" | "transfer";
   from?: string;
   to?: string;
   cursor?: { date: string; id: string } | null;
   direction?: "next" | "prev";
   limit?: number;
+  /** Also compute the total number of entries matching the filters
+   * (ignoring cursor/limit), returned as `totalMatching`. */
+  withTotal?: boolean;
 };
 
 export type EntryListItem = {
@@ -461,6 +469,7 @@ export async function listEntriesPage(
   items: EntryListItem[];
   nextCursor: { date: string; id: string } | null;
   hasPrevious: boolean;
+  totalMatching: number | null;
 }> {
   const limit = Math.min(Math.max(filters.limit ?? 25, 1), 100);
   const goingPrev = filters.direction === "prev" && Boolean(filters.cursor);
@@ -479,6 +488,11 @@ export async function listEntriesPage(
 
   if (filters.accountId && isValidUuid(filters.accountId))
     conditions.push(eq(entries.accountId, filters.accountId));
+  if (filters.accountIds) {
+    conditions.push(
+      filters.accountIds.length > 0 ? inArray(entries.accountId, filters.accountIds) : sql`1 = 0`
+    );
+  }
   if (filters.categoryId && isValidUuid(filters.categoryId))
     conditions.push(eq(transactions.categoryId, filters.categoryId));
   if (filters.tagId && isValidUuid(filters.tagId)) {
@@ -491,11 +505,16 @@ export async function listEntriesPage(
   if (filters.search) {
     const pattern = `%${filters.search}%`;
     conditions.push(
-      or(
-        caseInsensitiveLike(entries.name, pattern),
-        caseInsensitiveLike(entries.notes, pattern),
-        caseInsensitiveLike(transactions.merchant, pattern)
-      )!
+      filters.searchNotes === false
+        ? or(
+            caseInsensitiveLike(entries.name, pattern),
+            caseInsensitiveLike(transactions.merchant, pattern)
+          )!
+        : or(
+            caseInsensitiveLike(entries.name, pattern),
+            caseInsensitiveLike(entries.notes, pattern),
+            caseInsensitiveLike(transactions.merchant, pattern)
+          )!
     );
   }
   if (filters.kind === "expense") {
@@ -509,6 +528,20 @@ export async function listEntriesPage(
   }
   if (filters.from && isIsoDate(filters.from)) conditions.push(gte(entries.date, filters.from));
   if (filters.to && isIsoDate(filters.to)) conditions.push(lte(entries.date, filters.to));
+
+  // Total over the same filter set (before the cursor narrows it), so
+  // paginated callers can state exactly how much a page omits.
+  let totalMatching: number | null = null;
+  if (filters.withTotal) {
+    const [row] = await exec
+      .select({ n: count() })
+      .from(entries)
+      .innerJoin(accounts, eq(accounts.id, entries.accountId))
+      .innerJoin(transactions, eq(transactions.entryId, entries.id))
+      .where(and(...conditions));
+    totalMatching = Number(row?.n ?? 0);
+  }
+
   if (filters.cursor && isIsoDate(filters.cursor.date) && isValidUuid(filters.cursor.id)) {
     if (goingPrev) {
       conditions.push(
@@ -588,7 +621,8 @@ export async function listEntriesPage(
       tagIds: tagsByEntry.get(r.id) ?? []
     })),
     nextCursor,
-    hasPrevious
+    hasPrevious,
+    totalMatching
   };
 }
 

@@ -20,7 +20,7 @@ export type Actor = {
   email: string;
   name: string;
   emailVerified: boolean;
-  authProvider?: "password" | "cloudflare-access" | "api-key";
+  authProvider?: "password" | "cloudflare-access" | "api-key" | "oauth";
 };
 
 export type Family = typeof families.$inferSelect;

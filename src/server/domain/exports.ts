@@ -28,6 +28,13 @@ import { listAccountsForActor } from "./accounts";
  * v1: family, shares, accounts, categories, tags, entries, exchange rates.
  * v2: adds budgets, recurring series, saved filters, an explicit transfers
  *     list, and `recurringSeriesId` on entries. The importer accepts both.
+ *
+ * Deliberately NOT exported: MCP OAuth state (oauth_clients, oauth_grants,
+ * oauth_authorization_requests, oauth_authorization_codes, oauth_tokens,
+ * oauth_assertion_claims). AI-agent connections never migrate with a
+ * household export — after a household restore, agents reconnect and
+ * re-consent from scratch. (Operator instance backups are the opposite
+ * contract; see backups.ts.)
  */
 export const EXPORT_VERSION = 2;
 

@@ -13,12 +13,13 @@ import {
   InputGroupInput
 } from "@/components/ui/input-group";
 
-export function SignInForm() {
+export function SignInForm({ next = "/" }: { next?: string }) {
   const [state, action] = useActionState(signInAction, undefined);
   const [showPassword, setShowPassword] = useState(false);
 
   return (
     <form action={action} className="space-y-4">
+      {next !== "/" ? <input type="hidden" name="next" value={next} /> : null}
       <FormError message={state?.ok === false ? state.error : undefined} />
       <div>
         <label htmlFor="email" className="mb-1.5 block text-sm font-medium">

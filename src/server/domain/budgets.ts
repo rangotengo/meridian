@@ -103,7 +103,8 @@ export type BudgetOverview = {
 export async function budgetOverview(
   exec: Executor,
   family: Family,
-  userId: string
+  userId: string,
+  accountIds?: string[]
 ): Promise<BudgetOverview> {
   const mk = monthKeyIn(family.timezone);
   const range = currentMonthRange(family.timezone);
@@ -118,7 +119,7 @@ export async function budgetOverview(
       .from(budgets)
       .leftJoin(categories, eq(categories.id, budgets.categoryId))
       .where(and(eq(budgets.familyId, family.id), eq(budgets.active, true))),
-    spendingByCategory(exec, family, userId, range),
+    spendingByCategory(exec, family, userId, range, accountIds),
     exec
       .select({ id: categories.id, name: categories.name })
       .from(categories)
