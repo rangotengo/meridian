@@ -1,0 +1,9 @@
+# GitGuardian suppression, narrowly scoped.
+#
+# The MeroShare key-rotation integration tests seed connections with
+# obviously dummy credentials (demat-user-1 / pw-one, demat-user-2 / pw-two).
+# Both were flagged on PR #7's first commit and confirmed as test fixtures
+# with the repo owner on 2026-11-15. Suppression covers only that one file;
+# every other path in the repository is scanned normally.
+paths-ignore:
+  - "tests/integration/meroshare-key-rotation.test.ts"
