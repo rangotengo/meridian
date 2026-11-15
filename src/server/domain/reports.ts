@@ -158,6 +158,20 @@ export type DashboardSummary = {
 const ACCESS_SQL = (userId: string) =>
   sql`(\n  a.owner_id IS NULL\n  OR a.owner_id = ${userId}\n  OR EXISTS (\n    SELECT 1 FROM account_shares s\n    WHERE s.account_id = a.id AND s.user_id = ${userId}\n  )\n)`;
 
+/**
+ * Optional extra account restriction for report queries (e.g. an MCP
+ * grant's account ceiling). `undefined` leaves the query unrestricted
+ * beyond ACCESS_SQL; an empty list matches nothing.
+ */
+function accountFilter(accountIds?: string[]) {
+  if (!accountIds) return sql``;
+  if (accountIds.length === 0) return sql`AND 1 = 0`;
+  return sql`AND a.id IN (${sql.join(
+    accountIds.map((id) => sql`${id}`),
+    sql`, `
+  )})`;
+}
+
 export async function dashboardSummary(
   exec: Executor,
   family: Family,
@@ -421,7 +435,8 @@ export async function netWorthSeries(
   exec: Executor,
   family: Family,
   userId: string,
-  days: number | "all" = 90
+  days: number | "all" = 90,
+  accountIds?: string[]
 ): Promise<NetWorthSeriesResult> {
   const ctx = newConversionContext();
   const today = todayIn(family.timezone);
@@ -440,6 +455,7 @@ export async function netWorthSeries(
       AND a.status = 'active'
       AND a.included_in_reports = true
       AND ${ACCESS_SQL(userId)}
+      ${accountFilter(accountIds)}
       ${cutoff}
     ORDER BY b.as_of
   `);
@@ -479,7 +495,8 @@ export async function incomeExpenseSeries(
   exec: Executor,
   family: Family,
   userId: string,
-  months = 12
+  months = 12,
+  accountIds?: string[]
 ): Promise<IncomeExpenseSeriesResult> {
   const ctx = newConversionContext();
   const currentMk = monthKeyIn(family.timezone);
@@ -503,6 +520,7 @@ export async function incomeExpenseSeries(
       AND a.included_in_reports = true
       AND a.status = 'active'
       AND ${ACCESS_SQL(userId)}
+      ${accountFilter(accountIds)}
       AND e.entryable_type = 'transaction'
       AND t.transfer_id IS NULL
       AND NOT EXISTS (SELECT 1 FROM entries c WHERE c.parent_entry_id = e.id)
@@ -563,7 +581,8 @@ export async function spendingByCategory(
   exec: Executor,
   family: Family,
   userId: string,
-  range: { from: string; to: string }
+  range: { from: string; to: string },
+  accountIds?: string[]
 ): Promise<SpendingByCategoryResult> {
   const ctx = newConversionContext();
   const res = await exec.execute<{
@@ -581,6 +600,7 @@ export async function spendingByCategory(
       AND a.included_in_reports = true
       AND a.status = 'active'
       AND ${ACCESS_SQL(userId)}
+      ${accountFilter(accountIds)}
       AND e.entryable_type = 'transaction'
       AND t.transfer_id IS NULL
       AND NOT EXISTS (SELECT 1 FROM entries c WHERE c.parent_entry_id = e.id)
@@ -616,6 +636,83 @@ export async function spendingByCategory(
 
   return {
     categories: [...totals.values()]
+      .map((v) => ({ ...v, share: grand > 0 ? v.totalMinor / grand : 0 }))
+      .sort((a, b) => b.totalMinor - a.totalMinor),
+    fx
+  };
+}
+
+export type MerchantSpending = {
+  merchant: string | null;
+  totalMinor: number;
+  share: number;
+};
+
+export type SpendingByMerchantResult = {
+  merchants: MerchantSpending[];
+  fx: FxCompleteness;
+};
+
+/**
+ * Spending grouped by merchant over a range — the merchant counterpart of
+ * spendingByCategory, with identical filters and FX completeness semantics.
+ * Entries without a merchant form the `null` group.
+ */
+export async function spendingByMerchant(
+  exec: Executor,
+  family: Family,
+  userId: string,
+  range: { from: string; to: string },
+  accountIds?: string[]
+): Promise<SpendingByMerchantResult> {
+  const ctx = newConversionContext();
+  const res = await exec.execute<{
+    merchant: string | null;
+    total_minor: string;
+    currency: string;
+  }>(sql`
+    SELECT t.merchant, CAST(SUM(e.amount_minor) AS TEXT) AS total_minor, e.currency
+    FROM entries e
+    JOIN accounts a ON a.id = e.account_id
+    JOIN transactions t ON t.entry_id = e.id
+    WHERE a.family_id = ${family.id}
+      AND a.included_in_reports = true
+      AND a.status = 'active'
+      AND ${ACCESS_SQL(userId)}
+      ${accountFilter(accountIds)}
+      AND e.entryable_type = 'transaction'
+      AND t.transfer_id IS NULL
+      AND NOT EXISTS (SELECT 1 FROM entries c WHERE c.parent_entry_id = e.id)
+      AND e.amount_minor > 0
+      AND e.date BETWEEN ${range.from} AND ${range.to}
+    GROUP BY t.merchant, e.currency
+  `);
+
+  const totals = new Map<string, { merchant: string | null; totalMinor: number }>();
+  let grand = 0;
+  for (const r of res.rows ?? []) {
+    const converted = await convertTo(
+      exec,
+      safeParseMinor(r.total_minor),
+      r.currency,
+      family.currency,
+      range.to,
+      ctx
+    );
+    const key = r.merchant ?? "";
+    const existing = totals.get(key);
+    totals.set(key, {
+      merchant: r.merchant,
+      totalMinor: safeAdd(existing?.totalMinor ?? 0, converted)
+    });
+    grand = safeAdd(grand, converted);
+  }
+
+  const fx = completenessOf(ctx);
+  await reportFxIssues(exec, ctx, family.id, "spending_by_merchant");
+
+  return {
+    merchants: [...totals.values()]
       .map((v) => ({ ...v, share: grand > 0 ? v.totalMinor / grand : 0 }))
       .sort((a, b) => b.totalMinor - a.totalMinor),
     fx

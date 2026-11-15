@@ -45,6 +45,10 @@ const schema = z
       ),
     BACKUP_DIR: z.string().optional(),
     BACKUP_RETENTION: z.coerce.number().int().positive().default(7),
+    MCP_ENABLED: z.enum(["true", "false"]).default("false"),
+    MCP_RESOURCE_URL: z.string().url().optional(),
+    MCP_ISSUER_URL: z.string().url().optional(),
+    MCP_CIMD_ALLOWLIST: z.string().optional(),
     NODE_ENV: z.enum(["development", "test", "production"]).default("development")
   })
   .superRefine((value, ctx) => {
@@ -98,6 +102,61 @@ export function registrationOpen(): boolean {
 
 export function aiChatEnabled(): boolean {
   return Boolean(env.AI_BASE_URL && env.AI_MODEL);
+}
+
+export type McpConfig = {
+  /** Canonical MCP resource identifier (RFC 8707). One exact value from
+   * configuration — never derived from request Host headers. */
+  resourceUrl: string;
+  /** Authorization-server issuer identifier; also the origin the OAuth
+   * endpoints and discovery documents are served from. */
+  issuerUrl: string;
+  /**
+   * Exact client-metadata (CIMD) document URLs an operator has approved
+   * (MCP_CIMD_ALLOWLIST, comma-separated). On the Cloudflare/Workers
+   * backend — where the resolved destination cannot be enforced through
+   * fetch() — CIMD/JWKS fetching is restricted to this allowlist. On Node
+   * the resolve-and-pin SSRF policy enforces the destination instead, so
+   * the allowlist is not required there.
+   */
+  cimdAllowlist: string[];
+  accessTokenTtlSeconds: number;
+  refreshTokenTtlSeconds: number;
+  authorizationCodeTtlSeconds: number;
+  grantTtlSeconds: number;
+};
+
+/**
+ * MCP (read-only AI-agent access) is disabled unless explicitly configured:
+ * MCP_ENABLED=true is required. Read live (like backupConfig) so operators
+ * and tests can toggle it per-process. Returns null when disabled, in which
+ * case every MCP/OAuth route must behave as if it does not exist (404).
+ */
+export function mcpConfig(): McpConfig | null {
+  const enabled = process.env.MCP_ENABLED !== undefined ? process.env.MCP_ENABLED : env.MCP_ENABLED;
+  if (enabled !== "true") return null;
+  const resourceUrl =
+    process.env.MCP_RESOURCE_URL !== undefined && process.env.MCP_RESOURCE_URL
+      ? process.env.MCP_RESOURCE_URL
+      : (env.MCP_RESOURCE_URL ?? "https://meridian.arunshrestha.info.np/mcp");
+  const issuerRaw =
+    process.env.MCP_ISSUER_URL !== undefined && process.env.MCP_ISSUER_URL
+      ? process.env.MCP_ISSUER_URL
+      : (env.MCP_ISSUER_URL ?? env.APP_URL);
+  return {
+    // The resource identifier is compared verbatim everywhere (authorize,
+    // token, verification) — never normalized, never Host-derived.
+    resourceUrl,
+    issuerUrl: issuerRaw.replace(/\/+$/, ""),
+    cimdAllowlist: (process.env.MCP_CIMD_ALLOWLIST ?? env.MCP_CIMD_ALLOWLIST ?? "")
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter(Boolean),
+    accessTokenTtlSeconds: 3600,
+    refreshTokenTtlSeconds: 30 * 24 * 3600,
+    authorizationCodeTtlSeconds: 300,
+    grantTtlSeconds: 90 * 24 * 3600
+  };
 }
 
 export type BackupConfig = {

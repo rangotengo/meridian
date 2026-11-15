@@ -648,3 +648,143 @@ export const meroShareTransactions = pgTable(
     )
   ]
 );
+
+/**
+ * MCP OAuth 2.1 authorization-server tables (read-only AI-agent access).
+ * Clients registered via DCR live in oauth_clients; CIMD clients are not
+ * stored (their metadata document is the record). oauth_grants is the
+ * durable per-connection binding: user + client + ONE household, with the
+ * scopes and account ceiling consented to. Codes are single-use and
+ * hash-stored; tokens are opaque and hash-stored (sessions/API-key pattern)
+ * so revocation is a live row read on every request.
+ */
+export const oauthClients = pgTable("oauth_clients", {
+  id: text("id").primaryKey(),
+  clientName: text("client_name").notNull(),
+  redirectUris: jsonb("redirect_uris").$type<string[]>().notNull().default([]),
+  tokenEndpointAuthMethod: text("token_endpoint_auth_method").notNull().default("none"),
+  secretHash: text("secret_hash"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow()
+});
+
+export const oauthGrants = pgTable(
+  "oauth_grants",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    familyId: uuid("family_id")
+      .notNull()
+      .references(() => families.id, { onDelete: "cascade" }),
+    clientId: text("client_id").notNull(),
+    clientName: text("client_name").notNull(),
+    scopes: jsonb("scopes").$type<string[]>().notNull().default([]),
+    /** Account ceiling consented to; empty means "all accounts the user can
+     * currently access" (re-resolved per call, never a snapshot of rights). */
+    accountIds: jsonb("account_ids").$type<string[]>().notNull().default([]),
+    status: text("status").notNull().default("active"),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    lastUsedAt: timestamp("last_used_at", { withTimezone: true }),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow()
+  },
+  (t) => [
+    index("oauth_grants_user_idx").on(t.userId),
+    index("oauth_grants_client_idx").on(t.clientId),
+    index("oauth_grants_family_idx").on(t.familyId)
+  ]
+);
+
+export const oauthAuthorizationCodes = pgTable(
+  "oauth_authorization_codes",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    codeHash: text("code_hash").notNull().unique(),
+    grantId: uuid("grant_id")
+      .notNull()
+      .references(() => oauthGrants.id, { onDelete: "cascade" }),
+    clientId: text("client_id").notNull(),
+    redirectUri: text("redirect_uri").notNull(),
+    resource: text("resource").notNull(),
+    codeChallenge: text("code_challenge").notNull(),
+    usedAt: timestamp("used_at", { withTimezone: true }),
+    /** Set when the exchange that consumed this code has finished
+     * issuing (or failing). A replay that finds the code consumed waits
+     * for this marker before revoking the family, so the revoke cannot
+     * miss tokens a concurrent legitimate exchange is still inserting. */
+    issuedAt: timestamp("issued_at", { withTimezone: true }),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow()
+  },
+  (t) => [
+    uniqueIndex("oauth_authorization_codes_hash_unique").on(t.codeHash),
+    index("oauth_authorization_codes_grant_idx").on(t.grantId)
+  ]
+);
+
+export const oauthTokens = pgTable(
+  "oauth_tokens",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    tokenHash: text("token_hash").notNull().unique(),
+    grantId: uuid("grant_id")
+      .notNull()
+      .references(() => oauthGrants.id, { onDelete: "cascade" }),
+    /** The authorization code that began this token family; refresh
+     * rotations copy it forward so code replay / refresh reuse can revoke
+     * the whole family. */
+    codeId: uuid("code_id").references(() => oauthAuthorizationCodes.id, {
+      onDelete: "set null"
+    }),
+    kind: text("kind").notNull(),
+    resource: text("resource").notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    replacedById: uuid("replaced_by_id"),
+    lastUsedAt: timestamp("last_used_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow()
+  },
+  (t) => [
+    uniqueIndex("oauth_tokens_hash_unique").on(t.tokenHash),
+    index("oauth_tokens_grant_idx").on(t.grantId),
+    index("oauth_tokens_code_idx").on(t.codeId)
+  ]
+);
+
+/**
+ * Server-side authorization-request records: the consent page renders
+ * from one of these, and approval consumes it exactly once. The record —
+ * never form fields — is the source of truth for client, redirect_uri,
+ * scopes, resource, code challenge, and the household shown at consent,
+ * so an approval cannot be transplanted to a different request. The
+ * CSRF token is hash-stored and the record is bound to the session that
+ * started the flow.
+ */
+export const oauthAuthorizationRequests = pgTable(
+  "oauth_authorization_requests",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    familyId: uuid("family_id")
+      .notNull()
+      .references(() => families.id, { onDelete: "cascade" }),
+    sessionId: text("session_id").notNull(),
+    clientId: text("client_id").notNull(),
+    clientName: text("client_name").notNull(),
+    redirectUri: text("redirect_uri").notNull(),
+    scopes: jsonb("scopes").$type<string[]>().notNull().default([]),
+    resource: text("resource").notNull(),
+    codeChallenge: text("code_challenge").notNull(),
+    state: text("state"),
+    csrfTokenHash: text("csrf_token_hash").notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    consumedAt: timestamp("consumed_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow()
+  },
+  (t) => [index("oauth_authorization_requests_user_idx").on(t.userId)]
+);

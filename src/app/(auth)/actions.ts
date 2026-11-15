@@ -2,6 +2,7 @@
 
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
+import { validateNextPath } from "@/lib/next-path";
 import { z } from "zod";
 import { getDb } from "@/server/db/client";
 import { loadActor, requestMeta, SESSION_COOKIE } from "@/server/auth/context";
@@ -35,6 +36,7 @@ export async function signInAction(
 ): Promise<ActionState> {
   return runAction("auth.sign_in", async () => {
     const input = signInSchema.parse(Object.fromEntries(formData));
+    const next = validateNextPath(formData.get("next"));
     const db = getDb();
     const meta = await requestMeta();
     const { token } = await authenticate(db, input, meta);
@@ -46,7 +48,7 @@ export async function signInAction(
       path: "/",
       maxAge: 60 * 60 * 24 * 30
     });
-    redirect("/");
+    redirect(next);
   });
 }
 

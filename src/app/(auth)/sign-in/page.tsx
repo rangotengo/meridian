@@ -1,14 +1,20 @@
 import { redirect } from "next/navigation";
 import { loadActor, loadAccessIdentity } from "@/server/auth/context";
 import { usesCloudflareAccess } from "@/server/auth/access";
+import { validateNextPath } from "@/lib/next-path";
 import { AuthShell } from "@/components/auth/auth-shell";
 import { SignInForm } from "./sign-in-form";
 
 export const metadata = { title: "Sign in" };
 
-export default async function SignInPage() {
+export default async function SignInPage({
+  searchParams
+}: {
+  searchParams: Promise<{ next?: string }>;
+}) {
+  const next = validateNextPath((await searchParams).next);
   const actor = await loadActor();
-  if (actor) redirect("/");
+  if (actor) redirect(next);
   if (usesCloudflareAccess()) {
     const identity = await loadAccessIdentity();
     return (
@@ -36,7 +42,7 @@ export default async function SignInPage() {
   }
   return (
     <AuthShell title="Welcome back" subtitle="Sign in to your Meridian household">
-      <SignInForm />
+      <SignInForm next={next} />
     </AuthShell>
   );
 }
