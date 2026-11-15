@@ -74,3 +74,84 @@ export async function recordValuation(
 
   return { entryId };
 }
+
+type ValuationEntryRow = typeof entries.$inferSelect;
+type AccountRow = typeof accounts.$inferSelect;
+
+async function loadManagedValuation(
+  exec: Executor,
+  actor: Actor,
+  entryId: string
+): Promise<{ entry: ValuationEntryRow; account: AccountRow }> {
+  const [entry] = await exec.select().from(entries).where(eq(entries.id, entryId)).limit(1);
+  if (!entry || entry.entryableType !== "valuation") throw errors.notFound("Valuation");
+  // Tenancy is enforced through the account: assertAccountAccessLevel throws
+  // notFound when the account is outside the actor's family.
+  const level = await assertAccountAccessLevel(exec, actor, entry.accountId);
+  if (level !== "full_control") {
+    throw errors.forbidden("Only full-control access can change valuations.");
+  }
+  const { account } = await assertAccountOpen(exec, actor, entry.accountId, "manage");
+  return { entry, account };
+}
+
+export async function updateValuation(
+  exec: Executor,
+  actor: Actor,
+  input: {
+    entryId: string;
+    date: string;
+    amountDisplayMinor: number;
+    kind?: ValuationKind;
+  }
+): Promise<{ accountId: string; previousDate: string; date: string }> {
+  if (!isIsoDate(input.date)) throw errors.validation("Date must be in YYYY-MM-DD format.");
+  if (input.kind && !VALUATION_KINDS.includes(input.kind)) {
+    throw errors.validation("Unknown valuation kind.");
+  }
+  const { entry, account } = await loadManagedValuation(exec, actor, input.entryId);
+  const ledgerAmount = displayToLedgerBalance(input.amountDisplayMinor, account.type);
+
+  await exec.transaction(async (tx) => {
+    await tx
+      .update(entries)
+      .set({ date: input.date, amountMinor: ledgerAmount })
+      .where(eq(entries.id, entry.id));
+    if (input.kind) {
+      await tx.update(valuations).set({ kind: input.kind }).where(eq(valuations.entryId, entry.id));
+    }
+  });
+
+  await recordAudit(exec, {
+    familyId: actor.familyId,
+    actorUserId: actor.userId,
+    action: "valuation.updated",
+    entityType: "entry",
+    entityId: entry.id,
+    metadata: { accountId: account.id, kind: input.kind }
+  });
+
+  return { accountId: account.id, previousDate: entry.date, date: input.date };
+}
+
+export async function deleteValuation(
+  exec: Executor,
+  actor: Actor,
+  entryId: string
+): Promise<{ accountId: string; date: string }> {
+  const { entry, account } = await loadManagedValuation(exec, actor, entryId);
+
+  // The valuations row is removed by the entries FK cascade.
+  await exec.delete(entries).where(eq(entries.id, entry.id));
+
+  await recordAudit(exec, {
+    familyId: actor.familyId,
+    actorUserId: actor.userId,
+    action: "valuation.deleted",
+    entityType: "entry",
+    entityId: entry.id,
+    metadata: { accountId: account.id }
+  });
+
+  return { accountId: account.id, date: entry.date };
+}

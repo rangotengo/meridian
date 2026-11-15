@@ -8,8 +8,10 @@ import { getUserPrivacyMode } from "@/server/domain/users";
 import { Badge, Card, PageHeader } from "@/components/ds/card";
 import { Amount, Sparkline } from "@/components/finance/amount";
 import { fmtDate } from "@/lib/format";
+import { ledgerToDisplayBalance, minorToDecimal } from "@/lib/money";
 import { AccountActions } from "./actions-panel";
 import { ValuationForm } from "./valuation-form";
+import { ValuationRowActions } from "./valuation-row-actions";
 
 export const metadata = { title: "Account" };
 
@@ -162,6 +164,18 @@ export default async function AccountDetailPage({
                   )}
                   <p className="text-xs text-muted-foreground">{fmtDate(e.date)}</p>
                 </div>
+                {e.kind === "valuation" && level === "full_control" ? (
+                  <ValuationRowActions
+                    entryId={e.id}
+                    date={e.date}
+                    amount={minorToDecimal(
+                      ledgerToDisplayBalance(e.amountMinor, account.type),
+                      account.currency
+                    )}
+                    kind={e.valuationKind ?? "current"}
+                    currency={account.currency}
+                  />
+                ) : null}
                 <Amount
                   minor={e.kind === "valuation" ? e.amountMinor : -e.amountMinor}
                   currency={account.currency}

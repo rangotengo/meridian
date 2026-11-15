@@ -53,7 +53,7 @@ export function Dialog({
         closedby="any"
         aria-labelledby={titleId}
         aria-describedby={description ? descId : undefined}
-        className={`backdrop:bg-black/40 open:flex open:flex-col rounded-xl border border-border bg-surface p-0 text-fg shadow-xl ${width} w-[calc(100vw-2rem)]`}
+        className={`backdrop:bg-black/40 open:flex open:flex-col m-auto rounded-xl border border-border bg-surface p-0 text-fg shadow-xl ${width} w-[calc(100vw-2rem)]`}
       >
         <div className="flex flex-col gap-1 border-b border-border p-5">
           <div className="flex items-start justify-between gap-4">
