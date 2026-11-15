@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { and, eq, inArray } from "drizzle-orm";
 import type { Executor } from "../db/client";
 import { chunkParams } from "../db/params";
@@ -16,7 +16,8 @@ import { recordAudit } from "../observability/audit";
 import { recalculateAccount } from "./balances";
 import { decryptProviderSecret, encryptProviderSecret } from "../security/secrets";
 import { lockMeroShareCredentialsForWrite } from "./meroshare-rotation";
-import { errors } from "@/lib/errors";
+import { errors, isDomainError } from "@/lib/errors";
+import { log } from "@/lib/logger";
 import { isIsoDate, todayIn } from "@/lib/datetime";
 import { currencyExponent } from "@/lib/money";
 import fallbackCapitals from "./meroshare-capitals-cache.json";
@@ -36,6 +37,9 @@ const MAX_TRANSACTIONS = 10_000;
 const MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
 
 type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Response>;
+
+/** Upstream CDSC call stages, used for diagnostics and error tagging. */
+type MeroShareStage = "capitals" | "auth" | "ownDetail" | "portfolio" | "transactions" | "wacc";
 
 export type MeroShareCapital = { id: number; code: string; name: string };
 export type MeroShareCredentials = { clientId: number; username: string; password: string };
@@ -72,15 +76,28 @@ export type MeroShareSnapshotAccount = {
 
 export type MeroShareSnapshot = {
   accounts: MeroShareSnapshotAccount[];
+  /** False when the WACC report itself failed upstream and holdings were imported without purchase cost. */
+  costBasisAvailable: boolean;
+  /** Human-readable partial-success warnings, surfaced in audit metadata. */
+  warnings: string[];
 };
+
+const COST_BASIS_UNAVAILABLE_WARNING =
+  "Cost basis unavailable: MeroShare's WACC report could not be retrieved, so holdings were imported without purchase cost.";
 
 export class MeroShareClient {
   private authorization: string | null = null;
+  private correlationId: string | null = null;
 
   constructor(
     private readonly credentials: MeroShareCredentials,
     private readonly fetchFn: FetchLike = fetch
   ) {}
+
+  /** Start a diagnostics correlation group for one capitals()/snapshot call. */
+  private beginOperation(): void {
+    this.correlationId = randomUUID();
+  }
 
   static async capitals(fetchFn: FetchLike = fetch): Promise<MeroShareCapital[]> {
     try {
@@ -88,7 +105,9 @@ export class MeroShareClient {
         { clientId: 1, username: "unused", password: "unused" },
         fetchFn
       );
+      client.beginOperation();
       const payload = await client.requestJson(CAPITALS_PATH, {
+        stage: "capitals",
         authenticated: false,
         maxBytes: 1024 * 1024
       });
@@ -105,9 +124,9 @@ export class MeroShareClient {
         if (list.length > 0) return list;
       }
     } catch (err) {
-      console.warn(
-        "Failed to fetch fresh MeroShare capitals list from CDSC; using fallback cache:",
-        err
+      log.warn(
+        { action: "meroshare.capitals", code: isDomainError(err) ? err.code : undefined },
+        "meroshare.capitals.fallback"
       );
     }
     return fallbackCapitals as MeroShareCapital[];
@@ -121,24 +140,46 @@ export class MeroShareClient {
       throw errors.validation("MeroShare username and password are required.");
     }
 
+    this.beginOperation();
     await this.authenticate();
     const detail = await this.ownDetail();
     const boid = normalizeBoid(detail.demat);
     const clientCode = text(detail.clientCode, 80);
     if (!clientCode) throw errors.validation("MeroShare did not return a client code.");
 
-    const [portfolio, rawTransactions, wacc] = await Promise.all([
+    const [portfolio, rawTransactions, waccOutcome] = await Promise.all([
       this.portfolio(boid, clientCode),
       this.transactionHistory(boid, clientCode),
-      this.waccReport(boid)
+      this.waccReport(boid).then(
+        (value) => ({ available: true as const, value }),
+        (err: unknown) => {
+          // Only an upstream HTTP/transport failure of the WACC call
+          // itself degrades to a partial snapshot (holdings without cost
+          // basis). Authentication failures, unreadable 200 responses,
+          // and shape errors still abort the snapshot.
+          if (isWaccUpstreamFailure(err)) return { available: false as const, value: null };
+          throw err;
+        }
+      )
     ]);
+
+    const warnings: string[] = [];
+    if (!waccOutcome.available) {
+      warnings.push(COST_BASIS_UNAVAILABLE_WARNING);
+      log.warn(
+        { action: "meroshare.cost_basis", correlationId: this.correlationId },
+        "meroshare.cost_basis.unavailable"
+      );
+    }
 
     const waccByTicker = new Map<string, Record<string, unknown>>();
     const rows =
-      isRecord(wacc) && Array.isArray(wacc.waccReportResponse) ? wacc.waccReportResponse : [];
+      isRecord(waccOutcome.value) && Array.isArray(waccOutcome.value.waccReportResponse)
+        ? waccOutcome.value.waccReportResponse
+        : [];
     for (const row of rows) {
       if (!isRecord(row)) continue;
-      const ticker = normalizeTicker(row.scrip);
+      const ticker = normalizeTicker(row.scrip ?? row.script);
       if (ticker) waccByTicker.set(ticker, row);
     }
 
@@ -173,9 +214,12 @@ export class MeroShareClient {
           ? decimal(rawValue, `market value for ${ticker}`, { nonNegative: true })
           : multiplyDecimal(quantity, marketPrice);
       const waccRow = waccByTicker.get(ticker);
+      // CDSC's current client exposes the average buy rate as
+      // `averageBuyRate`; `rate` is kept only as a fallback for older
+      // payloads. A missing rate yields a null cost basis for the holding.
       const costBasis =
         waccRow && isRecord(waccRow)
-          ? optionalDecimal(waccRow.rate, `cost basis for ${ticker}`)
+          ? optionalDecimal(waccRow.averageBuyRate ?? waccRow.rate, `cost basis for ${ticker}`)
           : null;
       holdings.push({ ticker, name, quantity, marketPrice, marketValue, costBasis });
       if (holdings.length > MAX_HOLDINGS) {
@@ -185,62 +229,7 @@ export class MeroShareClient {
       }
     }
 
-    const transactionRows =
-      isRecord(rawTransactions) && Array.isArray(rawTransactions.myTransactionHistory)
-        ? rawTransactions.myTransactionHistory
-        : [];
-    const transactions: MeroShareTransaction[] = [];
-    for (const row of transactionRows) {
-      if (!isRecord(row)) continue;
-      const ticker = normalizeTicker(row.scrip);
-      if (!ticker) continue;
-      const name = firstText(row.scripName, row.companyName, ticker) ?? ticker;
-      const occurredOn = isIsoDate(String(row.historyDate ?? "").slice(0, 10))
-        ? String(row.historyDate).slice(0, 10)
-        : null;
-      if (!occurredOn) continue;
-      const quantity = decimal(row.quantity, `transaction quantity for ${ticker}`, {
-        nonNegative: true
-      });
-      const price = optionalDecimal(row.rate, `rate for ${ticker}`);
-      const estimatedValue =
-        price !== null
-          ? multiplyDecimal(quantity, price)
-          : optionalDecimal(row.amount, `amount for ${ticker}`);
-      const rawActivity = String(row.activityLabel ?? "")
-        .trim()
-        .toLowerCase();
-      const activityLabel: MeroShareTransaction["activityLabel"] = rawActivity.includes("buy")
-        ? "Buy"
-        : rawActivity.includes("sell")
-          ? "Sell"
-          : "Other";
-      const description = text(row.remarks, 255);
-      const transactionCode = text(row.transactionCode, 64);
-      const hash = createHash("sha256")
-        .update(
-          `${boid}:${ticker}:${occurredOn}:${quantity}:${activityLabel}:${transactionCode ?? ""}:${description ?? ""}`
-        )
-        .digest("hex")
-        .slice(0, 32);
-      transactions.push({
-        externalId: hash,
-        ticker,
-        name,
-        quantity,
-        price,
-        estimatedValue,
-        activityLabel,
-        occurredOn,
-        description,
-        transactionCode
-      });
-      if (transactions.length > MAX_TRANSACTIONS) {
-        throw errors.validation(
-          "MeroShare returned more transactions than Meridian can safely import."
-        );
-      }
-    }
+    const transactions = parseTransactions(rawTransactions, boid);
 
     const accountName = firstText(detail.name, `BOID ${boid}`) ?? `MeroShare ${boid.slice(-4)}`;
     const totalValue =
@@ -262,12 +251,15 @@ export class MeroShareClient {
           holdings,
           transactions
         }
-      ]
+      ],
+      costBasisAvailable: waccOutcome.available,
+      warnings
     };
   }
 
   private async authenticate(): Promise<void> {
     const response = await this.request(AUTH_PATH, {
+      stage: "auth",
       method: "POST",
       authenticated: false,
       authenticationRequest: true,
@@ -279,72 +271,118 @@ export class MeroShareClient {
       maxBytes: 1024 * 64
     });
     const authHeader = response.headers.get("Authorization");
-    if (!authHeader) throw errors.validation("MeroShare did not return an authorization token.");
+    if (!authHeader)
+      throw errors.validation("MeroShare did not return an authorization token. (stage: auth)", {
+        stage: "auth"
+      });
     this.authorization = authHeader;
   }
 
   private async ownDetail(): Promise<Record<string, unknown>> {
     const payload = await this.requestJson(OWN_DETAIL_PATH, {
+      stage: "ownDetail",
       authenticated: true,
       maxBytes: 1024 * 128
     });
-    if (!isRecord(payload)) throw errors.validation("MeroShare did not return user details.");
+    if (!isRecord(payload))
+      throw errors.validation("MeroShare did not return user details. (stage: ownDetail)", {
+        stage: "ownDetail"
+      });
     return payload;
   }
 
   private async portfolio(boid: string, clientCode: string): Promise<Record<string, unknown>> {
-    const payload = await this.requestJson(PORTFOLIO_PATH, {
-      method: "POST",
-      authenticated: true,
-      body: {
-        demat: [boid],
-        clientCode,
-        page: 1,
-        size: PAGE_SIZE,
-        sortAsc: true,
-        sortBy: "script"
+    const { first, key, rows } = await collectPages(
+      async (page) => {
+        const payload = await this.requestJson(PORTFOLIO_PATH, {
+          stage: "portfolio",
+          method: "POST",
+          authenticated: true,
+          body: {
+            demat: [boid],
+            clientCode,
+            page,
+            size: PAGE_SIZE,
+            sortAsc: true,
+            sortBy: "script"
+          },
+          maxBytes: MAX_RESPONSE_BYTES
+        });
+        if (!isRecord(payload))
+          throw errors.validation("MeroShare did not return portfolio data. (stage: portfolio)", {
+            stage: "portfolio"
+          });
+        return payload;
       },
-      maxBytes: MAX_RESPONSE_BYTES
-    });
-    if (!isRecord(payload)) throw errors.validation("MeroShare did not return portfolio data.");
-    return payload;
+      (payload) => (Array.isArray(payload.meroShareMyPortfolio) ? "meroShareMyPortfolio" : null),
+      MAX_HOLDINGS,
+      "MeroShare returned more holdings than Meridian can safely import."
+    );
+    // Totals and other top-level fields come from the first page; the
+    // rows key is replaced with the accumulated rows from every page.
+    return key === null ? first : { ...first, [key]: rows };
   }
 
   private async transactionHistory(
     boid: string,
     clientCode: string
   ): Promise<Record<string, unknown>> {
-    const payload = await this.requestJson(TRANSACTIONS_PATH, {
-      method: "POST",
-      authenticated: true,
-      body: {
-        demat: [boid],
-        clientCode,
-        page: 1,
-        size: PAGE_SIZE,
-        sortAsc: false,
-        sortBy: "historyDate"
+    const { first, key, rows } = await collectPages(
+      async (page) => {
+        const payload = await this.requestJson(TRANSACTIONS_PATH, {
+          stage: "transactions",
+          method: "POST",
+          authenticated: true,
+          body: {
+            // CDSC's current web client sends the BOID as `boid` (a plain
+            // string), not the `demat: [boid]` array the portfolio call uses.
+            boid,
+            clientCode,
+            page,
+            size: PAGE_SIZE,
+            sortAsc: false,
+            sortBy: "historyDate"
+          },
+          maxBytes: MAX_RESPONSE_BYTES
+        });
+        if (!isRecord(payload))
+          throw errors.validation(
+            "MeroShare did not return transactions data. (stage: transactions)",
+            { stage: "transactions" }
+          );
+        return payload;
       },
-      maxBytes: MAX_RESPONSE_BYTES
-    });
-    if (!isRecord(payload)) throw errors.validation("MeroShare did not return transactions data.");
-    return payload;
+      (payload) =>
+        Array.isArray(payload.transactionView)
+          ? "transactionView"
+          : Array.isArray(payload.myTransactionHistory)
+            ? "myTransactionHistory"
+            : null,
+      MAX_TRANSACTIONS,
+      "MeroShare returned more transactions than Meridian can safely import."
+    );
+    return key === null ? first : { ...first, [key]: rows };
   }
 
   private async waccReport(boid: string): Promise<Record<string, unknown>> {
     const payload = await this.requestJson(WACC_PATH, {
+      stage: "wacc",
       method: "POST",
       authenticated: true,
       body: { demat: boid },
       maxBytes: MAX_RESPONSE_BYTES
     });
-    if (!isRecord(payload)) throw errors.validation("MeroShare did not return purchase cost data.");
+    if (!isRecord(payload))
+      throw errors.validation("MeroShare did not return purchase cost data. (stage: wacc)", {
+        stage: "wacc"
+      });
     return payload;
   }
 
   private async requestJson(
     path: string,
     options: {
+      stage: MeroShareStage;
       method?: "GET" | "POST";
       body?: unknown;
       authenticated?: boolean;
@@ -356,13 +394,17 @@ export class MeroShareClient {
     try {
       return JSON.parse(text);
     } catch {
-      throw errors.validation("MeroShare returned an unreadable response.");
+      throw errors.validation(
+        `MeroShare returned an unreadable response. (stage: ${options.stage})`,
+        { stage: options.stage }
+      );
     }
   }
 
   private async request(
     path: string,
     options: {
+      stage: MeroShareStage;
       method?: "GET" | "POST";
       body?: unknown;
       authenticated?: boolean;
@@ -370,6 +412,24 @@ export class MeroShareClient {
       authenticationRequest?: boolean;
     }
   ): Promise<Response> {
+    const stage = options.stage;
+    const method = options.method ?? "GET";
+    const startedAt = Date.now();
+    // Safe diagnostics: stage/method/status/duration/correlation only. Never
+    // log credentials, the Authorization header, BOIDs, or request/response
+    // bodies — the fields below are the complete set, by construction.
+    const diagnostics = {
+      action: "meroshare.upstream",
+      stage,
+      method,
+      correlationId: this.correlationId
+    };
+    const upstreamError = (message: string, upstreamStatus: number | null) =>
+      errors.validation(`${message} (stage: ${stage})`, {
+        stage,
+        upstreamFailure: true,
+        upstreamStatus
+      });
     const headers = new Headers({
       Accept: "application/json, text/plain, */*",
       "Accept-Language": "en-US,en;q=0.9",
@@ -390,7 +450,7 @@ export class MeroShareClient {
     let response: Response;
     try {
       response = await this.fetchFn(new URL(path, BASE_URL), {
-        method: options.method ?? "GET",
+        method,
         headers,
         body: options.body === undefined ? undefined : JSON.stringify(options.body),
         cache: "no-store",
@@ -398,20 +458,47 @@ export class MeroShareClient {
         signal: AbortSignal.timeout(20_000)
       });
     } catch (err) {
-      console.warn("MeroShare fetch error:", err);
-      throw errors.validation("MeroShare could not be reached. Try again shortly.");
+      log.warn(
+        {
+          ...diagnostics,
+          status: null,
+          durationMs: Date.now() - startedAt,
+          errorName: err instanceof Error ? err.name : "unknown"
+        },
+        "meroshare.upstream.failed"
+      );
+      throw upstreamError("MeroShare could not be reached. Try again shortly.", null);
+    }
+    const durationMs = Date.now() - startedAt;
+    if (response.ok) {
+      log.info({ ...diagnostics, status: response.status, durationMs }, "meroshare.upstream.ok");
+    } else {
+      log.warn(
+        { ...diagnostics, status: response.status, durationMs },
+        "meroshare.upstream.failed"
+      );
     }
     if (options.authenticationRequest && [400, 401, 403].includes(response.status)) {
-      throw errors.validation("MeroShare rejected the supplied credentials.");
+      throw upstreamError("MeroShare rejected the supplied credentials.", response.status);
     }
     if ([401, 403].includes(response.status))
-      throw errors.validation("The MeroShare session was rejected. Reconnect the account.");
+      throw upstreamError(
+        "The MeroShare session was rejected. Reconnect the account.",
+        response.status
+      );
     if (response.status === 429 || response.status >= 500)
-      throw errors.validation("MeroShare is temporarily unavailable. Try again later.");
-    if (!response.ok) throw errors.validation("MeroShare could not complete that request.");
+      throw upstreamError(
+        "MeroShare is temporarily unavailable. Try again later.",
+        response.status
+      );
+    if (!response.ok)
+      throw upstreamError("MeroShare could not complete that request.", response.status);
     const length = Number(response.headers.get("content-length") ?? 0);
     if (Number.isFinite(length) && length > options.maxBytes)
-      throw errors.validation("MeroShare returned more data than Meridian can safely import.");
+      throw errors.validation(
+        `MeroShare returned more data than Meridian can safely import. (stage: ${stage})`,
+        { stage, upstreamStatus: response.status }
+      );
 
     // Stream the body with a hard byte cap so a chunked response without
     // content-length cannot be buffered whole before the size check runs.
@@ -428,7 +515,10 @@ export class MeroShareClient {
         if (!value) continue;
         total += value.byteLength;
         if (total > options.maxBytes)
-          throw errors.validation("MeroShare returned more data than Meridian can safely import.");
+          throw errors.validation(
+            `MeroShare returned more data than Meridian can safely import. (stage: ${stage})`,
+            { stage, upstreamStatus: response.status }
+          );
         chunks.push(value);
       }
       payload = new Uint8Array(total);
@@ -439,16 +529,238 @@ export class MeroShareClient {
       }
     }
     if (payload.byteLength > options.maxBytes)
-      throw errors.validation("MeroShare returned more data than Meridian can safely import.");
+      throw errors.validation(
+        `MeroShare returned more data than Meridian can safely import. (stage: ${stage})`,
+        { stage, upstreamStatus: response.status }
+      );
     return new Response(payload, { status: response.status, headers: response.headers });
   }
+}
+
+/**
+ * Fetch every page of a paged CDSC list and accumulate its rows.
+ * Termination: when the first page carries a numeric `totalItems`, stop
+ * once that many rows are accumulated; otherwise continue while a page
+ * returns exactly PAGE_SIZE rows. A page with no rows also stops the
+ * walk (no progress). Exceeding maxRows throws the caller's overflow
+ * error — imports never truncate silently.
+ */
+async function collectPages(
+  fetchPage: (page: number) => Promise<Record<string, unknown>>,
+  selectRowsKey: (payload: Record<string, unknown>) => string | null,
+  maxRows: number,
+  overflowMessage: string
+): Promise<{ first: Record<string, unknown>; key: string | null; rows: unknown[] }> {
+  const first = await fetchPage(1);
+  const key = selectRowsKey(first);
+  if (key === null) return { first, key, rows: [] };
+  let rows = [...(first[key] as unknown[])];
+  if (rows.length > maxRows) throw errors.validation(overflowMessage);
+  const total = totalItemsOf(first.totalItems);
+  let lastPageSize = rows.length;
+  for (let page = 2; total !== null ? rows.length < total : lastPageSize === PAGE_SIZE; page++) {
+    const payload = await fetchPage(page);
+    const pageRows = Array.isArray(payload[key]) ? (payload[key] as unknown[]) : [];
+    if (pageRows.length === 0) break;
+    rows = rows.concat(pageRows);
+    if (rows.length > maxRows) throw errors.validation(overflowMessage);
+    lastPageSize = pageRows.length;
+    if (total === null && pageRows.length < PAGE_SIZE) break;
+  }
+  return { first, key, rows };
+}
+
+function totalItemsOf(value: unknown): number | null {
+  if (typeof value !== "number" && typeof value !== "string") return null;
+  const numeric = Number(value);
+  return Number.isInteger(numeric) && numeric >= 0 ? numeric : null;
+}
+
+/**
+ * True only for an upstream HTTP-status or transport failure of the WACC
+ * request itself, as tagged by the request layer in the error's
+ * server-side meta. 401/403 are excluded: they mean the session itself
+ * was rejected — an authentication failure, not WACC unavailability —
+ * and must abort the snapshot.
+ */
+function isWaccUpstreamFailure(err: unknown): boolean {
+  if (!isDomainError(err)) return false;
+  const meta = err.meta;
+  if (!meta || meta.stage !== "wacc" || meta.upstreamFailure !== true) return false;
+  return meta.upstreamStatus !== 401 && meta.upstreamStatus !== 403;
+}
+
+/**
+ * Dispatch on the transaction-history response shape. CDSC's current web
+ * client returns `transactionView`; older responses used
+ * `myTransactionHistory` with a different row shape. Each shape has its
+ * own mapping — fields are never mixed across shapes. A payload with
+ * neither array is a shape we do not understand: fail loudly instead of
+ * importing zero transactions silently.
+ */
+function parseTransactions(payload: unknown, boid: string): MeroShareTransaction[] {
+  if (isRecord(payload) && Array.isArray(payload.transactionView)) {
+    return parseViewTransactions(payload.transactionView, boid);
+  }
+  if (isRecord(payload) && Array.isArray(payload.myTransactionHistory)) {
+    return parseLegacyTransactions(payload.myTransactionHistory, boid);
+  }
+  throw errors.validation("MeroShare did not return transaction history. (stage: transactions)", {
+    stage: "transactions"
+  });
+}
+
+/**
+ * Current CDSC shape: rows carry `script`, `transactionDate`, and the
+ * quantity split into `creditQty` (shares in → Buy) and `debitQty`
+ * (shares out → Sell). The rows carry no per-share rate in the current
+ * client; `rate`/`amount` are read opportunistically for DP variants
+ * that include them, otherwise price/estimatedValue stay null.
+ */
+function parseViewTransactions(rows: unknown[], boid: string): MeroShareTransaction[] {
+  const transactions: MeroShareTransaction[] = [];
+  for (const row of rows) {
+    if (!isRecord(row)) continue;
+    const ticker = normalizeTicker(row.script);
+    if (!ticker) continue;
+    const occurredOn = isIsoDate(String(row.transactionDate ?? "").slice(0, 10))
+      ? String(row.transactionDate).slice(0, 10)
+      : null;
+    if (!occurredOn) continue;
+    const credit = sideQuantity(row.creditQty);
+    const debit = sideQuantity(row.debitQty);
+    let quantity: string;
+    let activityLabel: MeroShareTransaction["activityLabel"];
+    if (credit > 0 && debit === 0) {
+      quantity = formatQuantity(credit);
+      activityLabel = "Buy";
+    } else if (debit > 0 && credit === 0) {
+      quantity = formatQuantity(debit);
+      activityLabel = "Sell";
+    } else if (credit === debit) {
+      // No net share movement (both sides zero/absent, or exactly
+      // offsetting): keep the history row as Other with zero quantity
+      // rather than dropping a book entry such as a fee or adjustment.
+      quantity = "0";
+      activityLabel = "Other";
+    } else {
+      // Both sides moved by different amounts: record the net position
+      // change, labelled by the larger side.
+      quantity = formatQuantity(Math.abs(credit - debit));
+      activityLabel = credit > debit ? "Buy" : "Sell";
+    }
+    const name = firstText(row.scriptDesc, row.companyName, ticker) ?? ticker;
+    const price = optionalDecimal(row.rate, `rate for ${ticker}`);
+    const estimatedValue =
+      price !== null
+        ? multiplyDecimal(quantity, price)
+        : optionalDecimal(row.amount, `amount for ${ticker}`);
+    const description = text(row.historyDesc, 255);
+    const transactionCode = text(row.transCode, 64);
+    const hash = createHash("sha256")
+      .update(
+        `${boid}:${ticker}:${occurredOn}:${quantity}:${activityLabel}:${transactionCode ?? ""}:${description ?? ""}`
+      )
+      .digest("hex")
+      .slice(0, 32);
+    transactions.push({
+      externalId: hash,
+      ticker,
+      name,
+      quantity,
+      price,
+      estimatedValue,
+      activityLabel,
+      occurredOn,
+      description,
+      transactionCode
+    });
+    if (transactions.length > MAX_TRANSACTIONS) {
+      throw errors.validation(
+        "MeroShare returned more transactions than Meridian can safely import."
+      );
+    }
+  }
+  return transactions;
+}
+
+/** Legacy CDSC shape (`myTransactionHistory` rows), kept as an explicit fallback. */
+function parseLegacyTransactions(rows: unknown[], boid: string): MeroShareTransaction[] {
+  const transactions: MeroShareTransaction[] = [];
+  for (const row of rows) {
+    if (!isRecord(row)) continue;
+    const ticker = normalizeTicker(row.scrip);
+    if (!ticker) continue;
+    const name = firstText(row.scripName, row.companyName, ticker) ?? ticker;
+    const occurredOn = isIsoDate(String(row.historyDate ?? "").slice(0, 10))
+      ? String(row.historyDate).slice(0, 10)
+      : null;
+    if (!occurredOn) continue;
+    const quantity = decimal(row.quantity, `transaction quantity for ${ticker}`, {
+      nonNegative: true
+    });
+    const price = optionalDecimal(row.rate, `rate for ${ticker}`);
+    const estimatedValue =
+      price !== null
+        ? multiplyDecimal(quantity, price)
+        : optionalDecimal(row.amount, `amount for ${ticker}`);
+    const rawActivity = String(row.activityLabel ?? "")
+      .trim()
+      .toLowerCase();
+    const activityLabel: MeroShareTransaction["activityLabel"] = rawActivity.includes("buy")
+      ? "Buy"
+      : rawActivity.includes("sell")
+        ? "Sell"
+        : "Other";
+    const description = text(row.remarks, 255);
+    const transactionCode = text(row.transactionCode, 64);
+    const hash = createHash("sha256")
+      .update(
+        `${boid}:${ticker}:${occurredOn}:${quantity}:${activityLabel}:${transactionCode ?? ""}:${description ?? ""}`
+      )
+      .digest("hex")
+      .slice(0, 32);
+    transactions.push({
+      externalId: hash,
+      ticker,
+      name,
+      quantity,
+      price,
+      estimatedValue,
+      activityLabel,
+      occurredOn,
+      description,
+      transactionCode
+    });
+    if (transactions.length > MAX_TRANSACTIONS) {
+      throw errors.validation(
+        "MeroShare returned more transactions than Meridian can safely import."
+      );
+    }
+  }
+  return transactions;
+}
+
+/** Parse one credit/debit quantity side; absent, blank, or non-positive → 0. */
+function sideQuantity(value: unknown): number {
+  const numeric = Number(
+    String(value ?? "")
+      .replace(/,/g, "")
+      .trim()
+  );
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : 0;
+}
+
+function formatQuantity(value: number): string {
+  // Round away binary float artifacts (e.g. 0.1 + 0.2) in stored decimals.
+  return String(Math.round(value * 1e6) / 1e6);
 }
 
 export async function connectMeroShare(
   exec: Executor,
   actor: Actor,
   input: MeroShareCredentials & { capital: MeroShareCapital }
-): Promise<{ connectionId: string; accounts: number }> {
+): Promise<{ connectionId: string; accounts: number; costBasisAvailable: boolean }> {
   const capital = input.capital;
   if (capital.id !== input.clientId || !capital.code || !capital.name)
     throw errors.validation("Choose a valid MeroShare DP.");
@@ -481,16 +793,25 @@ export async function connectMeroShare(
     action: "meroshare.connected",
     entityType: "mero_share_connection",
     entityId: connectionId,
-    metadata: { accounts: snapshot.accounts.length, dpCode: capital.code }
+    metadata: {
+      accounts: snapshot.accounts.length,
+      dpCode: capital.code,
+      costBasisAvailable: snapshot.costBasisAvailable,
+      ...(snapshot.warnings.length ? { warnings: snapshot.warnings } : {})
+    }
   });
-  return { connectionId, accounts: snapshot.accounts.length };
+  return {
+    connectionId,
+    accounts: snapshot.accounts.length,
+    costBasisAvailable: snapshot.costBasisAvailable
+  };
 }
 
 export async function syncMeroShareConnection(
   exec: Executor,
   actor: Actor,
   connectionId: string
-): Promise<{ accounts: number }> {
+): Promise<{ accounts: number; costBasisAvailable: boolean }> {
   const [connection] = await exec
     .select()
     .from(meroShareConnections)
@@ -517,9 +838,13 @@ export async function syncMeroShareConnection(
     action: "meroshare.synced",
     entityType: "mero_share_connection",
     entityId: connection.id,
-    metadata: { accounts: snapshot.accounts.length }
+    metadata: {
+      accounts: snapshot.accounts.length,
+      costBasisAvailable: snapshot.costBasisAvailable,
+      ...(snapshot.warnings.length ? { warnings: snapshot.warnings } : {})
+    }
   });
-  return { accounts: snapshot.accounts.length };
+  return { accounts: snapshot.accounts.length, costBasisAvailable: snapshot.costBasisAvailable };
 }
 
 export async function disconnectMeroShareConnection(
