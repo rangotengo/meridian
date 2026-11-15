@@ -20,6 +20,7 @@ export function Shell({
   assets,
   liabilities,
   netWorthMinor,
+  fxIssues,
   currency,
   children,
   signOut,
@@ -33,6 +34,7 @@ export function Shell({
   assets: NavAccount[];
   liabilities: NavAccount[];
   netWorthMinor: number;
+  fxIssues: { base: string; quote: string }[];
   currency: string;
   children: React.ReactNode;
   signOut: () => Promise<void>;
@@ -56,6 +58,7 @@ export function Shell({
         privacy={privacy}
         accounts={accounts}
         netWorthMinor={netWorthMinor}
+        fxIssues={fxIssues}
         currency={currency}
         showAdmin={showAdmin}
         signOut={signOut}

@@ -1,6 +1,12 @@
 import { requireVerifiedActor, currentFamily } from "@/server/auth/context";
 import { getDb } from "@/server/db/client";
-import { dashboardSummary, incomeExpenseSeries, netWorthSeries } from "@/server/domain/reports";
+import {
+  dashboardSummary,
+  incomeExpenseSeries,
+  mergeFxCompleteness,
+  netWorthSeries,
+  type FxCompleteness
+} from "@/server/domain/reports";
 import { budgetOverview } from "@/server/domain/budgets";
 import { getUserPrivacyMode } from "@/server/domain/users";
 import { listAccountsForActor } from "@/server/domain/accounts";
@@ -36,13 +42,15 @@ export default async function DashboardPage({
   const nwRange = nw && NW_RANGES.has(nw) ? nw : "90";
   const seriesDays = nwRange === "all" ? ("all" as const) : Number(nwRange);
 
-  const [summary, accounts, series, budget, flows] = await Promise.all([
+  const [summary, accounts, seriesResult, budget, flowsResult] = await Promise.all([
     dashboardSummary(db, family, actor.userId),
     listAccountsForActor(db, actor),
     netWorthSeries(db, family, actor.userId, seriesDays),
     budgetOverview(db, family, actor.userId),
     incomeExpenseSeries(db, family, actor.userId, 12)
   ]);
+  const series = seriesResult.points;
+  const flows = flowsResult.flows;
 
   const privacy = await getUserPrivacyMode(db, actor.userId);
   const income = summary.incomeThisMonthMinor;
@@ -136,17 +144,30 @@ export default async function DashboardPage({
           pct: budget.overall.pct
         }
       : null,
-    fx: {
-      incomplete: summary.incompleteFx ?? false,
-      issues: summary.fxIssues ?? [],
-      rates: (summary.fxRates ?? []).map((r) => ({
-        base: r.base,
-        quote: r.quote,
-        rate: r.rate,
-        quotedOn: r.quotedOn,
-        stale: isStaleRate(r.quotedOn, todayIn(family.timezone))
-      }))
-    },
+    fx: (() => {
+      // The banner covers every total and chart on the page, so merge the
+      // completeness of the summary, the historical series, the monthly
+      // flows, and the budget widget — a rate missing only for a past
+      // period still leaves the chart incomplete even when today's
+      // summary converts cleanly.
+      const summaryFx: FxCompleteness = {
+        incompleteFx: summary.incompleteFx ?? false,
+        fxIssues: summary.fxIssues ?? [],
+        fxRates: summary.fxRates ?? []
+      };
+      const merged = mergeFxCompleteness(summaryFx, seriesResult.fx, flowsResult.fx, budget.fx);
+      return {
+        incomplete: merged.incompleteFx,
+        issues: merged.fxIssues,
+        rates: merged.fxRates.map((r) => ({
+          base: r.base,
+          quote: r.quote,
+          rate: r.rate,
+          quotedOn: r.quotedOn,
+          stale: isStaleRate(r.quotedOn, todayIn(family.timezone))
+        }))
+      };
+    })(),
     health: {
       overall,
       trend,

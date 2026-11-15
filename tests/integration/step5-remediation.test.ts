@@ -162,7 +162,7 @@ describe("F10: Net Worth Respects Report Inclusion Filter", () => {
     const reportAccounts = active.filter((a) => a.includedInReports);
 
     const family = (await familiesSvc.getFamilyById(db(), user.familyId))!;
-    const netWorth = await netWorthMinorForAccounts(
+    const { netWorthMinor: netWorth } = await netWorthMinorForAccounts(
       db(),
       family,
       reportAccounts.map((a) => ({
