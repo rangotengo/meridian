@@ -1,6 +1,6 @@
-import { mkdir, readdir, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readdir, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { getTableColumns, type Table } from "drizzle-orm";
+import { eq, getTableColumns, type Table } from "drizzle-orm";
 import type { Executor } from "../db/client";
 import { usesCloudStorage } from "../db/dialect";
 import { chunkRows } from "../db/params";
@@ -50,6 +50,10 @@ import { errors } from "@/lib/errors";
  *
  * Tables are listed in foreign-key order (parents before children) so a
  * restore can insert them verbatim, preserving ids, into an empty database.
+ * Two references cannot follow that order and are handled specially at
+ * restore time: entries/categories are sorted parents-first within their
+ * own table, and transactions are inserted with transfer_id detached and
+ * re-linked after transfers exist.
  */
 
 export const INSTANCE_EXPORT_VERSION = 1;
@@ -99,17 +103,30 @@ export type InstanceExport = {
 };
 
 export async function buildInstanceExport(exec: Executor): Promise<InstanceExport> {
-  const tables: Record<string, TableRows> = {};
-  for (const { name, table } of INSTANCE_TABLES) {
-    const rows = await exec.select().from(table);
-    tables[name] = rows as TableRows;
-  }
-  return {
-    kind: INSTANCE_EXPORT_KIND,
-    version: INSTANCE_EXPORT_VERSION,
-    exportedAt: new Date().toISOString(),
-    tables
+  const capture = async (tx: Executor): Promise<InstanceExport> => {
+    const tables: Record<string, TableRows> = {};
+    for (const { name, table } of INSTANCE_TABLES) {
+      const rows = await tx.select().from(table);
+      tables[name] = rows as TableRows;
+    }
+    return {
+      kind: INSTANCE_EXPORT_KIND,
+      version: INSTANCE_EXPORT_VERSION,
+      exportedAt: new Date().toISOString(),
+      tables
+    };
   };
+  // Capture every table under one stable snapshot: without it, a write that
+  // lands between two table reads can produce an archive whose rows
+  // reference rows that are absent (an entry whose account was created
+  // mid-capture), which no restore could ever apply. PostgreSQL gets a
+  // REPEATABLE READ transaction; the cloud backend's transaction holds the
+  // Durable Object mutex across the capture, which gives SQLite the same
+  // coherent-snapshot guarantee.
+  if (usesCloudStorage) return exec.transaction(async (tx) => capture(tx as Executor));
+  return exec.transaction(async (tx) => capture(tx as Executor), {
+    isolationLevel: "repeatable read"
+  });
 }
 
 export function parseInstanceExport(text: string): InstanceExport {
@@ -157,11 +174,30 @@ export async function restoreInstanceExport(
     }
     const counts: Record<string, number> = {};
     let totalRows = 0;
+    // transactions.transfer_id references transfers, but transfers is
+    // restored after transactions (its own rows reference entries). Insert
+    // transactions with the link detached and re-attach it once transfers
+    // exist — the whole restore is one transaction, so the intermediate
+    // state is never visible.
+    const deferredTransferLinks: { id: string; transferId: string }[] = [];
     for (const { name, table } of INSTANCE_TABLES) {
       let rows = (data.tables[name] ?? []) as TableRows;
-      // Categories reference their parent category: insert parents first.
-      if (name === "categories") rows = sortCategoriesParentsFirst(rows);
+      // Self-referencing tables insert parents before children, across the
+      // whole row set (chunk boundaries must not split a parent/child pair
+      // the wrong way round either).
+      if (name === "categories") rows = sortRowsParentsFirst(rows, "parentId");
+      if (name === "entries") rows = sortRowsParentsFirst(rows, "parentEntryId");
       rows = rows.map((row) => reviveTimestamps(table, row));
+      if (name === "transactions") {
+        rows = rows.map((row) => {
+          const transferId = row.transferId;
+          if (typeof transferId === "string" && transferId) {
+            deferredTransferLinks.push({ id: String(row.id), transferId });
+            return { ...row, transferId: null };
+          }
+          return row;
+        });
+      }
       if (rows.length === 0) {
         counts[name] = 0;
         continue;
@@ -172,6 +208,12 @@ export async function restoreInstanceExport(
       }
       counts[name] = rows.length;
       totalRows += rows.length;
+    }
+    for (const link of deferredTransferLinks) {
+      await tx
+        .update(transactions)
+        .set({ transferId: link.transferId })
+        .where(eq(transactions.id, link.id));
     }
     return { tables: counts, totalRows };
   });
@@ -196,7 +238,7 @@ function reviveTimestamps(table: Table, row: Record<string, unknown>): Record<st
   return revived ?? row;
 }
 
-function sortCategoriesParentsFirst(rows: TableRows): TableRows {
+function sortRowsParentsFirst(rows: TableRows, parentKey: string): TableRows {
   const byId = new Map(rows.map((r) => [String(r.id), r]));
   const sorted: TableRows = [];
   const placed = new Set<string>();
@@ -205,7 +247,7 @@ function sortCategoriesParentsFirst(rows: TableRows): TableRows {
     const before = pending.length;
     for (let i = pending.length - 1; i >= 0; i--) {
       const row = pending[i]!;
-      const parentId = row.parentId;
+      const parentId = row[parentKey];
       if (
         parentId === null ||
         parentId === undefined ||
@@ -251,7 +293,13 @@ export async function runScheduledBackup(exec: Executor): Promise<ScheduledBacku
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   const fileName = `${BACKUP_FILE_PREFIX}${stamp}${BACKUP_FILE_SUFFIX}`;
   const filePath = path.join(config.dir, fileName);
-  await writeFile(filePath, ciphertext, "utf8");
+  // Durable write: write to a temp file in the same directory and rename it
+  // into place, so a crash mid-write can never leave a truncated archive
+  // under a final name (retention pruning below only ever sees complete
+  // archives, and the temp name never matches the archive pattern).
+  const tempPath = `${filePath}.${process.pid}.tmp`;
+  await writeFile(tempPath, ciphertext, "utf8");
+  await rename(tempPath, filePath);
 
   const archives = (await readdir(config.dir))
     .filter((f) => f.startsWith(BACKUP_FILE_PREFIX) && f.endsWith(BACKUP_FILE_SUFFIX))

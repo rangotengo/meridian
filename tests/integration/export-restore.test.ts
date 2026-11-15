@@ -8,10 +8,12 @@ import {
   truncateAll,
   actorOf,
   daysAgo,
+  joinFamily,
   latestBalance,
   type TestUser
 } from "../helpers";
 import * as orchestrate from "@/server/domain/orchestrate";
+import * as accountsSvc from "@/server/domain/accounts";
 import * as categoriesSvc from "@/server/domain/categories";
 import * as tagsSvc from "@/server/domain/tags";
 import * as budgetsSvc from "@/server/domain/budgets";
@@ -19,6 +21,7 @@ import * as recurringSvc from "@/server/domain/recurring";
 import * as savedFiltersSvc from "@/server/domain/saved-filters";
 import * as valuationsSvc from "@/server/domain/valuations";
 import { recalculateAccount } from "@/server/domain/balances";
+import { nextOccurrence } from "@/server/domain/recurring";
 import * as exportsSvc from "@/server/domain/exports";
 import { importFamilyExport, parseFamilyExport } from "@/server/domain/family-import";
 import {
@@ -195,15 +198,16 @@ describe("family export v2 → restore round-trip", () => {
     expect(result.budgets).toBe(2);
     expect(result.recurring).toBe(1);
     expect(result.savedFilters).toBe(1);
-    // The rate already exists in this instance (the source household's export
-    // came from here), so the restore inserts no duplicate.
+    // The importing admin is not a platform super-admin, so the uploaded
+    // rate is skipped rather than written to the global table (the row
+    // below is the one inserted directly before the export, unchanged).
     expect(result.exchangeRates).toBe(0);
     const rateRows = await exec
       .select()
       .from(exchangeRates)
       .where(eq(exchangeRates.baseCurrency, "USD"));
     expect(rateRows).toHaveLength(1);
-    expect(result.skipped).toEqual({ shares: 0, savedFilters: 0 });
+    expect(result.skipped).toEqual({ shares: 0, savedFilters: 0, exchangeRates: 1 });
 
     const restoredAccounts = await exec
       .select()
@@ -466,5 +470,387 @@ describe("family export v1 backward compatibility", () => {
     // Balances were materialized for both accounts.
     expect(await latestBalance(checking.id)).not.toBeNull();
     expect(await latestBalance(savings.id)).not.toBeNull();
+  });
+});
+
+describe("restore hardening (PR #6 review fixes)", () => {
+  type MutableExport = {
+    accounts: { id: string; currency: string }[];
+    entries: {
+      id: string;
+      amountMinor: number;
+      date: string;
+      parentEntryId: string | null;
+      transferId: string | null;
+    }[];
+    recurring: unknown[];
+    savedFilters: { params: Record<string, unknown> }[];
+  };
+  const mutable = (value: unknown): MutableExport =>
+    JSON.parse(JSON.stringify(value)) as MutableExport;
+
+  async function expectFamilyEmpty(familyId: string): Promise<void> {
+    const rows = await db().select().from(accounts).where(eq(accounts.familyId, familyId));
+    expect(rows).toHaveLength(0);
+  }
+
+  it("never writes global exchange rates from a household restore by a non-super-admin", async () => {
+    const exec = db();
+    const source = await makeUser();
+    await makeAccount(source, { name: "FX Source Account" });
+    await exec.execute(
+      sql`DELETE FROM exchange_rates WHERE base_currency = 'USD' AND quote_currency = 'NPR'`
+    );
+    await exec.insert(exchangeRates).values({
+      baseCurrency: "USD",
+      quoteCurrency: "NPR",
+      rate: "999.00000000",
+      quotedOn: daysAgo(0)
+    });
+    const exported = await exportsSvc.buildFamilyExport(exec, actorOf(source));
+    expect(exported.exchangeRates.some((r) => (r as { quote: string }).quote === "NPR")).toBe(true);
+    // Simulate the target instance: it does not have this rate yet.
+    await exec.execute(
+      sql`DELETE FROM exchange_rates WHERE base_currency = 'USD' AND quote_currency = 'NPR'`
+    );
+
+    const target = await makeUser();
+    const result = await importFamilyExport(
+      exec,
+      actorOf(target),
+      parseFamilyExport(encode(exported))
+    );
+    expect(result.exchangeRates).toBe(0);
+    expect(result.skipped.exchangeRates).toBeGreaterThan(0);
+    // The global table — what every other household's lookups read — is
+    // untouched by the uploaded file.
+    const rows = await exec
+      .select()
+      .from(exchangeRates)
+      .where(eq(exchangeRates.quoteCurrency, "NPR"));
+    expect(rows).toHaveLength(0);
+  });
+
+  it("applies uploaded exchange rates when the importer is a platform super-admin", async () => {
+    const exec = db();
+    const source = await makeUser();
+    await makeAccount(source, { name: "FX Admin Source" });
+    await exec.execute(
+      sql`DELETE FROM exchange_rates WHERE base_currency = 'USD' AND quote_currency = 'NPR'`
+    );
+    await exec.insert(exchangeRates).values({
+      baseCurrency: "USD",
+      quoteCurrency: "NPR",
+      rate: "133.50000000",
+      quotedOn: daysAgo(1)
+    });
+    const exported = await exportsSvc.buildFamilyExport(exec, actorOf(source));
+    await exec.execute(
+      sql`DELETE FROM exchange_rates WHERE base_currency = 'USD' AND quote_currency = 'NPR'`
+    );
+
+    const target = await makeUser();
+    const superActor = { ...actorOf(target), platformRole: "super_admin" as const };
+    const result = await importFamilyExport(exec, superActor, parseFamilyExport(encode(exported)));
+    expect(result.exchangeRates).toBeGreaterThan(0);
+    expect(result.skipped.exchangeRates).toBe(0);
+    const rows = await exec
+      .select()
+      .from(exchangeRates)
+      .where(eq(exchangeRates.quoteCurrency, "NPR"));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.rate).toBe("133.50000000");
+    await exec.execute(
+      sql`DELETE FROM exchange_rates WHERE base_currency = 'USD' AND quote_currency = 'NPR'`
+    );
+  });
+
+  it("rejects a budget-bearing export whose reporting currency differs from the target family", async () => {
+    const source = await makeUser({ currency: "USD" });
+    await makeAccount(source, { name: "USD Budget Account" });
+    await budgetsSvc.setBudget(db(), actorOf(source), {
+      categoryId: null,
+      amountLedgerMinor: 10_000 // a $100 budget
+    });
+    const exported = await exportsSvc.buildFamilyExport(db(), actorOf(source));
+
+    const target = await makeUser({ currency: "JPY" });
+    await expect(
+      importFamilyExport(db(), actorOf(target), parseFamilyExport(encode(exported)))
+    ).rejects.toThrow(/budgets are in USD, but this family reports in JPY/);
+    await expectFamilyEmpty(target.familyId);
+    const targetBudgets = await db()
+      .select()
+      .from(budgets)
+      .where(eq(budgets.familyId, target.familyId));
+    expect(targetBudgets).toHaveLength(0);
+  });
+
+  it("imports a budget-free export across reporting currencies without reinterpretation", async () => {
+    const source = await makeUser({ currency: "USD" });
+    const accountId = await makeAccount(source, { name: "Portable Account", currency: "EUR" });
+    await addTxn(source, accountId, { amountLedgerMinor: 2_500, name: "Portable txn" });
+    const exported = await exportsSvc.buildFamilyExport(db(), actorOf(source));
+
+    const target = await makeUser({ currency: "JPY" });
+    const result = await importFamilyExport(
+      db(),
+      actorOf(target),
+      parseFamilyExport(encode(exported))
+    );
+    expect(result.accounts).toBe(1);
+    expect(result.budgets).toBe(0);
+    const restored = await db()
+      .select()
+      .from(accounts)
+      .where(eq(accounts.familyId, target.familyId));
+    expect(restored[0]!.currency).toBe("EUR");
+  });
+
+  it("rejects a tampered transfer whose legs do not balance, and restores nothing", async () => {
+    const source = await makeUser();
+    const a = await makeAccount(source, {
+      name: "Tamper A",
+      openingBalanceDisplayMinor: 100_000
+    });
+    const b = await makeAccount(source, { name: "Tamper B" });
+    await orchestrate.makeTransferWithEntries(db(), actorOf(source), {
+      fromAccountId: a,
+      toAccountId: b,
+      date: daysAgo(0),
+      amountDisplayMinor: 20_000
+    });
+    const exported = mutable(await exportsSvc.buildFamilyExport(db(), actorOf(source)));
+    const inflow = exported.entries.find((e) => e.amountMinor < 0)!;
+    inflow.amountMinor = -100; // was -20_000: legs no longer balance
+
+    const target = await makeUser();
+    await expect(
+      importFamilyExport(db(), actorOf(target), parseFamilyExport(encode(exported)))
+    ).rejects.toThrow(/do not have equal amounts/);
+    await expectFamilyEmpty(target.familyId);
+  });
+
+  it("rejects a transfer whose legs fall outside the supported date window", async () => {
+    const source = await makeUser();
+    const a = await makeAccount(source, {
+      name: "Window A",
+      openingBalanceDisplayMinor: 100_000
+    });
+    const b = await makeAccount(source, { name: "Window B" });
+    await orchestrate.makeTransferWithEntries(db(), actorOf(source), {
+      fromAccountId: a,
+      toAccountId: b,
+      date: daysAgo(0),
+      amountDisplayMinor: 5_000
+    });
+    const exported = mutable(await exportsSvc.buildFamilyExport(db(), actorOf(source)));
+    const inflow = exported.entries.find((e) => e.amountMinor < 0)!;
+    inflow.date = daysAgo(30);
+
+    const target = await makeUser();
+    await expect(
+      importFamilyExport(db(), actorOf(target), parseFamilyExport(encode(exported)))
+    ).rejects.toThrow(/days apart/);
+    await expectFamilyEmpty(target.familyId);
+  });
+
+  it("rejects a cross-currency transfer in the export", async () => {
+    const source = await makeUser();
+    const a = await makeAccount(source, {
+      name: "FX Leg A",
+      openingBalanceDisplayMinor: 100_000
+    });
+    const b = await makeAccount(source, { name: "FX Leg B" });
+    await orchestrate.makeTransferWithEntries(db(), actorOf(source), {
+      fromAccountId: a,
+      toAccountId: b,
+      date: daysAgo(0),
+      amountDisplayMinor: 5_000
+    });
+    const exported = mutable(await exportsSvc.buildFamilyExport(db(), actorOf(source)));
+    exported.accounts.find((acc) => acc.id === b)!.currency = "EUR";
+
+    const target = await makeUser();
+    await expect(
+      importFamilyExport(db(), actorOf(target), parseFamilyExport(encode(exported)))
+    ).rejects.toThrow(/cross-currency/i);
+    await expectFamilyEmpty(target.familyId);
+  });
+
+  it("rejects a tampered split whose parts do not sum to the parent, and restores nothing", async () => {
+    const source = await makeUser();
+    const a = await makeAccount(source, { name: "Split Tamper Account" });
+    const parent = await addTxn(source, a, { amountLedgerMinor: 10_000, name: "Split shop" });
+    await orchestrate.splitTransaction(db(), actorOf(source), parent, [
+      { amountLedgerMinor: 6_000 },
+      { amountLedgerMinor: 4_000 }
+    ]);
+    const exported = mutable(await exportsSvc.buildFamilyExport(db(), actorOf(source)));
+    const child = exported.entries.find((e) => e.parentEntryId !== null)!;
+    child.amountMinor += 1;
+
+    const target = await makeUser();
+    await expect(
+      importFamilyExport(db(), actorOf(target), parseFamilyExport(encode(exported)))
+    ).rejects.toThrow(/do not add up to the original/);
+    await expectFamilyEmpty(target.familyId);
+  });
+
+  it("rejects an invalid recurring config at parse time and bounds nextOccurrence", () => {
+    const bad = {
+      version: 2,
+      family: {
+        id: "11111111-1111-1111-1111-111111111111",
+        name: "Bad Config Family",
+        currency: "USD",
+        locale: "en-US",
+        timezone: "UTC",
+        createdAt: new Date().toISOString(),
+        members: []
+      },
+      accounts: [],
+      categories: [],
+      tags: [],
+      entries: [],
+      recurring: [
+        {
+          id: "22222222-2222-2222-2222-222222222222",
+          accountId: "33333333-3333-3333-3333-333333333333",
+          createdBy: null,
+          name: "Bad weekly",
+          merchant: null,
+          amountMinor: 1_000,
+          currency: "USD",
+          categoryId: null,
+          frequency: "weekly",
+          config: { weekday: 99 },
+          nextDue: daysAgo(-1),
+          active: true,
+          lastPostedEntryId: null
+        }
+      ]
+    };
+    expect(() => parseFamilyExport(encode(bad))).toThrow(/weekday/);
+    // The wedge itself is bounded even if a bad row reaches the worker.
+    expect(() => nextOccurrence("weekly", { weekday: 99 }, daysAgo(0))).toThrow(/weekday/);
+  });
+
+  it("preserves joint account ownership through a restore", async () => {
+    const admin = await makeUser({ familyName: "JointRestoreFam" });
+    const member = await makeUser();
+    await joinFamily(member, admin.familyId);
+    await makeAccount(admin, { name: "Joint Account", joint: true });
+    await makeAccount(admin, { name: "Private Account", joint: false });
+
+    const exported = await exportsSvc.buildFamilyExport(db(), actorOf(admin));
+    await wipeFamilyData(admin.familyId);
+    await importFamilyExport(db(), actorOf(admin), parseFamilyExport(encode(exported)));
+
+    const restored = await db()
+      .select()
+      .from(accounts)
+      .where(eq(accounts.familyId, admin.familyId));
+    expect(restored.find((a) => a.name === "Joint Account")!.ownerId).toBeNull();
+    expect(restored.find((a) => a.name === "Private Account")!.ownerId).toBe(admin.userId);
+
+    const memberVisible = await accountsSvc.listAccountsForActor(db(), actorOf(member, "member"));
+    expect(memberVisible.map((a) => a.name)).toContain("Joint Account");
+    expect(memberVisible.map((a) => a.name)).not.toContain("Private Account");
+  });
+
+  it("exports only the exporting member's own saved filters", async () => {
+    const admin = await makeUser();
+    const member = await makeUser();
+    await joinFamily(member, admin.familyId);
+    await savedFiltersSvc.createSavedFilter(db(), member.userId, "Private medical spending", {
+      q: "medical"
+    });
+    await savedFiltersSvc.createSavedFilter(db(), admin.userId, "Admin rent search", {
+      q: "rent"
+    });
+
+    const exported = await exportsSvc.buildFamilyExport(db(), actorOf(admin));
+    const names = exported.savedFilters.map((f) => f.name);
+    expect(names).toContain("Admin rent search");
+    expect(names).not.toContain("Private medical spending");
+  });
+
+  it("remaps saved-filter params to restored ids and drops unremappable references", async () => {
+    const user = await makeUser();
+    const actor = actorOf(user);
+    const account = await makeAccount(user, { name: "Remap Account" });
+    const cat = await categoriesSvc.createCategory(db(), actor, { name: "RemapCat" });
+    const tag = await tagsSvc.createTag(db(), actor, { name: "remaptag" });
+    await savedFiltersSvc.createSavedFilter(db(), user.userId, "Remapped", {
+      account,
+      category: cat.categoryId,
+      tag: tag.tagId,
+      q: "x"
+    });
+
+    const exported = await exportsSvc.buildFamilyExport(db(), actor);
+    await wipeFamilyData(user.familyId);
+    await importFamilyExport(db(), actor, parseFamilyExport(encode(exported)));
+
+    const restoredAccount = (
+      await db().select().from(accounts).where(eq(accounts.familyId, user.familyId))
+    )[0]!;
+    const restoredCategory = (
+      await db().select().from(categories).where(eq(categories.familyId, user.familyId))
+    )[0]!;
+    const restoredFilters = await db()
+      .select()
+      .from(savedFilters)
+      .where(eq(savedFilters.userId, user.userId));
+    expect(restoredFilters).toHaveLength(1);
+    const params = restoredFilters[0]!.params as Record<string, string>;
+    expect(params.account).toBe(restoredAccount.id);
+    expect(params.account).not.toBe(account);
+    expect(params.category).toBe(restoredCategory.id);
+    expect(params.q).toBe("x");
+    expect(params.tag).toBeTruthy();
+    expect(params.tag).not.toBe(tag.tagId);
+
+    // A reference that is not part of the export is dropped, not copied.
+    const tampered = mutable(exported);
+    tampered.savedFilters[0]!.params.account = "99999999-9999-9999-9999-999999999999";
+    await wipeFamilyData(user.familyId);
+    await importFamilyExport(db(), actor, parseFamilyExport(encode(tampered)));
+    const refilters = await db()
+      .select()
+      .from(savedFilters)
+      .where(eq(savedFilters.userId, user.userId));
+    expect(refilters).toHaveLength(1);
+    const reparsed = refilters[0]!.params as Record<string, string>;
+    expect(reparsed.account).toBeUndefined();
+    expect(reparsed.category).toBeTruthy();
+  });
+
+  it("does not export a transfer whose other leg is in an account the exporter cannot see", async () => {
+    const admin = await makeUser();
+    const member = await makeUser();
+    await joinFamily(member, admin.familyId);
+    const shared = await makeAccount(admin, { name: "Shared Pot", joint: true });
+    const priv = await makeAccount(admin, { name: "Admin Private", joint: false });
+    await orchestrate.makeTransferWithEntries(db(), actorOf(admin), {
+      fromAccountId: shared,
+      toAccountId: priv,
+      date: daysAgo(0),
+      amountDisplayMinor: 5_000
+    });
+
+    const memberExport = await exportsSvc.buildFamilyExport(db(), actorOf(member, "member"));
+    expect(memberExport.transfers).toHaveLength(0);
+    const memberEntries = memberExport.entries as {
+      amountMinor: number;
+      transferId: string | null;
+    }[];
+    const visibleLeg = memberEntries.find((e) => e.amountMinor === 5_000);
+    expect(visibleLeg).toBeTruthy();
+    expect(visibleLeg!.transferId).toBeNull();
+
+    const adminExport = await exportsSvc.buildFamilyExport(db(), actorOf(admin));
+    expect(adminExport.transfers).toHaveLength(1);
   });
 });

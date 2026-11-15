@@ -22,10 +22,12 @@ import {
 import type { Actor } from "../auth/context";
 import { recordAudit } from "../observability/audit";
 import { recalculateAccount } from "./balances";
+import { validateSeriesConfig, type Frequency, type SeriesConfig } from "./recurring";
 import { assertFamilyIsEmpty } from "./sure-import";
+import { TRANSFER_DATE_WINDOW_DAYS } from "./transfers";
 import { ACCOUNT_TYPES } from "../authorization/access";
 import { errors } from "@/lib/errors";
-import { isIsoDate } from "@/lib/datetime";
+import { diffDays, isIsoDate } from "@/lib/datetime";
 import { isValidCurrency } from "@/lib/money";
 
 /**
@@ -42,9 +44,23 @@ import { isValidCurrency } from "@/lib/money";
  *   account owners, series creators, share grantees, and saved-filter owners
  *   are matched to users already in the target family by email. Unmatched
  *   shares and saved filters are skipped and counted in the result; account
- *   ownership falls back to the importing admin.
+ *   ownership falls back to the importing admin — except joint accounts
+ *   (owner null), which stay joint.
  * - Family settings (name, currency, locale, timezone) are NOT overwritten;
- *   the target family keeps its own.
+ *   the target family keeps its own. Because budgets are denominated in the
+ *   reporting currency, an export whose budgets were recorded in a different
+ *   reporting currency than the target family's is rejected outright rather
+ *   than silently reinterpreted.
+ * - Exchange rates are instance-global reference data whose normal writes
+ *   are restricted to platform super-admins, so a household restore applies
+ *   uploaded rates only when the importing admin is also a super-admin;
+ *   otherwise they are skipped and counted. Uploaded JSON must never mutate
+ *   global data as a side effect of a household restore.
+ * - Transfers and splits are validated against the same invariants the
+ *   transfer/split services enforce (balanced legs in one currency inside
+ *   the date window; split parts inheriting and summing to the parent), and
+ *   recurring configs against the recurring service's rules, before any row
+ *   is written.
  * - Format v1 exports (no budgets/recurring/savedFilters/transfers arrays)
  *   still import: transfers are rebuilt from the transferId carried on each
  *   entry, using the ledger sign convention (outflow positive, inflow
@@ -73,7 +89,7 @@ export type FamilyImportResult = {
   recurring: number;
   savedFilters: number;
   exchangeRates: number;
-  skipped: { shares: number; savedFilters: number };
+  skipped: { shares: number; savedFilters: number; exchangeRates: number };
 };
 
 type ParsedMember = { id: string; email: string };
@@ -144,6 +160,8 @@ type ParsedRate = { base: string; quote: string; rate: string; quotedOn: string 
 
 export type ParsedFamilyExport = {
   version: number;
+  /** The source family's reporting currency, when the export records it. */
+  familyCurrency: string | null;
   members: ParsedMember[];
   accounts: ParsedAccount[];
   categories: ParsedCategory[];
@@ -182,6 +200,10 @@ export function parseFamilyExport(bytes: Uint8Array): ParsedFamilyExport {
   }
   const family = isRecord(raw.family) ? raw.family : null;
   if (!family) throw errors.validation("The export is missing its family record.");
+  const familyCurrency =
+    typeof family.currency === "string" && isValidCurrency(family.currency.toUpperCase())
+      ? family.currency.toUpperCase()
+      : null;
   const members = reqArray(family.members, "family members").map((m) => {
     if (!isRecord(m)) throw errors.validation("The export has an invalid family member.");
     return {
@@ -200,6 +222,7 @@ export function parseFamilyExport(bytes: Uint8Array): ParsedFamilyExport {
 
   return {
     version,
+    familyCurrency,
     members,
     accounts,
     categories,
@@ -243,6 +266,38 @@ async function importRecords(
     .where(eq(families.id, actor.familyId))
     .limit(1);
   if (!family) throw errors.notFound("Family");
+
+  // Budgets are denominated in the family's reporting currency and minor
+  // units do not translate across currencies (a $100 budget is not ¥100), so
+  // a budget-bearing export recorded under a different reporting currency is
+  // rejected rather than silently reinterpreted.
+  if (data.budgets.length > 0) {
+    if (!data.familyCurrency) {
+      throw errors.validation(
+        "This export does not record its household reporting currency, so its budgets cannot be restored safely. Re-export the household with a current Meridian version and try again."
+      );
+    }
+    if (data.familyCurrency !== family.currency) {
+      throw errors.validation(
+        `This export's budgets are in ${data.familyCurrency}, but this family reports in ${family.currency}. Budget amounts cannot be converted between currencies — restore the export into a family that reports in ${data.familyCurrency}, or remove the budgets from the export file.`
+      );
+    }
+  }
+
+  // Transfers: v2 exports carry an explicit list; v1 exports only carry the
+  // transferId on each entry, so rebuild pairs from the ledger sign rule.
+  const transferPairs: ParsedTransfer[] =
+    data.transfers.length > 0
+      ? data.transfers.map((t) => ({
+          id: t.id,
+          outflowEntryId: t.outflowEntryId,
+          inflowEntryId: t.inflowEntryId,
+          status: t.status
+        }))
+      : rebuildTransferPairs(data.entries);
+  // Validate splits and transfers against the domain invariants before any
+  // row is written, so a tampered export fails as one atomic no-op.
+  validateRestoredData(data, transferPairs);
 
   // Resolve exported people to users already present in the target family.
   const targetMembers = await exec
@@ -308,7 +363,9 @@ async function importRecords(
       .insert(accounts)
       .values({
         familyId: actor.familyId,
-        ownerId: resolveUser(record.ownerId) ?? actor.userId,
+        // Joint accounts (owner null) stay joint; only a non-null owner who
+        // cannot be matched to a target member falls back to the admin.
+        ownerId: record.ownerId === null ? null : (resolveUser(record.ownerId) ?? actor.userId),
         type: record.type,
         subtype: record.subtype,
         name: record.name,
@@ -431,16 +488,6 @@ async function importRecords(
       .where(eq(recurringSeries.id, seriesMap.get(record.id)!));
   }
 
-  // Transfers: v2 exports carry an explicit list; v1 exports only carry the
-  // transferId on each entry, so rebuild pairs from the ledger sign rule.
-  const transferPairs =
-    data.transfers.length > 0
-      ? data.transfers.map((t) => ({
-          outflowEntryId: t.outflowEntryId,
-          inflowEntryId: t.inflowEntryId,
-          status: t.status
-        }))
-      : rebuildTransferPairs(data.entries);
   let transferCount = 0;
   for (const pair of transferPairs) {
     const outflowEntryId = mappedId(pair.outflowEntryId, entryMap, "transfer outflow entry");
@@ -476,7 +523,11 @@ async function importRecords(
       skippedFilters++;
       continue;
     }
-    await exec.insert(savedFilters).values({ userId, name: record.name, params: record.params });
+    await exec.insert(savedFilters).values({
+      userId,
+      name: record.name,
+      params: remapFilterParams(record.params, { accountMap, categoryMap, tagMap })
+    });
     savedFilterCount++;
   }
 
@@ -494,8 +545,18 @@ async function importRecords(
       .onConflictDoNothing();
   }
 
+  // Exchange rates are instance-global and their normal writes are
+  // super-admin-only; a household restore must not let uploaded JSON mutate
+  // them. Only a super-admin import applies uploaded rates — everyone else's
+  // are skipped and counted.
   let rateCount = 0;
+  let skippedRates = 0;
+  const mayWriteRates = actor.platformRole === "super_admin";
   for (const rate of data.exchangeRates) {
+    if (!mayWriteRates) {
+      skippedRates++;
+      continue;
+    }
     const inserted = await exec
       .insert(exchangeRates)
       .values({
@@ -529,7 +590,7 @@ async function importRecords(
       recurring: seriesMap.size,
       savedFilters: savedFilterCount,
       exchangeRates: rateCount,
-      skipped: { shares: skippedShares, savedFilters: skippedFilters }
+      skipped: { shares: skippedShares, savedFilters: skippedFilters, exchangeRates: skippedRates }
     }
   });
 
@@ -544,8 +605,148 @@ async function importRecords(
     recurring: seriesMap.size,
     savedFilters: savedFilterCount,
     exchangeRates: rateCount,
-    skipped: { shares: skippedShares, savedFilters: skippedFilters }
+    skipped: { shares: skippedShares, savedFilters: skippedFilters, exchangeRates: skippedRates }
   };
+}
+
+/**
+ * Saved-filter params reference accounts, categories, and tags by id; those
+ * ids change on restore, so remap them through the import's id maps.
+ * References that cannot be remapped (the entity is not part of the export)
+ * are dropped, consistent with how unmatched people are skipped.
+ */
+function remapFilterParams(
+  params: RecordData,
+  maps: {
+    accountMap: Map<string, string>;
+    categoryMap: Map<string, string>;
+    tagMap: Map<string, string>;
+  }
+): RecordData {
+  const idMaps: Record<string, Map<string, string>> = {
+    account: maps.accountMap,
+    category: maps.categoryMap,
+    tag: maps.tagMap
+  };
+  const out: RecordData = {};
+  for (const [key, value] of Object.entries(params)) {
+    const map = idMaps[key];
+    if (map && typeof value === "string") {
+      const mapped = map.get(value);
+      if (mapped) out[key] = mapped;
+    } else {
+      out[key] = value;
+    }
+  }
+  return out;
+}
+
+/**
+ * Pre-write validation of the relationships the normal services enforce at
+ * creation time. The importer recreates rows verbatim, so without this a
+ * tampered export could persist states the domain forbids: unbalanced or
+ * cross-currency transfer legs, split parts that do not sum to (or do not
+ * inherit) their parent, and entries claiming transfers they are not part
+ * of. Throws a validation error; the caller runs inside the import
+ * transaction, so the whole restore rolls back.
+ */
+function validateRestoredData(data: ParsedFamilyExport, pairs: ParsedTransfer[]): void {
+  const entryById = new Map(data.entries.map((e) => [e.id, e]));
+  const accountById = new Map(data.accounts.map((a) => [a.id, a]));
+  const childrenByParent = new Map<string, ParsedEntry[]>();
+  for (const entry of data.entries) {
+    if (!entry.parentEntryId) continue;
+    const list = childrenByParent.get(entry.parentEntryId) ?? [];
+    list.push(entry);
+    childrenByParent.set(entry.parentEntryId, list);
+  }
+
+  for (const [parentId, children] of childrenByParent) {
+    const parent = entryById.get(parentId);
+    if (!parent)
+      throw errors.validation("The export contains a split part whose parent entry is missing.");
+    if (parent.kind !== "transaction")
+      throw errors.validation("A split parent in the export is not a transaction.");
+    let total = 0;
+    for (const child of children) {
+      if (child.kind !== "transaction")
+        throw errors.validation("A split part in the export is not a transaction.");
+      if (childrenByParent.has(child.id))
+        throw errors.validation(
+          "A split part in the export is itself split; nested splits are not supported."
+        );
+      if (
+        child.accountId !== parent.accountId ||
+        child.date !== parent.date ||
+        child.currency !== parent.currency
+      ) {
+        throw errors.validation(
+          "A split part in the export does not inherit its parent's account, date, and currency."
+        );
+      }
+      if (child.amountMinor === 0)
+        throw errors.validation("A split part in the export has a zero amount.");
+      total += child.amountMinor;
+    }
+    if (total !== parent.amountMinor) {
+      throw errors.validation(
+        "The split parts in the export do not add up to the original transaction amount."
+      );
+    }
+  }
+
+  const pairById = new Map(pairs.map((p) => [p.id, p]));
+  const usedLegs = new Set<string>();
+  for (const pair of pairs) {
+    if (pair.outflowEntryId === pair.inflowEntryId)
+      throw errors.validation("A transfer in the export uses the same entry for both legs.");
+    const outflow = entryById.get(pair.outflowEntryId);
+    const inflow = entryById.get(pair.inflowEntryId);
+    if (!outflow || !inflow)
+      throw errors.validation(
+        "A transfer in the export references an entry that is not part of the export."
+      );
+    for (const leg of [outflow, inflow]) {
+      if (leg.kind !== "transaction")
+        throw errors.validation("Only transactions can be linked as a transfer in the export.");
+      if (leg.parentEntryId)
+        throw errors.validation("A split part in the export cannot be a transfer leg.");
+      if (childrenByParent.has(leg.id))
+        throw errors.validation("A split transaction in the export cannot be a transfer leg.");
+      if (usedLegs.has(leg.id))
+        throw errors.validation("An entry in the export is used by more than one transfer.");
+      usedLegs.add(leg.id);
+    }
+    if (outflow.accountId === inflow.accountId)
+      throw errors.validation("A transfer in the export must move between two different accounts.");
+    const outflowAccount = accountById.get(outflow.accountId);
+    const inflowAccount = accountById.get(inflow.accountId);
+    if (!outflowAccount || !inflowAccount)
+      throw errors.validation(
+        "A transfer in the export references an account that is not part of the export."
+      );
+    if (outflow.currency !== inflow.currency || outflowAccount.currency !== inflowAccount.currency)
+      throw errors.validation("A cross-currency transfer in the export is not supported.");
+    if (outflow.amountMinor <= 0 || inflow.amountMinor >= 0)
+      throw errors.validation(
+        "A transfer in the export does not follow the outflow/inflow sign convention."
+      );
+    if (outflow.amountMinor + inflow.amountMinor !== 0)
+      throw errors.validation("The legs of a transfer in the export do not have equal amounts.");
+    if (Math.abs(diffDays(outflow.date, inflow.date)) > TRANSFER_DATE_WINDOW_DAYS) {
+      throw errors.validation(
+        `The legs of a transfer in the export are more than ${TRANSFER_DATE_WINDOW_DAYS} days apart.`
+      );
+    }
+  }
+
+  for (const entry of data.entries) {
+    if (!entry.transferId) continue;
+    const pair = pairById.get(entry.transferId);
+    if (!pair || (pair.outflowEntryId !== entry.id && pair.inflowEntryId !== entry.id)) {
+      throw errors.validation("An entry in the export claims a transfer it is not a leg of.");
+    }
+  }
 }
 
 function rebuildTransferPairs(entries: ParsedEntry[]): ParsedTransfer[] {
@@ -685,13 +886,21 @@ function parseRecurring(raw: unknown): ParsedRecurring {
     throw errors.validation(`The export contains an unsupported frequency "${frequency}".`);
   if (!isRecord(r.config))
     throw errors.validation("A recurring series in the export has an invalid schedule config.");
+  // The importer restores series verbatim, so the config must satisfy the
+  // same rules the recurring service enforces at creation time — an
+  // out-of-range weekly weekday, for example, would wedge the worker's
+  // next-occurrence scan.
+  validateSeriesConfig(frequency as Frequency, r.config as SeriesConfig);
+  const amountMinor = reqMinor(r.amountMinor, "recurring amount");
+  if (amountMinor === 0)
+    throw errors.validation("A recurring series in the export has a zero amount.");
   return {
     id: reqId(r.id, "recurring series"),
     accountId: reqId(r.accountId, "recurring account"),
     createdBy: optId(r.createdBy),
     name: reqText(r.name, "recurring series name", 240),
     merchant: optText(r.merchant, 240),
-    amountMinor: reqMinor(r.amountMinor, "recurring amount"),
+    amountMinor,
     currency: reqCurrency(r.currency),
     categoryId: optId(r.categoryId),
     frequency,

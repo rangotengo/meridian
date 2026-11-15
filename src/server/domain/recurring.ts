@@ -56,6 +56,12 @@ export function nextOccurrence(frequency: Frequency, config: SeriesConfig, from:
   switch (frequency) {
     case "weekly": {
       const weekday = config.weekday ?? new Date(`${from}T00:00:00Z`).getUTCDay();
+      // Defensive bound: an out-of-range weekday (e.g. from a hand-edited
+      // database row) must fail fast instead of looping forever — the scan
+      // below can never need more than 7 steps for a valid weekday.
+      if (!Number.isInteger(weekday) || weekday < 0 || weekday > 6) {
+        throw errors.validation("Weekly series require a weekday (0-6).");
+      }
       let next = addDays(from, 1);
       while (new Date(`${next}T00:00:00Z`).getUTCDay() !== weekday) {
         next = addDays(next, 1);
@@ -90,37 +96,36 @@ function clampToMonth(firstOfMonth: string, day: number): string {
   return `${firstOfMonth.slice(0, 8)}${pad2(Math.min(Math.max(day, 1), last))}`;
 }
 
-function validateInput(input: RecurringSeriesInput): void {
-  const name = input.name.trim();
-  if (!name) throw errors.validation("A name is required.");
-  if (name.length > MAX_NAME_LENGTH) throw errors.validation("Name is too long.");
-  if (input.amountLedgerMinor === 0) throw errors.validation("Amount cannot be zero.");
-  if (!isIsoDate(input.nextDue))
-    throw errors.validation("Next due date must be in YYYY-MM-DD format.");
-
-  switch (input.frequency) {
+/**
+ * The schedule-config rules every series must satisfy, shared by series
+ * creation and the family-export importer (which restores series verbatim
+ * and so must reject configs the service itself would never accept — an
+ * out-of-range weekly weekday, for instance, would wedge nextOccurrence).
+ */
+export function validateSeriesConfig(frequency: Frequency, config: SeriesConfig): void {
+  switch (frequency) {
     case "monthly":
-      if (!input.config.dayOfMonth || input.config.dayOfMonth < 1 || input.config.dayOfMonth > 31) {
+      if (
+        !Number.isInteger(config.dayOfMonth) ||
+        config.dayOfMonth! < 1 ||
+        config.dayOfMonth! > 31
+      ) {
         throw errors.validation("Monthly series require a day of month (1-31).");
       }
       break;
     case "weekly":
-      if (
-        input.config.weekday === undefined ||
-        input.config.weekday < 0 ||
-        input.config.weekday > 6
-      ) {
+      if (!Number.isInteger(config.weekday) || config.weekday! < 0 || config.weekday! > 6) {
         throw errors.validation("Weekly series require a weekday (0-6).");
       }
       break;
     case "yearly":
       if (
-        !input.config.month ||
-        input.config.month < 1 ||
-        input.config.month > 12 ||
-        !input.config.day ||
-        input.config.day < 1 ||
-        input.config.day > 31
+        !Number.isInteger(config.month) ||
+        config.month! < 1 ||
+        config.month! > 12 ||
+        !Number.isInteger(config.day) ||
+        config.day! < 1 ||
+        config.day! > 31
       ) {
         throw errors.validation("Yearly series require a month (1-12) and day (1-31).");
       }
@@ -128,6 +133,16 @@ function validateInput(input: RecurringSeriesInput): void {
     default:
       throw errors.validation("Unsupported frequency.");
   }
+}
+
+function validateInput(input: RecurringSeriesInput): void {
+  const name = input.name.trim();
+  if (!name) throw errors.validation("A name is required.");
+  if (name.length > MAX_NAME_LENGTH) throw errors.validation("Name is too long.");
+  if (input.amountLedgerMinor === 0) throw errors.validation("Amount cannot be zero.");
+  if (!isIsoDate(input.nextDue))
+    throw errors.validation("Next due date must be in YYYY-MM-DD format.");
+  validateSeriesConfig(input.frequency, input.config);
 }
 
 async function assertAccountAndCategory(

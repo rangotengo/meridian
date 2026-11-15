@@ -45,6 +45,12 @@ export function FamilyImportForm() {
               members of this family.
             </p>
           ) : null}
+          {skipped && skipped.exchangeRates > 0 ? (
+            <p className="mt-1 text-xs text-muted-foreground">
+              Skipped {pluralize(skipped.exchangeRates, "exchange rate")}: exchange rates are
+              instance-wide and only a platform super-admin restore applies them.
+            </p>
+          ) : null}
         </div>
       ) : null}
     </form>

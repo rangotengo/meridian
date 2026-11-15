@@ -115,6 +115,8 @@ export async function buildFamilyExport(exec: Executor, actor: Actor): Promise<F
     .from(users)
     .where(eq(users.familyId, familyId));
 
+  // Saved filters are private to their owner: an export carries only the
+  // exporting actor's own filters, never other members' saved searches.
   const savedFilterRows = await exec
     .select({
       id: savedFilters.id,
@@ -123,8 +125,7 @@ export async function buildFamilyExport(exec: Executor, actor: Actor): Promise<F
       params: savedFilters.params
     })
     .from(savedFilters)
-    .innerJoin(users, eq(users.id, savedFilters.userId))
-    .where(eq(users.familyId, familyId));
+    .where(eq(savedFilters.userId, actor.userId));
 
   const shareRows = [];
   for (const chunk of chunkParams(visibleAccountIds)) {
@@ -148,6 +149,17 @@ export async function buildFamilyExport(exec: Executor, actor: Actor): Promise<F
     list.push(link.tagId);
     tagsByEntry.set(link.entryId, list);
   }
+
+  // A transfer is exported only when BOTH legs are in accounts the actor can
+  // see; a half-visible transfer would dangle (its other leg is not in the
+  // export) and leak the existence of an account the actor cannot access.
+  // Legs of an excluded transfer are exported as ordinary transactions with
+  // no transfer link.
+  const exportedEntryIds = new Set(entryRows.map((r) => r.entry.id));
+  const completeTransfers = transferRows.filter(
+    (t) => exportedEntryIds.has(t.outflowEntryId) && exportedEntryIds.has(t.inflowEntryId)
+  );
+  const completeTransferIds = new Set(completeTransfers.map((t) => t.id));
 
   await recordAudit(exec, {
     familyId,
@@ -199,12 +211,12 @@ export async function buildFamilyExport(exec: Executor, actor: Actor): Promise<F
         recurringSeriesId: entry.recurringSeriesId,
         categoryId: txnCategoryId ?? null,
         merchant: txnMerchant ?? null,
-        transferId: txnTransferId ?? null,
+        transferId: txnTransferId && completeTransferIds.has(txnTransferId) ? txnTransferId : null,
         valuationKind: valuationKind ?? null,
         tagIds: tagsByEntry.get(entry.id) ?? []
       })
     ),
-    transfers: transferRows,
+    transfers: completeTransfers,
     budgets: budgetRows.map((b) => ({
       id: b.id,
       categoryId: b.categoryId,
