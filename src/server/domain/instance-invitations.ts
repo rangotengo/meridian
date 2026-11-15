@@ -1,5 +1,6 @@
 import { and, desc, eq, isNull, sql } from "drizzle-orm";
 import type { Executor } from "../db/client";
+import { databaseNow } from "../db/dialect";
 import { families, instanceInvitations, users } from "../db/schema";
 import { assertSuperAdmin, type Actor } from "../auth/context";
 import { hashPassword, hashToken, passwordPolicyError, randomToken } from "@/lib/crypto";
@@ -28,15 +29,33 @@ export async function createInstanceInvitation(
   const email = input.email.trim().toLowerCase();
   if (!EMAIL_PATTERN.test(email)) throw errors.validation("Enter a valid email address.");
 
+  // Any existing account blocks the invitation, active or removed: acceptance
+  // creates a brand-new user for the email, and a removed user's row still
+  // owns it. Removed accounts are never deleted or reactivated by an invite,
+  // so the operator must use a different email for that person.
   const existing = await findUserByEmail(exec, email);
-  if (existing && !existing.removedAt) {
+  if (existing) {
+    if (existing.removedAt) {
+      throw errors.conflict(
+        "That email belongs to a removed account and cannot be invited to create a new household. Use a different email address."
+      );
+    }
     throw errors.conflict("That person already has an account.");
   }
 
+  // The cap counts only live invitations (unaccepted and unexpired) and
+  // excludes the target email's own pending invitation: reissuing replaces
+  // that row below instead of consuming a second slot.
   const [pending] = await exec
     .select({ count: sql<number>`CAST(count(*) AS INTEGER)` })
     .from(instanceInvitations)
-    .where(isNull(instanceInvitations.acceptedAt));
+    .where(
+      and(
+        isNull(instanceInvitations.acceptedAt),
+        sql`${instanceInvitations.expiresAt} > ${databaseNow}`,
+        sql`lower(email) <> ${email}`
+      )
+    );
   if ((pending?.count ?? 0) >= MAX_PENDING_INVITES) {
     throw errors.conflict("Too many pending invitations. Revoke some first.");
   }
@@ -121,7 +140,28 @@ export async function acceptInstanceInvitation(
     const invitation = await getInstanceInvitationByToken(tx, token);
     if (!invitation) throw errors.validation("This invitation link is invalid or has expired.");
 
-    const existing = await findUserByEmail(tx, invitation.email);
+    // Claim the invitation atomically before creating anything: one
+    // conditional UPDATE that matches only a still-pending, unexpired row
+    // (the same claim pattern as consumeAuthToken). If a concurrent
+    // revoke/reissue deleted the row, or another acceptance claimed it,
+    // after the read above, this returns no row and the transaction aborts
+    // — a household is never committed against a dead invitation. The claim
+    // lives in this transaction, so any later failure rolls it back and the
+    // invitation stays usable.
+    const [claimed] = await tx
+      .update(instanceInvitations)
+      .set({ acceptedAt: new Date() })
+      .where(
+        and(
+          eq(instanceInvitations.tokenHash, hashToken(token)),
+          isNull(instanceInvitations.acceptedAt),
+          sql`${instanceInvitations.expiresAt} > ${databaseNow}`
+        )
+      )
+      .returning({ id: instanceInvitations.id, email: instanceInvitations.email });
+    if (!claimed) throw errors.validation("This invitation link is invalid or has expired.");
+
+    const existing = await findUserByEmail(tx, claimed.email);
     if (existing) throw errors.conflict("That email is already registered.");
 
     const [family] = await tx
@@ -138,7 +178,7 @@ export async function acceptInstanceInvitation(
       .insert(users)
       .values({
         familyId,
-        email: invitation.email,
+        email: claimed.email,
         passwordHash,
         name,
         familyRole: "admin",
@@ -151,17 +191,12 @@ export async function acceptInstanceInvitation(
       .returning({ id: users.id });
     const userId = user!.id;
 
-    await tx
-      .update(instanceInvitations)
-      .set({ acceptedAt: new Date() })
-      .where(eq(instanceInvitations.id, invitation.id));
-
     await recordAudit(tx, {
       familyId,
       actorUserId: userId,
       action: "instance_invitation.accepted",
       entityType: "instance_invitation",
-      entityId: invitation.id
+      entityId: claimed.id
     });
 
     return { userId, familyId };
@@ -178,7 +213,12 @@ export async function listPendingInstanceInvitations(exec: Executor, actor: Acto
       expiresAt: instanceInvitations.expiresAt
     })
     .from(instanceInvitations)
-    .where(isNull(instanceInvitations.acceptedAt))
+    .where(
+      and(
+        isNull(instanceInvitations.acceptedAt),
+        sql`${instanceInvitations.expiresAt} > ${databaseNow}`
+      )
+    )
     .orderBy(desc(instanceInvitations.createdAt));
 }
 
