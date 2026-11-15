@@ -27,6 +27,13 @@ vitest.config.ts.timestamp-*
 
 # Playwright MCP working artifacts
 .playwright-mcp/
+
+# Playwright E2E (e2e/) generated artifacts
+/test-results/
+/playwright-report/
+/blob-report/
+/e2e/.auth/
+/e2e/test-data.json
 pg_review.log
 
 # Operator CLI restore/undo bookmark log (bin/cloud-ops.mjs)

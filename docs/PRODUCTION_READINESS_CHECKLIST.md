@@ -28,8 +28,22 @@ remains the local/docker backend only.
       `cron.lastTickAt` (last successful five-minute tick) and mail config.
 - [x] Earlier release blockers: safe admin promotion (S13), member removal
       (S14), currency-change safety (F13), fail-closed mailer configuration.
+- [x] Browser E2E suite (Playwright, `e2e/`, run with `npm run test:e2e`):
+      the production build served locally against a seeded test household —
+      login (success and wrong password), family invitation acceptance,
+      member access levels (read-only controls disabled, read-write
+      annotation-only), transfers with both legs linked, transaction
+      splits, 390px mobile layout without horizontal overflow, and
+      axe-core accessibility smoke (no critical violations) on sign-in and
+      dashboard. See `e2e/README.md` for the seed design and spec map.
 
 ## Remaining operator tasks
+
+The sign-in drill, first real household, live MeroShare, PITR restore
+drill, Shortcuts service token, uptime monitor, and scheduled off-site
+export items below are inherently live-production tasks: the automated
+suites (unit, cloud, browser E2E) support them but cannot substitute for
+doing them against production.
 
 - [ ] Live sign-in drill: complete Google and email-code login in production
       (login page verified 2026-09-09; interactive sign-in still untested).
@@ -45,10 +59,13 @@ remains the local/docker backend only.
       headers; alert on non-200 and on a stale `cron.lastTickAt`.
 - [ ] Schedule off-site encrypted exports (any machine with the ops token;
       suggested 7 daily / 4 weekly / 12 monthly).
-- [ ] Browser E2E against a production-shaped environment: signup,
-      login/logout, invitations, member roles, private accounts, transfers,
-      splits, reports, exports/imports, recurring entries, MeroShare; plus
-      mobile layout, accessibility and large-export checks before wider use.
+- [ ] Browser E2E — remaining coverage: the automated suite (above) covers
+      login, invitations, member roles, private accounts, transfers,
+      splits, mobile layout, and accessibility against a locally served
+      production build. Still outstanding: logout and public signup flows,
+      reports, exports/imports, recurring entries, and large-export checks
+      in the browser; a full suite run against the deployed environment;
+      and a MeroShare browser flow (blocked on a live connection, below).
 
 ## Accepted risks and limits
 
