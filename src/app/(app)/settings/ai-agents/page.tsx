@@ -25,6 +25,7 @@ export default async function AiAgentsPage() {
     clientName: c.grant.clientName,
     status: c.status,
     scopes: c.grant.scopes,
+    ssisAccess: c.grant.ssisAccess,
     familyName: c.familyName,
     accounts: c.accounts,
     createdAt: c.grant.createdAt,

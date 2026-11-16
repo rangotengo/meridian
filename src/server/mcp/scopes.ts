@@ -46,8 +46,27 @@ export const TOOL_SCOPES = {
   get_income_expense_trend: "finance:read",
   get_budget_progress: "finance:read",
   list_recurring_transactions: "finance:read",
-  get_net_worth_history: "finance:read"
+  get_net_worth_history: "finance:read",
+  get_ssis_summary: "finance:read",
+  list_ssis_purchases: "finance:read",
+  list_ssis_statement: "finance:read",
+  get_ssis_nav_history: "finance:read"
 } as const;
+
+/**
+ * SSIS access is NOT a scope: it is an explicit per-connection
+ * permission stored on the grant (oauth_grants.ssis_access, default
+ * false). The SSIS tools above require their finance:read scope AND
+ * that flag — a connection holding finance:read alone must never gain
+ * the SSIS dataset silently, because SSIS is household-wide insight
+ * data that the grant's account ceiling does not restrict. The wording
+ * for the consent page and the Connected AI agents page lives here, in
+ * the same single place as the scope wording.
+ */
+export const SSIS_ACCESS_LABEL = "SSIS investment insight";
+
+export const SSIS_ACCESS_DESCRIPTION =
+  "Also read the household's SSIS insight (the Siddhartha Systematic Investment Scheme tracker): purchase history, statement entries, NAV history and totals. SSIS is household-wide insight data kept separate from accounts — any account restrictions on this connection do not apply to it.";
 
 /**
  * Extra scope the merchant grouping of get_spending_breakdown requires:

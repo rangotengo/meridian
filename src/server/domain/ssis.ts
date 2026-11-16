@@ -223,6 +223,48 @@ export type SsisStatementRow = {
 
 export type SsisNavPoint = { engDate: string; nepDate: string; navMinor: number };
 
+/**
+ * Stored-row → read-model projections, shared by the insight page
+ * (getSsisInsight) and the MCP SSIS tools so both surfaces expose
+ * exactly the same whitelisted fields for a row.
+ */
+export function toSsisPurchaseRow(row: typeof ssisPurchases.$inferSelect): SsisPurchaseRow {
+  return {
+    requestNo: row.requestNo,
+    applyDate: row.applyDate,
+    units: row.units,
+    amountMinor: row.amountMinor,
+    status: row.status,
+    purchaseNavMinor: row.purchaseNavMinor,
+    navDate: row.navDate,
+    schemeName: row.schemeName,
+    isSip: row.isSip
+  };
+}
+
+export function toSsisStatementRow(
+  row: typeof ssisStatementEntries.$inferSelect
+): SsisStatementRow {
+  return {
+    transNo: row.transNo,
+    installmentDate: row.installmentDate,
+    dueDate: row.dueDate,
+    actionDate: row.actionDate,
+    amountCrMinor: row.amountCrMinor,
+    amountDrMinor: row.amountDrMinor,
+    units: row.units,
+    appliedNavMinor: row.appliedNavMinor,
+    payment: row.payment,
+    otherChargesMinor: row.otherChargesMinor,
+    sebonFeeMinor: row.sebonFeeMinor,
+    sipRegNo: row.sipRegNo
+  };
+}
+
+export function toSsisNavPoint(row: typeof ssisNavHistory.$inferSelect): SsisNavPoint {
+  return { engDate: row.engDate, nepDate: row.nepDate, navMinor: row.navMinor };
+}
+
 export type SsisExtractedSnapshot = {
   purchases: SsisPurchaseRow[];
   statement: SsisStatementRow[];
@@ -232,6 +274,13 @@ export type SsisExtractedSnapshot = {
   holderNames: string[];
   navDataNav: { navMinor: number; navDate: string } | null;
   skipped: number;
+  /**
+   * Skipped-row counts per dataset. A dataset whose response contained
+   * rows that could not be read was NOT fully extracted, however the
+   * fetch itself went — coverage uses these counts so an HTTP/envelope
+   * success with dropped rows is never reported as complete.
+   */
+  skippedByDataset: { purchases: number; statement: number; nav: number };
 };
 
 function extractPurchase(row: unknown): SsisPurchaseRow | null {
@@ -365,11 +414,13 @@ export function extractSsisSnapshot(payload: unknown): SsisExtractedSnapshot {
   }
 
   let skipped = 0;
+  const skippedByDataset = { purchases: 0, statement: 0, nav: 0 };
   const purchaseByKey = new Map<string, SsisPurchaseRow>();
   for (const row of unitPurchase) {
     const parsed = extractPurchase(row);
     if (!parsed) {
       skipped += 1;
+      skippedByDataset.purchases += 1;
       continue;
     }
     purchaseByKey.set(parsed.requestNo, parsed); // uniqueBy: last wins
@@ -379,6 +430,7 @@ export function extractSsisSnapshot(payload: unknown): SsisExtractedSnapshot {
     const parsed = extractStatementRow(row);
     if (!parsed) {
       skipped += 1;
+      skippedByDataset.statement += 1;
       continue;
     }
     statementByKey.set(parsed.transNo, parsed);
@@ -388,6 +440,7 @@ export function extractSsisSnapshot(payload: unknown): SsisExtractedSnapshot {
     const parsed = extractNavPoint(row);
     if (!parsed) {
       skipped += 1;
+      skippedByDataset.nav += 1;
       continue;
     }
     navByDate.set(parsed.engDate, parsed);
@@ -430,7 +483,8 @@ export function extractSsisSnapshot(payload: unknown): SsisExtractedSnapshot {
     holderName: holderNames[0] ?? null,
     holderNames,
     navDataNav: extractNavDataNav(navData),
-    skipped
+    skipped,
+    skippedByDataset
   };
 }
 
@@ -619,7 +673,86 @@ export type SsisImportOptions = {
    * insight with the previous holder's rows.
    */
   expectedConfig?: { boAccountNo: string; configGeneration: number };
+  /**
+   * Refresh commits also carry the fetcher's per-dataset outcomes so the
+   * commit can persist dataset coverage alongside the rows (see
+   * SsisCoverage). Snapshot imports omit this: every dataset is present
+   * in the envelope, so each counts as fetched — but the commit still
+   * only records "ok" for a dataset the snapshot fully accounts for
+   * (no skipped rows, no retained rows absent from the file).
+   */
+  datasetOutcomes?: SsisDatasetOutcomes;
 };
+
+export type SsisDatasetOutcomes = { purchases: boolean; statement: boolean; nav: boolean };
+
+// ---------------------------------------------------------------------------
+// Dataset coverage
+// ---------------------------------------------------------------------------
+
+export type SsisDatasetStatus = "ok" | "failed" | "partial" | "unknown";
+export type SsisDatasetCoverage = { status: SsisDatasetStatus; fetchedAt: string | null };
+export type SsisCoverage = {
+  purchases: SsisDatasetCoverage;
+  statement: SsisDatasetCoverage;
+  nav: SsisDatasetCoverage;
+};
+
+type SsisStateRow = typeof ssisInsightState.$inferSelect;
+
+function datasetCoverage(
+  coverage: string | null | undefined,
+  fetchedAt: Date | string | null | undefined
+): SsisDatasetCoverage {
+  return {
+    status:
+      coverage === "ok"
+        ? "ok"
+        : coverage === "failed"
+          ? "failed"
+          : coverage === "partial"
+            ? "partial"
+            : "unknown",
+    fetchedAt: fetchedAt ? new Date(fetchedAt).toISOString() : null
+  };
+}
+
+/**
+ * The persisted per-dataset coverage contract: each dataset's last known
+ * fetch outcome and when it last fetched COMPLETELY. "ok" is earned only
+ * by a fetch (live refresh or snapshot import) that succeeded AND fully
+ * accounts for the stored dataset: no rows in the response were skipped
+ * as malformed, and no previously stored row is absent from the response
+ * (imports/refreshes upsert, so absent rows are retained — retained rows
+ * make the dataset "partial", never silently fresh). "partial" means the
+ * last fetch succeeded but did not fully account for the dataset, so the
+ * stored rows mix fresh and retained data. "failed" means the last fetch
+ * could not retrieve the dataset at all. "unknown" means coverage was
+ * never established — no refresh outcome and no snapshot import has
+ * recorded one — so stored rows alone prove nothing about completeness.
+ * fetchedAt moves ONLY on "ok": it is the last time the dataset was
+ * fetched completely, so partial or failed data stays visibly dated by
+ * the last complete fetch instead of looking fresh. A snapshot import's
+ * "ok" is scoped to the supplied snapshot — it states the stored rows
+ * match that file exactly, not that the file itself was the holder's
+ * full upstream history.
+ */
+export function ssisCoverageFromState(state: SsisStateRow | null | undefined): SsisCoverage {
+  return {
+    purchases: datasetCoverage(state?.purchasesCoverage, state?.purchasesFetchedAt),
+    statement: datasetCoverage(state?.statementCoverage, state?.statementFetchedAt),
+    nav: datasetCoverage(state?.navCoverage, state?.navFetchedAt)
+  };
+}
+
+export async function getSsisCoverage(exec: Executor, familyId: string): Promise<SsisCoverage> {
+  const [state] = await exec
+    .select()
+    .from(ssisInsightState)
+    .where(eq(ssisInsightState.familyId, familyId))
+    .limit(1);
+  return ssisCoverageFromState(state ?? null);
+}
 
 /**
  * Serialize SSIS writes per family (the family-import pattern). On the
@@ -790,6 +923,102 @@ export async function importSsisSnapshot(
           set: { nepDate: point.nepDate, navMinor: point.navMinor, updatedAt: new Date() }
         });
     }
+    // Persist per-dataset coverage in the same commit as the rows it
+    // describes, so a later read can never see rows without the outcome
+    // that produced them. A dataset earns 'ok' — and moves its
+    // last-complete-fetch timestamp — only when this commit fully
+    // accounts for it:
+    //   - the fetch itself succeeded (a failed fetch records 'failed'
+    //     and NEVER moves the timestamp, so rows from an older success
+    //     stay visibly stale instead of looking fresh);
+    //   - extraction skipped no rows from its response (an envelope
+    //     success with malformed rows dropped is 'partial', not 'ok');
+    //   - no previously stored row is absent from the response. This
+    //     commit upserts and never deletes, so rows the latest response
+    //     no longer mentions are RETAINED history, not refreshed data:
+    //     the dataset is 'partial' and its timestamp stays at the last
+    //     complete fetch, so a successful-but-empty holder response
+    //     over a populated insight can never present the retained rows
+    //     as a fully refreshed, complete position.
+    // When no outcomes are known (a refresh-shaped commit without
+    // fetcher outcomes), the stored coverage is left untouched rather
+    // than guessed.
+    const outcomes =
+      options.datasetOutcomes ??
+      (source === "import" ? { purchases: true, statement: true, nav: true } : null);
+    let coverageInsert: Record<string, unknown> = {};
+    let coverageUpdate: Record<string, unknown> = {};
+    if (outcomes) {
+      const storedPurchaseKeys = new Set(
+        (
+          await tx
+            .select({ requestNo: ssisPurchases.requestNo })
+            .from(ssisPurchases)
+            .where(eq(ssisPurchases.familyId, familyId))
+        ).map((r) => r.requestNo)
+      );
+      const storedStatementKeys = new Set(
+        (
+          await tx
+            .select({ transNo: ssisStatementEntries.transNo })
+            .from(ssisStatementEntries)
+            .where(eq(ssisStatementEntries.familyId, familyId))
+        ).map((r) => r.transNo)
+      );
+      const storedNavKeys = new Set(
+        (
+          await tx
+            .select({ engDate: ssisNavHistory.engDate })
+            .from(ssisNavHistory)
+            .where(eq(ssisNavHistory.familyId, familyId))
+        ).map((r) => r.engDate)
+      );
+      const retainedCount = (stored: Set<string>, incoming: Set<string>): number => {
+        let count = 0;
+        for (const key of stored) if (!incoming.has(key)) count += 1;
+        return count;
+      };
+      const verdict = (
+        fetched: boolean,
+        skippedCount: number,
+        retained: number
+      ): SsisDatasetStatus =>
+        !fetched ? "failed" : skippedCount > 0 || retained > 0 ? "partial" : "ok";
+      const verdicts = {
+        purchases: verdict(
+          outcomes.purchases,
+          data.skippedByDataset.purchases,
+          retainedCount(storedPurchaseKeys, new Set(data.purchases.map((p) => p.requestNo)))
+        ),
+        statement: verdict(
+          outcomes.statement,
+          data.skippedByDataset.statement,
+          retainedCount(storedStatementKeys, new Set(data.statement.map((r) => r.transNo)))
+        ),
+        nav: verdict(
+          outcomes.nav,
+          data.skippedByDataset.nav,
+          retainedCount(storedNavKeys, new Set(data.navHistory.map((p) => p.engDate)))
+        )
+      };
+      const fetchedNow = new Date();
+      coverageInsert = {
+        purchasesCoverage: verdicts.purchases,
+        purchasesFetchedAt: verdicts.purchases === "ok" ? fetchedNow : null,
+        statementCoverage: verdicts.statement,
+        statementFetchedAt: verdicts.statement === "ok" ? fetchedNow : null,
+        navCoverage: verdicts.nav,
+        navFetchedAt: verdicts.nav === "ok" ? fetchedNow : null
+      };
+      coverageUpdate = {
+        purchasesCoverage: verdicts.purchases,
+        ...(verdicts.purchases === "ok" ? { purchasesFetchedAt: fetchedNow } : {}),
+        statementCoverage: verdicts.statement,
+        ...(verdicts.statement === "ok" ? { statementFetchedAt: fetchedNow } : {}),
+        navCoverage: verdicts.nav,
+        ...(verdicts.nav === "ok" ? { navFetchedAt: fetchedNow } : {})
+      };
+    }
     await tx
       .insert(ssisInsightState)
       .values({
@@ -798,7 +1027,8 @@ export async function importSsisSnapshot(
         latestNavMinor: stateNav?.navMinor ?? null,
         latestNavDate: stateNav?.navDate ?? null,
         lastFetchedAt: new Date(),
-        lastSource: source
+        lastSource: source,
+        ...coverageInsert
       })
       .onConflictDoUpdate({
         target: ssisInsightState.familyId,
@@ -809,6 +1039,7 @@ export async function importSsisSnapshot(
             : {}),
           lastFetchedAt: new Date(),
           lastSource: source,
+          ...coverageUpdate,
           updatedAt: new Date()
         }
       });
@@ -974,7 +1205,17 @@ export async function setSsisBoAccountNo(
       const configGeneration =
         (state?.configGeneration ?? 0) + (changed && previousBo !== null ? 1 : 0);
       const resetFields = dataReset
-        ? { holderName: null, lastFetchedAt: null, lastSource: null }
+        ? {
+            holderName: null,
+            lastFetchedAt: null,
+            lastSource: null,
+            // The cleared holder datasets have no coverage anymore; NAV
+            // history is scheme-level and kept, so its coverage stays.
+            purchasesCoverage: null,
+            purchasesFetchedAt: null,
+            statementCoverage: null,
+            statementFetchedAt: null
+          }
         : {};
       await tx
         .insert(ssisInsightState)
@@ -1037,7 +1278,8 @@ export async function refreshSsis(
     );
   }
   const counts = await importSsisSnapshot(exec, actor, snapshot.payload, "refresh", {
-    expectedConfig: { boAccountNo, configGeneration }
+    expectedConfig: { boAccountNo, configGeneration },
+    datasetOutcomes: snapshot.datasets
   });
   return { ...counts, warnings: snapshot.warnings };
 }
@@ -1052,6 +1294,7 @@ export type SsisInsightData = {
   schemeName: string;
   lastFetchedAt: string | null;
   lastSource: string | null;
+  coverage: SsisCoverage;
   hasBoAccount: boolean;
   boAccountMasked: string | null;
   canManage: boolean;
@@ -1092,36 +1335,9 @@ export async function getSsisInsight(exec: Executor, actor: Actor): Promise<Ssis
   ]);
   const state = stateRows[0] ?? null;
   const today = todayIn(familyRows[0]?.timezone ?? "UTC");
-  const purchases: SsisPurchaseRow[] = purchaseRows.map((row) => ({
-    requestNo: row.requestNo,
-    applyDate: row.applyDate,
-    units: row.units,
-    amountMinor: row.amountMinor,
-    status: row.status,
-    purchaseNavMinor: row.purchaseNavMinor,
-    navDate: row.navDate,
-    schemeName: row.schemeName,
-    isSip: row.isSip
-  }));
-  const statement: SsisStatementRow[] = statementRows.map((row) => ({
-    transNo: row.transNo,
-    installmentDate: row.installmentDate,
-    dueDate: row.dueDate,
-    actionDate: row.actionDate,
-    amountCrMinor: row.amountCrMinor,
-    amountDrMinor: row.amountDrMinor,
-    units: row.units,
-    appliedNavMinor: row.appliedNavMinor,
-    payment: row.payment,
-    otherChargesMinor: row.otherChargesMinor,
-    sebonFeeMinor: row.sebonFeeMinor,
-    sipRegNo: row.sipRegNo
-  }));
-  const navHistory: SsisNavPoint[] = navRows.map((row) => ({
-    engDate: row.engDate,
-    nepDate: row.nepDate,
-    navMinor: row.navMinor
-  }));
+  const purchases: SsisPurchaseRow[] = purchaseRows.map(toSsisPurchaseRow);
+  const statement: SsisStatementRow[] = statementRows.map(toSsisStatementRow);
+  const navHistory: SsisNavPoint[] = navRows.map(toSsisNavPoint);
   const stateNav =
     state?.latestNavMinor != null && state?.latestNavDate
       ? { navMinor: state.latestNavMinor, navDate: state.latestNavDate }
@@ -1139,6 +1355,7 @@ export async function getSsisInsight(exec: Executor, actor: Actor): Promise<Ssis
     schemeName,
     lastFetchedAt: state?.lastFetchedAt ? new Date(state.lastFetchedAt).toISOString() : null,
     lastSource: state?.lastSource ?? null,
+    coverage: ssisCoverageFromState(state),
     hasBoAccount: !!state?.boAccountNo,
     boAccountMasked: maskBoAccountNo(state?.boAccountNo ?? null),
     canManage: actor.familyRole === "admin",

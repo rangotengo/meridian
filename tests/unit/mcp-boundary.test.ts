@@ -54,7 +54,11 @@ const MUTATION_SYMBOLS = [
   "deleteRate",
   "createCategory",
   "updateCategory",
-  "deleteCategory"
+  "deleteCategory",
+  // SSIS mutators: the MCP SSIS tools are read-only by construction.
+  "importSsisSnapshot",
+  "refreshSsis",
+  "setSsisBoAccountNo"
 ];
 
 /** The only domain services the MCP tools may call (plus type-only names). */
@@ -75,6 +79,15 @@ const READ_SERVICE_ALLOWLIST = new Set([
   "dashboardSummary",
   "accessibleAccountIds",
   "recordAudit",
+  // SSIS read model (domain/ssis): calculations and row projections
+  // only — the mutators above stay banned.
+  "getSsisCoverage",
+  "getSsisInsight",
+  "resolveCurrentNav",
+  "toSsisNavPoint",
+  "toSsisPurchaseRow",
+  "toSsisStatementRow",
+  "SsisDatasetCoverage",
   // types
   "DashboardSummary",
   "FxCompleteness",

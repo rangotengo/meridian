@@ -725,6 +725,11 @@ export const oauthGrants = pgTable(
     /** Account ceiling consented to; empty means "all accounts the user can
      * currently access" (re-resolved per call, never a snapshot of rights). */
     accountIds: jsonb("account_ids").$type<string[]>().notNull().default([]),
+    /** Explicit per-connection permission for the SSIS insight dataset.
+     * SSIS is household-wide and separate from accounts, so finance:read
+     * never implies it: default false, owner opt-in only, checked on the
+     * live grant row by every SSIS tool handler. */
+    ssisAccess: boolean("ssis_access").notNull().default(false),
     status: text("status").notNull().default("active"),
     expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
     lastUsedAt: timestamp("last_used_at", { withTimezone: true }),
@@ -952,5 +957,16 @@ export const ssisInsightState = pgTable("ssis_insight_state", {
   latestNavDate: date("latest_nav_date"),
   lastFetchedAt: timestamp("last_fetched_at", { withTimezone: true }),
   lastSource: text("last_source"),
+  // Per-dataset fetch coverage (migration 0019): the last known outcome
+  // of each independently-fetched dataset ('ok' | 'failed'; NULL = never
+  // established) and when that dataset last fetched SUCCESSFULLY. A
+  // failed refresh updates coverage but never the timestamp, so partial
+  // refreshes cannot make stale holder data look fresh.
+  purchasesCoverage: text("purchases_coverage"),
+  purchasesFetchedAt: timestamp("purchases_fetched_at", { withTimezone: true }),
+  statementCoverage: text("statement_coverage"),
+  statementFetchedAt: timestamp("statement_fetched_at", { withTimezone: true }),
+  navCoverage: text("nav_coverage"),
+  navFetchedAt: timestamp("nav_fetched_at", { withTimezone: true }),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow()
 });

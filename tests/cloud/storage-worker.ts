@@ -44,6 +44,7 @@ import {
   summarizeHoldings
 } from "../../src/server/domain/holdings";
 import { mockMeroShareFetch } from "./meroshare-fixture";
+import { buildSsisPayload } from "../fixtures/ssis-snapshot";
 import { splitEntry } from "../../src/server/domain/splits";
 import { claimBatch, completeJob, enqueue } from "../../src/server/queue";
 import { createApiKey, verifyApiKey, revokeApiKey } from "../../src/server/domain/api-keys";
@@ -60,6 +61,7 @@ import {
   revokeGrant,
   resolveMcpAccess,
   resolveOAuthClient,
+  setGrantSsisAccess,
   validateAuthorizeRequest
 } from "../../src/server/domain/oauth";
 import type { McpConfig } from "../../src/lib/env";
@@ -2235,6 +2237,33 @@ export class StorageProbe {
         history.data.coverage?.complete === false &&
         history.data.coverage?.missingDays === 0;
 
+      // SSIS MCP tools: the per-connection permission gates the dataset
+      // on the cloud executor too. The `full` grant starts without it.
+      await importSsisSnapshot(exec, actor, buildSsisPayload(), "import");
+      const ssisDenied = await callTool(full.accessToken, "get_ssis_summary");
+      const ssisDeniedWithoutPermission = ssisDenied.isError === true;
+      const fullAccess = await resolveMcpAccess(exec, full.accessToken, config);
+      await setGrantSsisAccess(exec, fullAccess!.grant.id, user.id, true);
+      const ssisSummary = await callTool(full.accessToken, "get_ssis_summary");
+      const ssisSummaryOk =
+        ssisSummary.data?.ssis?.counts?.purchases === 3 &&
+        ssisSummary.data?.ssis?.totals?.totalInvested?.amountMinor === "177260";
+      // The shared fixture carries malformed rows (skipped=3), so on the
+      // cloud executor too the import's holder datasets are partial —
+      // never complete — while the fully extracted NAV dataset is ok
+      // and the totals are flagged incomplete.
+      const ssisCoveragePartial =
+        ssisSummary.data?.ssis?.coverage?.purchases?.status === "partial" &&
+        ssisSummary.data?.ssis?.coverage?.statement?.status === "partial" &&
+        ssisSummary.data?.ssis?.coverage?.nav?.status === "ok" &&
+        ssisSummary.data?.ssis?.coverage?.purchases?.fetchedAt == null &&
+        ssisSummary.data?.ssis?.totals?.complete === false;
+      const ssisPurchases = await callTool(full.accessToken, "list_ssis_purchases");
+      const ssisPurchasesOk = ssisPurchases.data?.purchases?.length === 3;
+      await setGrantSsisAccess(exec, fullAccess!.grant.id, user.id, false);
+      const ssisDeniedAgainRes = await callTool(full.accessToken, "get_ssis_summary");
+      const ssisDeniedAfterDisable = ssisDeniedAgainRes.isError === true;
+
       return Response.json({
         listAccountsOk,
         searchOk,
@@ -2247,7 +2276,12 @@ export class StorageProbe {
         breakdownMerchantOk,
         summaryOk,
         summaryExcludesCeilingAccount,
-        netWorthPartialFlagged
+        netWorthPartialFlagged,
+        ssisDeniedWithoutPermission,
+        ssisSummaryOk,
+        ssisCoveragePartial,
+        ssisPurchasesOk,
+        ssisDeniedAfterDisable
       });
     }
     if (operation === "/mcp-settings") {

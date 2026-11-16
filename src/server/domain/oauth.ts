@@ -380,21 +380,27 @@ async function resolveConsentAccountCeiling(
  * connection is its own grant row — reconnecting never revives or
  * extends an earlier grant) plus a single-use authorization code.
  *
- * `selection` is the consent page's account picker result. When omitted
- * (programmatic approvals, older forms), the grant gets the default
- * empty ceiling — all accounts the user can access. When present, the
- * ids are validated by resolveConsentAccountCeiling before anything is
- * stored.
+ * `consent` carries the consent page's CHOICES (never request data):
+ * - `accountIds`: the account picker's selection. When omitted (the
+ *   picker was not offered, or programmatic approvals), the grant gets
+ *   the default empty ceiling — all accounts the user can access. When
+ *   present, the ids are validated by resolveConsentAccountCeiling
+ *   before anything is stored.
+ * - `ssisAccess`: the SSIS opt-in checkbox. Defaults to false — the
+ *   permission is never granted implicitly, and finance:read does not
+ *   cover the SSIS dataset.
  */
 export async function approveAuthorizationRequest(
   exec: Executor,
   record: OAuthAuthorizationRequestRow,
   config: McpConfig,
-  selection?: { actor: Actor; accountIds: string[] }
+  consent?: { actor: Actor; accountIds?: string[]; ssisAccess?: boolean }
 ): Promise<{ grant: OAuthGrantRow; code: string }> {
-  const accountIds = selection
-    ? await resolveConsentAccountCeiling(exec, selection.actor, selection.accountIds)
-    : [];
+  const accountIds =
+    consent?.accountIds !== undefined
+      ? await resolveConsentAccountCeiling(exec, consent.actor, consent.accountIds)
+      : [];
+  const ssisAccess = consent?.ssisAccess === true;
   const now = new Date();
   const [grant] = await exec
     .insert(oauthGrants)
@@ -405,6 +411,7 @@ export async function approveAuthorizationRequest(
       clientName: record.clientName,
       scopes: record.scopes,
       accountIds,
+      ssisAccess,
       status: "active",
       expiresAt: new Date(now.getTime() + config.grantTtlSeconds * 1000)
     })
@@ -416,7 +423,7 @@ export async function approveAuthorizationRequest(
     action: "oauth_grant.created",
     entityType: "oauth_grant",
     entityId: created.id,
-    metadata: { clientId: record.clientId, scopes: record.scopes, accountIds }
+    metadata: { clientId: record.clientId, scopes: record.scopes, accountIds, ssisAccess }
   });
 
   const code = randomToken(32);
@@ -1013,6 +1020,7 @@ const CONNECTION_HISTORY_LIMIT = 10;
 const CONNECTION_HISTORY_ACTIONS = [
   "oauth_grant.created",
   "oauth_grant.revoked",
+  "oauth_grant.ssis_access_changed",
   "mcp.tool_called"
 ];
 
@@ -1095,6 +1103,44 @@ export async function listConnectionsForUser(
       history: historyByGrant.get(grant.id) ?? []
     };
   });
+}
+
+/**
+ * Owner-only toggle of a connection's SSIS permission. Only the grant's
+ * owner may change it (the lookup is scoped by userId, exactly like
+ * revocation), and because MCP access resolution re-reads the grant row
+ * on every call, the change takes effect on the very next tool call —
+ * no token reissue. Returns false when no grant with that id belongs to
+ * the user. Audited only when the value actually changes; the metadata
+ * carries the flag and client id, never SSIS data.
+ */
+export async function setGrantSsisAccess(
+  exec: Executor,
+  grantId: string,
+  userId: string,
+  enabled: boolean
+): Promise<boolean> {
+  const [grant] = await exec
+    .select()
+    .from(oauthGrants)
+    .where(and(eq(oauthGrants.id, grantId), eq(oauthGrants.userId, userId)))
+    .limit(1);
+  if (!grant) return false;
+  if (grant.ssisAccess !== enabled) {
+    await exec
+      .update(oauthGrants)
+      .set({ ssisAccess: enabled, updatedAt: new Date() })
+      .where(eq(oauthGrants.id, grantId));
+    await recordAudit(exec, {
+      familyId: grant.familyId,
+      actorUserId: userId,
+      action: "oauth_grant.ssis_access_changed",
+      entityType: "oauth_grant",
+      entityId: grantId,
+      metadata: { clientId: grant.clientId, ssisAccess: enabled }
+    });
+  }
+  return true;
 }
 
 /** Owner-initiated disconnect. Effective on the very next call because
