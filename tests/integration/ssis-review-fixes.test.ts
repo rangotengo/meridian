@@ -12,6 +12,7 @@ import { log } from "@/lib/logger";
 import {
   auditEvents,
   ssisInsightState,
+  ssisNavHistory,
   ssisPurchases,
   ssisStatementEntries
 } from "@/server/db/schema";
@@ -792,5 +793,55 @@ describe("SSIS review round 2 — effective-dataset bounds (Postgres)", () => {
       .from(auditEvents)
       .where(eq(auditEvents.action, "ssis.refreshed"));
     expect(refreshAudits).toHaveLength(0);
+  });
+});
+
+describe("SSIS effective bounds use the household date", () => {
+  beforeEach(async () => {
+    await truncateAll();
+  });
+  it("rolls back a quote current locally but still future-dated in UTC", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-11-16T20:00:00Z"));
+    try {
+      const actor = actorOf(await makeUser({ timezone: "Asia/Kathmandu" }));
+      await setSsisBoAccountNo(db(), actor, BO_A);
+      await importSsisSnapshot(
+        db(),
+        actor,
+        bigPurchasePayload({
+          requestNo: 1,
+          amount: "100.00",
+          units: "500000000000",
+          navValue: "1.00"
+        }),
+        "import"
+      );
+      const [before] = await db().select().from(ssisInsightState);
+      const update = [
+        {
+          unitPurchase: [],
+          statement: [],
+          navData: {},
+          overallNav: [{ eng_date: "2026-11-17", nep_date: "2083-08-01", nav: "1000000.00" }]
+        }
+      ];
+      await expect(
+        importSsisSnapshot(db(), actor, update, "refresh", {
+          expectedConfig: { boAccountNo: BO_A, configGeneration: 0 }
+        })
+      ).rejects.toThrow(/too large/);
+      const [after] = await db().select().from(ssisInsightState);
+      expect(after).toEqual(before);
+      expect((await getSsisInsight(db(), actor)).summary.currentValueMinor).toBe(50000000000000);
+      expect(await db().select().from(ssisNavHistory)).toHaveLength(0);
+      const audits = await db()
+        .select()
+        .from(auditEvents)
+        .where(eq(auditEvents.action, "ssis.refreshed"));
+      expect(audits).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

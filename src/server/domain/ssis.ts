@@ -641,26 +641,35 @@ export async function importSsisSnapshot(
   assertSsisAdmin(actor);
   const data = extractSsisSnapshot(payload);
   const familyId = actor.familyId;
-  const today = new Date().toISOString().slice(0, 10);
-  const stateNav = data.navDataNav ?? resolveCurrentNav(data.navHistory, null, today);
-
-  // The value this snapshot implies at its own current NAV must also be
-  // exactly representable before anything is persisted.
-  if (stateNav) {
-    let totalUnitsScaled = 0n;
-    for (const purchase of data.purchases) {
-      totalUnitsScaled += parseDecimalScaled(purchase.units, UNITS_SCALE) ?? 0n;
-    }
-    const value = roundHalfUpDiv(totalUnitsScaled * BigInt(stateNav.navMinor), UNITS_FACTOR);
-    if (toSafeNumber(value) === null) {
-      throw errors.validation(
-        "That snapshot's current value is too large for Meridian to represent exactly, so nothing was imported. Check the file and try again."
-      );
-    }
-  }
-
   await exec.transaction(async (tx) => {
     await lockSsisFamily(tx, familyId);
+    // Resolve the current NAV on the same household-local date as the
+    // page read model. UTC can still be yesterday when a quote is already
+    // current for this household; skipping that quote here would persist
+    // an overflowing valuation that the page cannot represent.
+    const [family] = await tx
+      .select({ timezone: families.timezone })
+      .from(families)
+      .where(eq(families.id, familyId))
+      .limit(1);
+    const today = todayIn(family?.timezone ?? "UTC");
+    const stateNav = data.navDataNav ?? resolveCurrentNav(data.navHistory, null, today);
+
+    // The value this snapshot implies at its own current NAV must also be
+    // exactly representable before anything is persisted.
+    if (stateNav) {
+      let totalUnitsScaled = 0n;
+      for (const purchase of data.purchases) {
+        totalUnitsScaled += parseDecimalScaled(purchase.units, UNITS_SCALE) ?? 0n;
+      }
+      const value = roundHalfUpDiv(totalUnitsScaled * BigInt(stateNav.navMinor), UNITS_FACTOR);
+      if (toSafeNumber(value) === null) {
+        throw errors.validation(
+          "That snapshot's current value is too large for Meridian to represent exactly, so nothing was imported. Check the file and try again."
+        );
+      }
+    }
+
     const [state] = await tx
       .select()
       .from(ssisInsightState)
