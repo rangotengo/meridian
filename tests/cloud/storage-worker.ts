@@ -2248,14 +2248,16 @@ export class StorageProbe {
       const ssisSummaryOk =
         ssisSummary.data?.ssis?.counts?.purchases === 3 &&
         ssisSummary.data?.ssis?.totals?.totalInvested?.amountMinor === "177260";
-      // The snapshot import establishes full dataset coverage on the
-      // cloud executor too, and the totals are flagged complete.
-      const ssisCoverageOk =
-        ssisSummary.data?.ssis?.coverage?.purchases?.status === "ok" &&
-        ssisSummary.data?.ssis?.coverage?.statement?.status === "ok" &&
+      // The shared fixture carries malformed rows (skipped=3), so on the
+      // cloud executor too the import's holder datasets are partial —
+      // never complete — while the fully extracted NAV dataset is ok
+      // and the totals are flagged incomplete.
+      const ssisCoveragePartial =
+        ssisSummary.data?.ssis?.coverage?.purchases?.status === "partial" &&
+        ssisSummary.data?.ssis?.coverage?.statement?.status === "partial" &&
         ssisSummary.data?.ssis?.coverage?.nav?.status === "ok" &&
-        ssisSummary.data?.ssis?.coverage?.purchases?.fetchedAt != null &&
-        ssisSummary.data?.ssis?.totals?.complete === true;
+        ssisSummary.data?.ssis?.coverage?.purchases?.fetchedAt == null &&
+        ssisSummary.data?.ssis?.totals?.complete === false;
       const ssisPurchases = await callTool(full.accessToken, "list_ssis_purchases");
       const ssisPurchasesOk = ssisPurchases.data?.purchases?.length === 3;
       await setGrantSsisAccess(exec, fullAccess!.grant.id, user.id, false);
@@ -2277,7 +2279,7 @@ export class StorageProbe {
         netWorthPartialFlagged,
         ssisDeniedWithoutPermission,
         ssisSummaryOk,
-        ssisCoverageOk,
+        ssisCoveragePartial,
         ssisPurchasesOk,
         ssisDeniedAfterDisable
       });

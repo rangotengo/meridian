@@ -163,8 +163,17 @@ function ssisCoverageLimitations(label: string, coverage: SsisDatasetCoverage): 
     return [
       `${label} data may be incomplete: the most recent refresh could not retrieve it from Siddhartha Capital${
         coverage.fetchedAt
-          ? `; the rows shown date from the last successful fetch at ${coverage.fetchedAt}`
-          : "; it has never been fetched successfully"
+          ? `; the rows shown date from the last complete fetch at ${coverage.fetchedAt}`
+          : "; it has never been fetched completely"
+      }.`
+    ];
+  }
+  if (coverage.status === "partial") {
+    return [
+      `${label} data may be incomplete: the most recent fetch succeeded but did not fully account for this dataset — some rows in the response could not be read, or rows already stored were absent from the response and are retained from an earlier fetch${
+        coverage.fetchedAt
+          ? `; the last fetch that fully accounted for this dataset was at ${coverage.fetchedAt}`
+          : "; this dataset has never been fetched completely"
       }.`
     ];
   }
@@ -920,7 +929,7 @@ export function createMeridianMcpServer(ctx: McpRequestContext): McpServer {
     {
       title: "Get SSIS summary",
       description:
-        "Read-only summary of the household's SSIS insight (Siddhartha Systematic Investment Scheme): totals invested, units held, current NAV and value, profit and return, plus dataset counts and per-dataset coverage. Requires the finance:read scope AND this connection's explicit SSIS permission (the owner enables it in Settings → Connected AI agents); SSIS is household-wide data separate from accounts, so account restrictions on the connection do not apply to it. Amounts are integer minor units as strings in NPR. A figure that cannot be represented exactly is null, never approximated. SSIS figures are NOT part of account balances or net worth, and this tool never imports or refreshes data. coverage reports, per dataset (purchases, statement, nav), the last known fetch outcome and the last successful fetch time; totals.complete is true only when purchase coverage is established — otherwise the totals are subtotals of the rows currently stored and may understate the position (e.g. after a partially failed refresh), never a confirmed complete zero.",
+        "Read-only summary of the household's SSIS insight (Siddhartha Systematic Investment Scheme): totals invested, units held, current NAV and value, profit and return, plus dataset counts and per-dataset coverage. Requires the finance:read scope AND this connection's explicit SSIS permission (the owner enables it in Settings → Connected AI agents); SSIS is household-wide data separate from accounts, so account restrictions on the connection do not apply to it. Amounts are integer minor units as strings in NPR. A figure that cannot be represented exactly is null, never approximated. SSIS figures are NOT part of account balances or net worth, and this tool never imports or refreshes data. coverage reports, per dataset (purchases, statement, nav), the last known fetch outcome and the last COMPLETE fetch time: a dataset is ok only when a fetch fully accounted for it — no rows in the response were skipped as unreadable, and no stored row was absent from the response (absent rows are retained, and a dataset with retained or skipped rows is reported partial, with its timestamp left at the last complete fetch); totals.complete is true only when purchase coverage is ok — otherwise the totals are subtotals of the rows currently stored and may understate the position (e.g. after a partially failed refresh), never a confirmed complete zero.",
       inputSchema: z.object({}),
       annotations: READ_ONLY_ANNOTATIONS
     },

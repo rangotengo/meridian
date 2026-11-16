@@ -10,6 +10,7 @@ import {
 } from "@/app/(app)/settings/actions";
 import { Field, FormError, Input, Select } from "@/components/ds/form";
 import { SubmitButton } from "@/components/ds/submit-button";
+import { applyTheme, type ThemePreference } from "@/lib/theme";
 
 export function ProfileForms({
   name,
@@ -93,7 +94,12 @@ function AppearanceForm({ theme }: { theme: "light" | "dark" | "system" }) {
     <form action={setPreferenceAction} className="space-y-3">
       <input type="hidden" name="key" value="theme" />
       <Field label="Appearance" htmlFor="s-theme">
-        <Select id="s-theme" name="value" defaultValue={theme}>
+        <Select
+          id="s-theme"
+          name="value"
+          defaultValue={theme}
+          onChange={(e) => applyTheme(e.target.value as ThemePreference)}
+        >
           <option value="system">System</option>
           <option value="light">Light</option>
           <option value="dark">Dark</option>

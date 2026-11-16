@@ -15,6 +15,7 @@ import { revokeOtherSessions } from "@/server/security/session";
 import { enqueue } from "@/server/queue";
 import { adminEmails, env } from "@/lib/env";
 import { errors } from "@/lib/errors";
+import { isThemePreference, THEME_COOKIE_MAX_AGE_SECONDS, THEME_COOKIE_NAME } from "@/lib/theme";
 import { assertPasswordAuth, usesCloudflareAccess } from "@/server/auth/access";
 
 const profileSchema = z.object({ name: z.string().min(1).max(120) });
@@ -44,7 +45,7 @@ export async function setPreferenceAction(formData: FormData): Promise<void> {
   const actor = await loadActor();
   if (!actor) return;
   const { key, value } = parsed.data;
-  if (key === "theme" && value !== "light" && value !== "dark" && value !== "system") return;
+  if (key === "theme" && !isThemePreference(value)) return;
   await usersSvc.setUserPreference(
     getDb(),
     actor.userId,
@@ -53,7 +54,11 @@ export async function setPreferenceAction(formData: FormData): Promise<void> {
   );
   if (key === "theme") {
     const store = await cookies();
-    store.set("theme", value, { path: "/", maxAge: 60 * 60 * 24 * 365, sameSite: "lax" });
+    store.set(THEME_COOKIE_NAME, value, {
+      path: "/",
+      maxAge: THEME_COOKIE_MAX_AGE_SECONDS,
+      sameSite: "lax"
+    });
   }
   revalidatePath("/", "layout");
 }

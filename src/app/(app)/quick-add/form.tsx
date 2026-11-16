@@ -98,13 +98,13 @@ export function QuickAddForm({
           maxLength={240}
           placeholder="Coffee"
           autoComplete="off"
-          className="py-3"
+          density="comfortable"
         />
       </label>
 
       <label className="block space-y-1">
         <span className="text-sm font-medium">Account</span>
-        <Select name="accountId" required defaultValue={accounts[0]?.id} className="py-3">
+        <Select name="accountId" required defaultValue={accounts[0]?.id} density="comfortable">
           {accounts.map((a) => (
             <option key={a.id} value={a.id}>
               {a.name}
@@ -115,8 +115,8 @@ export function QuickAddForm({
 
       <label className="block space-y-1">
         <span className="text-sm font-medium">Category (optional)</span>
-        <Select name="categoryId" className="py-3">
-          <option value="">—</option>
+        <Select name="categoryId" density="comfortable">
+          <option value="">Uncategorized</option>
           {categories.map((c) => (
             <option key={c.id} value={c.id}>
               {c.name}

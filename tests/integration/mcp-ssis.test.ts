@@ -2,7 +2,13 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { createHash } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { actorOf, db, makeUser, truncateAll, type TestUser } from "../helpers";
-import { auditEvents, ssisInsightState, ssisNavHistory, ssisPurchases } from "@/server/db/schema";
+import {
+  auditEvents,
+  ssisInsightState,
+  ssisNavHistory,
+  ssisPurchases,
+  ssisStatementEntries
+} from "@/server/db/schema";
 import type { McpConfig } from "@/lib/env";
 import { randomToken } from "@/lib/crypto";
 import {
@@ -450,7 +456,28 @@ type CoverageStubOptions = {
   failPurchases?: boolean;
   failStatement?: boolean;
   emptyHolder?: boolean;
+  /**
+   * Return the fixture's rows exactly as exported, including its
+   * malformed ones (2 purchases, 1 statement row). By default the stub
+   * returns only the well-formed rows, so a "complete" refresh really
+   * is complete; the malformed variant exercises extraction coverage.
+   */
+  includeMalformed?: boolean;
+  /** Purchases response is nonempty but EVERY row is malformed. */
+  allInvalidPurchases?: boolean;
 };
+
+function isWellFormedPurchase(row: unknown): boolean {
+  if (typeof row !== "object" || row === null) return false;
+  const r = row as Record<string, unknown>;
+  return r.REQUEST_NO != null && r.APPLY_UNIT !== "not-a-number";
+}
+
+function isWellFormedStatement(row: unknown): boolean {
+  if (typeof row !== "object" || row === null) return false;
+  const r = row as Record<string, unknown>;
+  return typeof r.trans_no === "string" && r.trans_no !== "";
+}
 
 /** Upstream stub in the shape of tests/integration/ssis.test.ts, with
  * per-dataset failure switches for the coverage regressions. */
@@ -460,11 +487,27 @@ function stubCoverageUpstream(options: CoverageStubOptions = {}): typeof fetch {
     const payload = buildSsisPayload() as [{ unitPurchase: unknown[]; statement: unknown[] }];
     if (url.includes("PurchaseRequesthandler")) {
       if (options.failPurchases) return jsonResponse({ message: "boom" }, 500);
-      return jsonResponse({ ResponseData: options.emptyHolder ? [] : payload[0].unitPurchase });
+      if (options.emptyHolder) return jsonResponse({ ResponseData: [] });
+      if (options.allInvalidPurchases) {
+        return jsonResponse({
+          ResponseData: payload[0].unitPurchase.filter((r) => !isWellFormedPurchase(r))
+        });
+      }
+      return jsonResponse({
+        ResponseData: options.includeMalformed
+          ? payload[0].unitPurchase
+          : payload[0].unitPurchase.filter(isWellFormedPurchase)
+      });
     }
     if (url.includes("HolderStatement")) {
       if (options.failStatement) return jsonResponse({ message: "boom" }, 500);
-      return jsonResponse({ ResponseData: options.emptyHolder ? [] : payload[0].statement });
+      return jsonResponse({
+        ResponseData: options.emptyHolder
+          ? []
+          : options.includeMalformed
+            ? payload[0].statement
+            : payload[0].statement.filter(isWellFormedStatement)
+      });
     }
     if (url.includes("GetNAV")) {
       return jsonResponse({
@@ -483,10 +526,46 @@ function stubCoverageUpstream(options: CoverageStubOptions = {}): typeof fetch {
   };
 }
 
+/** The shared fixture with its malformed rows removed — a snapshot
+ * that extraction can account for completely. */
+function buildCleanSsisPayload(): unknown {
+  const payload = buildSsisPayload() as [{ unitPurchase: unknown[]; statement: unknown[] }];
+  return [
+    {
+      ...payload[0],
+      unitPurchase: payload[0].unitPurchase.filter(isWellFormedPurchase),
+      statement: payload[0].statement.filter(isWellFormedStatement)
+    }
+  ];
+}
+
 describe("SSIS coverage reporting", () => {
-  it("snapshot import establishes full coverage and complete totals", async () => {
+  it("snapshot import with malformed rows: skipped rows make coverage partial, never complete", async () => {
     const user = await makeUser({ timezone: "UTC" });
+    // The shared fixture carries 2 malformed purchase rows and 1
+    // malformed statement row (skipped=3): extraction drops them, so
+    // the import — however clean its envelope — did NOT fully account
+    // for either holder dataset.
     await seedSsis(user);
+    const flow = await connectFlow(user, { ssisAccess: true });
+
+    const summary = await callTool(flow.tokens.accessToken, "get_ssis_summary");
+    const ssis = summary.data.ssis;
+    expect(ssis.coverage.purchases.status).toBe("partial");
+    expect(ssis.coverage.statement.status).toBe("partial");
+    expect(ssis.coverage.nav.status).toBe("ok");
+    // No complete fetch has ever happened for the holder datasets.
+    expect(ssis.coverage.purchases.fetchedAt).toBeNull();
+    expect(ssis.totals.complete).toBe(false);
+    // The valid rows still drive the totals — labelled as subtotals.
+    expect(ssis.totals.totalInvested.amountMinor).toBe("177260");
+    expect(ssis.limitations.join(" ")).toMatch(/Purchase data may be incomplete/);
+    expect(ssis.limitations.join(" ")).toMatch(/observed subtotals/);
+  });
+
+  it("clean snapshot import establishes full coverage and complete totals", async () => {
+    const user = await makeUser({ timezone: "UTC" });
+    await importSsisSnapshot(db(), actorOf(user), buildCleanSsisPayload(), "import");
     const flow = await connectFlow(user, { ssisAccess: true });
 
     const summary = await callTool(flow.tokens.accessToken, "get_ssis_summary");
@@ -587,7 +666,7 @@ describe("SSIS coverage reporting", () => {
       new Date(afterFirst!.purchasesFetchedAt!).toISOString()
     );
     expect(ssis.coverage.nav.status).toBe("ok");
-    expect(ssis.limitations.join(" ")).toMatch(/last successful fetch/);
+    expect(ssis.limitations.join(" ")).toMatch(/last complete fetch/);
   });
 
   it("complete refresh: full coverage, totals complete, no incompleteness caveats", async () => {
@@ -631,6 +710,142 @@ describe("SSIS coverage reporting", () => {
     expect(ssis.totals.totalInvested.amountMinor).toBe("0");
     expect(ssis.totals.totalUnits).toBe("0");
     expect(ssis.limitations.join(" ")).not.toMatch(/incomplete|coverage is unknown/);
+  });
+
+  it("populated then successful-empty refresh: retained rows are reported partial with unmoved timestamps", async () => {
+    const user = await makeUser({ timezone: "UTC" });
+    const actor = actorOf(user);
+    await setSsisBoAccountNo(db(), actor, ENTERED_BO);
+    const first = await refreshSsis(db(), actor, stubCoverageUpstream());
+    expect(first.warnings).toEqual([]);
+    expect(first.purchases).toBe(3);
+    expect(first.statement).toBe(2);
+    const [afterFirst] = await db()
+      .select()
+      .from(ssisInsightState)
+      .where(eq(ssisInsightState.familyId, user.familyId));
+    expect(afterFirst!.purchasesCoverage).toBe("ok");
+    expect(afterFirst!.statementCoverage).toBe("ok");
+
+    // The holder endpoints now succeed with EMPTY datasets. The import
+    // is upsert-only, so the previously stored rows are retained — they
+    // must not be presented as refreshed or complete, and the
+    // effective-data timestamps must stay at the first fetch.
+    const second = await refreshSsis(db(), actor, stubCoverageUpstream({ emptyHolder: true }));
+    expect(second.warnings).toEqual([]);
+    expect(second.purchases).toBe(0);
+    expect(second.statement).toBe(0);
+
+    const storedPurchases = await db()
+      .select()
+      .from(ssisPurchases)
+      .where(eq(ssisPurchases.familyId, user.familyId));
+    const storedStatement = await db()
+      .select()
+      .from(ssisStatementEntries)
+      .where(eq(ssisStatementEntries.familyId, user.familyId));
+    expect(storedPurchases).toHaveLength(3);
+    expect(storedStatement).toHaveLength(2);
+
+    const [afterSecond] = await db()
+      .select()
+      .from(ssisInsightState)
+      .where(eq(ssisInsightState.familyId, user.familyId));
+    expect(afterSecond!.purchasesCoverage).toBe("partial");
+    expect(afterSecond!.statementCoverage).toBe("partial");
+    expect(afterSecond!.purchasesFetchedAt).toEqual(afterFirst!.purchasesFetchedAt);
+    expect(afterSecond!.statementFetchedAt).toEqual(afterFirst!.statementFetchedAt);
+    // NAV really was refreshed completely, so its coverage stays ok.
+    expect(afterSecond!.navCoverage).toBe("ok");
+
+    const flow = await connectFlow(user, { ssisAccess: true });
+    const summary = await callTool(flow.tokens.accessToken, "get_ssis_summary");
+    const ssis = summary.data.ssis;
+    // Retained rows still drive the totals — as flagged subtotals whose
+    // effective date is the FIRST fetch, not the empty refresh.
+    expect(ssis.totals.totalInvested.amountMinor).toBe("177260");
+    expect(ssis.totals.complete).toBe(false);
+    expect(ssis.coverage.purchases.status).toBe("partial");
+    expect(ssis.coverage.statement.status).toBe("partial");
+    expect(ssis.coverage.purchases.fetchedAt).toBe(
+      new Date(afterFirst!.purchasesFetchedAt!).toISOString()
+    );
+    expect(ssis.coverage.statement.fetchedAt).toBe(
+      new Date(afterFirst!.statementFetchedAt!).toISOString()
+    );
+    expect(ssis.limitations.join(" ")).toMatch(/Purchase data may be incomplete/);
+    expect(ssis.limitations.join(" ")).toMatch(/Statement data may be incomplete/);
+    expect(ssis.limitations.join(" ")).toMatch(/observed subtotals/);
+
+    const purchases = await callTool(flow.tokens.accessToken, "list_ssis_purchases");
+    expect(purchases.data.page.totalMatching).toBe(3);
+    expect(purchases.data.dataAsOf).toBe(new Date(afterFirst!.purchasesFetchedAt!).toISOString());
+    expect(purchases.data.limitations.join(" ")).toMatch(/may be incomplete/);
+  });
+
+  it("refresh with malformed rows mixed in: envelope success is partial coverage, not complete", async () => {
+    const user = await makeUser({ timezone: "UTC" });
+    const actor = actorOf(user);
+    await setSsisBoAccountNo(db(), actor, ENTERED_BO);
+    const result = await refreshSsis(db(), actor, stubCoverageUpstream({ includeMalformed: true }));
+    // The fetch itself succeeded — no warnings — yet extraction dropped
+    // rows from both holder datasets.
+    expect(result.warnings).toEqual([]);
+    expect(result.purchases).toBe(3);
+    expect(result.statement).toBe(2);
+    // Extraction skips 2 of the malformed rows here (the third — a
+    // purchase with no REQUEST_NO — is already dropped by the fetcher's
+    // key dedupe before the payload is built).
+    expect(result.skipped).toBe(2);
+
+    const [state] = await db()
+      .select()
+      .from(ssisInsightState)
+      .where(eq(ssisInsightState.familyId, user.familyId));
+    expect(state!.purchasesCoverage).toBe("partial");
+    expect(state!.statementCoverage).toBe("partial");
+    expect(state!.purchasesFetchedAt).toBeNull();
+    expect(state!.navCoverage).toBe("ok");
+
+    const flow = await connectFlow(user, { ssisAccess: true });
+    const summary = await callTool(flow.tokens.accessToken, "get_ssis_summary");
+    const ssis = summary.data.ssis;
+    expect(ssis.coverage.purchases.status).toBe("partial");
+    expect(ssis.totals.complete).toBe(false);
+    expect(ssis.totals.totalInvested.amountMinor).toBe("177260");
+    expect(ssis.limitations.join(" ")).toMatch(/Purchase data may be incomplete/);
+    expect(ssis.limitations.join(" ")).toMatch(/never been fetched completely/);
+  });
+
+  it("refresh whose purchase rows are ALL malformed: zero stored rows are partial, never a complete zero", async () => {
+    const user = await makeUser({ timezone: "UTC" });
+    const actor = actorOf(user);
+    await setSsisBoAccountNo(db(), actor, ENTERED_BO);
+    const result = await refreshSsis(
+      db(),
+      actor,
+      stubCoverageUpstream({ allInvalidPurchases: true })
+    );
+    expect(result.purchases).toBe(0);
+    expect(result.skipped).toBeGreaterThan(0);
+
+    const [state] = await db()
+      .select()
+      .from(ssisInsightState)
+      .where(eq(ssisInsightState.familyId, user.familyId));
+    expect(state!.purchasesCoverage).toBe("partial");
+    expect(state!.purchasesFetchedAt).toBeNull();
+    // The clean datasets in the same refresh are unaffected.
+    expect(state!.statementCoverage).toBe("ok");
+    expect(state!.navCoverage).toBe("ok");
+
+    const flow = await connectFlow(user, { ssisAccess: true });
+    const summary = await callTool(flow.tokens.accessToken, "get_ssis_summary");
+    const ssis = summary.data.ssis;
+    expect(ssis.coverage.purchases.status).toBe("partial");
+    expect(ssis.totals.complete).toBe(false);
+    expect(ssis.totals.totalInvested.amountMinor).toBe("0");
+    expect(ssis.limitations.join(" ")).toMatch(/Purchase data may be incomplete/);
   });
 });
 

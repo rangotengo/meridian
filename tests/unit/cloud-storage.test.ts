@@ -203,7 +203,7 @@ describe("Cloudflare SQLite storage", () => {
       netWorthPartialFlagged: true,
       ssisDeniedWithoutPermission: true,
       ssisSummaryOk: true,
-      ssisCoverageOk: true,
+      ssisCoveragePartial: true,
       ssisPurchasesOk: true,
       ssisDeniedAfterDisable: true
     });
