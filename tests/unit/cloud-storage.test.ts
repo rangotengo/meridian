@@ -56,6 +56,43 @@ describe("Cloudflare SQLite storage", () => {
   it("rolls back earlier writes when a foreign key fails after an await", async () => {
     expect(await probe("rollback")).toEqual({ rejected: true, remaining: 0 });
   });
+  it("tracks a loan by transactions after a balance-tracking switch in cloud DO", async () => {
+    expect(await probe("balance-tracking")).toEqual({
+      beforeBalance: 15000000,
+      previewResulting: 16000000,
+      afterBalance: 16000000,
+      switchedResulting: 16000000,
+      valuationDrivenAfter: false,
+      valuationRejected: true
+    });
+  });
+  it("keeps a backdated conversion date-correct after a round trip in cloud DO", async () => {
+    expect(await probe("balance-tracking-backdated")).toEqual({
+      valuationModeAnchorBalance: 100000,
+      previewPlug: -100000,
+      previewResulting: 100000,
+      previewRestated: 1,
+      switchedPlug: -100000,
+      switchedRestated: 1,
+      switchedResulting: 100000,
+      balanceBeforeAnchor: 0,
+      balanceOnAnchor: 100000,
+      balanceOnAdjustment: 100000,
+      balanceToday: 100000,
+      earlierAdjustmentAmount: 0,
+      earlierAdjustmentSource: "balance_tracking"
+    });
+  });
+  it("rejects a backdated conversion that would restate a transfer leg in cloud DO", async () => {
+    expect(await probe("balance-tracking-transfer-leg")).toEqual({
+      previewRejected: true,
+      switchRejected: true,
+      adjustmentAmount: -100000,
+      modeAfter: "valuation",
+      legsSum: 0,
+      balanceToday: 100000
+    });
+  });
   it("edits and deletes loan valuations with atomic balance repair in cloud DO", async () => {
     expect(await probe("valuation-edit")).toEqual({
       editedBalance: -22500,

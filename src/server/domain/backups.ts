@@ -46,6 +46,7 @@ import {
   valuations
 } from "../db/schema";
 import { recordAudit } from "../observability/audit";
+import { isValuationTracked } from "../authorization/access";
 import { decryptWithKey, encryptWithKey } from "../security/secrets";
 import { backupConfig } from "@/lib/env";
 import { errors } from "@/lib/errors";
@@ -203,6 +204,72 @@ export function parseInstanceExport(text: string): InstanceExport {
 export type InstanceRestoreResult = { tables: Record<string, number>; totalRows: number };
 
 /**
+ * Cross-table controller invariants an archive must satisfy before any
+ * row is inserted. A household export is validated record-by-record on
+ * restore (see family-import.ts); an operator archive is restored
+ * verbatim, so without this check a tampered or hand-edited archive
+ * could persist states the domain forbids — above all the
+ * one-controller rule for account balances: manual holdings and a live
+ * MeroShare link each publish the balance as valuations, so both
+ * require a valuation-tracked other-asset account, and they can never
+ * manage the same account at once. Account rows written before the
+ * balance_tracking column existed carry no value and fall back to the
+ * type default, exactly as the domain reads them.
+ */
+function validateInstanceArchive(data: InstanceExport): void {
+  const accountById = new Map<string, Record<string, unknown>>();
+  for (const row of data.tables.accounts ?? []) {
+    if (row && typeof row.id === "string") accountById.set(row.id, row);
+  }
+  const modeOf = (accountId: unknown) => {
+    const account = typeof accountId === "string" ? accountById.get(accountId) : undefined;
+    if (!account) return null;
+    return {
+      type: typeof account.type === "string" ? account.type : "",
+      valuationTracked: isValuationTracked({
+        type: typeof account.type === "string" ? account.type : "",
+        balanceTracking:
+          typeof account.balanceTracking === "string" ? account.balanceTracking : null
+      })
+    };
+  };
+
+  const linkedAccountIds = new Set<string>();
+  for (const row of data.tables.meroShareAccounts ?? []) {
+    const mode = modeOf(row?.accountId);
+    if (!mode) {
+      throw errors.validation(
+        "The backup archive links a MeroShare account to an account that is not in the archive."
+      );
+    }
+    if (!mode.valuationTracked) {
+      throw errors.validation(
+        "The backup archive links MeroShare to an account that tracks its balance from its transactions. A MeroShare link controls the balance through valuations — correct the archive or restore it into a build that can reconcile the account."
+      );
+    }
+    linkedAccountIds.add(String(row?.accountId));
+  }
+  for (const row of data.tables.portfolioHoldings ?? []) {
+    const mode = modeOf(row?.accountId);
+    if (!mode) {
+      throw errors.validation(
+        "The backup archive contains a portfolio holding for an account that is not in the archive."
+      );
+    }
+    if (mode.type !== "other_asset" || !mode.valuationTracked) {
+      throw errors.validation(
+        "The backup archive contains a portfolio holding on an account that is not a valuation-tracked other-asset account. Holdings publish the balance as a valuation — correct the archive or restore it into a build that can reconcile the account."
+      );
+    }
+    if (linkedAccountIds.has(String(row?.accountId))) {
+      throw errors.validation(
+        "The backup archive gives one account both portfolio holdings and a MeroShare link. Exactly one controller may manage an account's value — correct the archive before restoring."
+      );
+    }
+  }
+}
+
+/**
  * Restore an instance export into an EMPTY database, preserving ids.
  * Runs in one transaction: any failure leaves the database untouched.
  */
@@ -210,6 +277,8 @@ export async function restoreInstanceExport(
   exec: Executor,
   data: InstanceExport
 ): Promise<InstanceRestoreResult> {
+  // Reject inconsistent archives before inserting a single row.
+  validateInstanceArchive(data);
   return exec.transaction(async (tx) => {
     const existing = await tx.select({ id: families.id }).from(families).limit(1);
     if (existing.length > 0) {

@@ -8,10 +8,33 @@ import { errors } from "@/lib/errors";
 import { addMinor, negateMinor } from "@/lib/money";
 import { diffDays, isIsoDate } from "@/lib/datetime";
 import { recordAudit } from "../observability/audit";
+import { lockHoldingsAccount } from "./holdings";
 
 export const TRANSFER_DATE_WINDOW_DAYS = 4;
 
 export async function createTransferFromTransactions(
+  exec: Executor,
+  actor: Actor,
+  outflowEntryId: string,
+  inflowEntryId: string
+): Promise<{ transferId: string; existing: boolean }> {
+  // Account ids only discover the locks; all entry/permission/amount
+  // checks run after acquiring them. A mode switch can restate an
+  // opening adjustment, so a link must not commit using amounts read
+  // before that switch. Lock both accounts in a consistent order.
+  const rows = await exec
+    .select({ accountId: entries.accountId })
+    .from(entries)
+    .where(sql`${entries.id} IN (${outflowEntryId}, ${inflowEntryId})`);
+  return exec.transaction(async (tx) => {
+    for (const accountId of [...new Set(rows.map((row) => row.accountId))].sort()) {
+      await lockHoldingsAccount(tx, accountId);
+    }
+    return linkTransferUnderAccountLocks(tx, actor, outflowEntryId, inflowEntryId);
+  });
+}
+
+async function linkTransferUnderAccountLocks(
   exec: Executor,
   actor: Actor,
   outflowEntryId: string,

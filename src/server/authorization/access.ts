@@ -22,6 +22,30 @@ export function isValuationDriven(type: string): boolean {
   return (VALUATION_DRIVEN_TYPES as string[]).includes(type);
 }
 
+export type BalanceTracking = "valuation" | "transactions";
+
+export const BALANCE_TRACKING_MODES: BalanceTracking[] = ["valuation", "transactions"];
+
+/** The tracking mode an account of this type starts with. */
+export function defaultBalanceTracking(type: string): BalanceTracking {
+  return isValuationDriven(type) ? "valuation" : "transactions";
+}
+
+/**
+ * Whether THIS account's balance is its latest valuation (true) or the sum
+ * of its transactions (false). The mode is per-account for the valuation-
+ * driven types — a loan tracked by lend/repay transactions opts out — while
+ * depository / credit_card accounts are always transaction-tracked no
+ * matter what the column says.
+ */
+export function isValuationTracked(account: {
+  type: string;
+  balanceTracking?: string | null;
+}): boolean {
+  if (!isValuationDriven(account.type)) return false;
+  return (account.balanceTracking ?? defaultBalanceTracking(account.type)) === "valuation";
+}
+
 export type AccountRow = typeof accounts.$inferSelect;
 
 const NEED_RANK: Record<AccessNeed, number> = { view: 1, annotate: 2, manage: 3 };

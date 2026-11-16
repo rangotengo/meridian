@@ -234,6 +234,7 @@ export async function buildFamilyExport(exec: Executor, actor: Actor): Promise<F
       id: a.id,
       name: a.name,
       type: a.type,
+      balanceTracking: a.balanceTracking,
       subtype: a.subtype,
       institution: a.institution,
       currency: a.currency,

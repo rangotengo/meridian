@@ -12,6 +12,19 @@ const TYPES = [
   { value: "other_liability", label: "Other liability", hint: "A debt you track manually" }
 ];
 
+const TRACKING = [
+  {
+    value: "valuation",
+    label: "From valuations I record",
+    hint: "Balance is the latest value you enter — property, investments"
+  },
+  {
+    value: "transactions",
+    label: "From its transactions",
+    hint: "Balance follows money in and out — a loan you lend and collect"
+  }
+];
+
 export function NewAccountForm({
   defaultCurrency,
   today
@@ -21,6 +34,8 @@ export function NewAccountForm({
 }) {
   const [state, action] = useActionState(createAccountAction, undefined);
   const [type, setType] = useState("depository");
+  const [tracking, setTracking] = useState("valuation");
+  const showTracking = type === "other_asset" || type === "other_liability";
 
   return (
     <form action={action} className="space-y-5">
@@ -52,6 +67,35 @@ export function NewAccountForm({
           ))}
         </div>
       </fieldset>
+
+      {showTracking ? (
+        <fieldset>
+          <legend className="mb-2 text-sm font-medium">Balance tracking</legend>
+          <div className="grid gap-3 sm:grid-cols-2">
+            {TRACKING.map((t) => (
+              <label
+                key={t.value}
+                className={`cursor-pointer rounded-xl border p-4 ${
+                  tracking === t.value
+                    ? "border-primary bg-primary/5"
+                    : "border-border hover:border-primary/40"
+                }`}
+              >
+                <input
+                  type="radio"
+                  name="balanceTracking"
+                  value={t.value}
+                  checked={tracking === t.value}
+                  onChange={() => setTracking(t.value)}
+                  className="sr-only"
+                />
+                <span className="block text-sm font-medium">{t.label}</span>
+                <span className="block text-xs text-muted-foreground">{t.hint}</span>
+              </label>
+            ))}
+          </div>
+        </fieldset>
+      ) : null}
 
       <div className="grid gap-4 sm:grid-cols-2">
         <Field label="Name" htmlFor="name">

@@ -15,6 +15,7 @@ import migration12 from "../../../../db/cloud-migrations/0013_portfolio_holdings
 import migration13 from "../../../../db/cloud-migrations/0014_holding_cost_quantity.up.sql";
 import migration14 from "../../../../db/cloud-migrations/0015_ssis_insight.up.sql";
 import migration15 from "../../../../db/cloud-migrations/0016_ssis_config_generation.up.sql";
+import migration16 from "../../../../db/cloud-migrations/0017_balance_tracking.up.sql";
 
 export const cloudMigrations = [
   { name: "0001_init", sql: migration0 },
@@ -32,5 +33,6 @@ export const cloudMigrations = [
   { name: "0013_portfolio_holdings", sql: migration12 },
   { name: "0014_holding_cost_quantity", sql: migration13 },
   { name: "0015_ssis_insight", sql: migration14 },
-  { name: "0016_ssis_config_generation", sql: migration15 }
+  { name: "0016_ssis_config_generation", sql: migration15 },
+  { name: "0017_balance_tracking", sql: migration16 }
 ];

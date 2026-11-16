@@ -4,6 +4,8 @@ import { requireVerifiedActor, currentFamily } from "@/server/auth/context";
 import { todayIn } from "@/lib/datetime";
 import { getDb } from "@/server/db/client";
 import { getAccountOverview, isLiability, familyMemberOptions } from "@/server/domain/accounts";
+import { previewBalanceTracking } from "@/server/domain/balance-tracking";
+import { isValuationDriven } from "@/server/authorization/access";
 import { getUserPrivacyMode } from "@/server/domain/users";
 import { Badge, Card, PageHeader } from "@/components/ds/card";
 import { Amount, Sparkline } from "@/components/finance/amount";
@@ -43,6 +45,18 @@ export default async function AccountDetailPage({
   const privacy = await getUserPrivacyMode(db, actor.userId);
   const { account, level, series, recentActivity, shares, valuationDriven, isJoint } = overview;
   const members = await familyMemberOptions(db, actor.familyId);
+
+  // The balance-tracking switch is offered only to full-control users on
+  // the types that have a choice; the preview shows the exact outcome.
+  let trackingPreview = null;
+  if (level === "full_control" && isValuationDriven(account.type)) {
+    trackingPreview = await previewBalanceTracking(
+      db,
+      actor,
+      accountId,
+      valuationDriven ? "transactions" : "valuation"
+    ).catch(() => null);
+  }
 
   // Manual portfolio holdings exist only on other-asset accounts; while an
   // account has any, its value is managed by them (no manual valuations).
@@ -91,6 +105,9 @@ export default async function AccountDetailPage({
               institution={account.institution}
               includedInReports={account.includedInReports}
               members={members}
+              balanceTracking={valuationDriven ? "valuation" : "transactions"}
+              currency={account.currency}
+              trackingPreview={trackingPreview}
             />
           ) : undefined
         }

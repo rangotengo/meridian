@@ -10,7 +10,11 @@ import {
   valuations
 } from "../db/schema";
 import type { Actor } from "../auth/context";
-import { assertAccountAccessLevel, assertAccountOpen } from "../authorization/access";
+import {
+  assertAccountAccessLevel,
+  assertAccountOpen,
+  isValuationTracked
+} from "../authorization/access";
 import { errors } from "@/lib/errors";
 import { displayToLedgerBalance } from "@/lib/money";
 import { todayIn } from "@/lib/datetime";
@@ -37,7 +41,14 @@ import { recalculateAccount } from "./balances";
  * mode — runs inside withHoldingsAccountLock, which takes a
  * transaction-scoped advisory lock keyed by the account BEFORE any
  * position is read or total computed, and holds it through the position
- * write, the daily-valuation write, and recalculation. Positions are read
+ * write, the daily-valuation write, and recalculation. The
+ * balance-tracking switch takes the SAME lock (see balance-tracking.ts):
+ * it is one of the account's balance-controller writers. Because the
+ * guard checks that authorize a mutation (access, open state, tracking
+ * mode, controller) run before a caller queues on the lock, every writer
+ * RE-RESOLVES them inside the lock against fresh reads before mutating —
+ * a switch that committed while this writer waited must be seen, never
+ * overwritten from a stale snapshot. Positions are read
  * under READ COMMITTED statement snapshots, so without the lock two
  * writers can each read pre-mutation state and silently lose each other's
  * changes. On the cloud backend the Durable Object executor serializes
@@ -392,7 +403,7 @@ async function loadViewableAccount(
   return account;
 }
 
-/** Full-control + open + other_asset + not-MeroShare-linked guard for mutations. */
+/** Full-control + open + other_asset + valuation-tracked + not-MeroShare-linked guard for mutations. */
 export async function loadManagedAccount(
   exec: Executor,
   actor: Actor,
@@ -405,6 +416,11 @@ export async function loadManagedAccount(
   const { account } = await assertAccountOpen(exec, actor, accountId, "manage");
   if (account.type !== "other_asset") {
     throw errors.validation("Holdings can only be managed on other-asset accounts.");
+  }
+  if (!isValuationTracked(account)) {
+    throw errors.validation(
+      "This account tracks its balance from its transactions, so holdings would not affect it. Switch the account to valuation tracking (Account settings → Balance tracking) before managing holdings."
+    );
   }
   if (await accountHasActiveMeroShareLink(exec, account.id)) {
     throw errors.validation(
@@ -550,6 +566,10 @@ export async function addHolding(
 
   let holdingId = "";
   const result = await withHoldingsAccountLock(exec, account.id, async (tx) => {
+    // Re-resolve the managed-account guards inside the lock: the checks
+    // above ran before this writer queued on it, and a balance-tracking
+    // switch holding the same lock may have committed in between.
+    const managed = await loadManagedAccount(tx, actor, account.id);
     await assertHoldingsActivationAllowed(tx, actor, account.id);
     const [duplicate] = await tx
       .select({ id: portfolioHoldings.id })
@@ -576,7 +596,7 @@ export async function addHolding(
       .returning({ id: portfolioHoldings.id });
     if (!row) throw errors.conflict("Could not create the holding.");
     holdingId = row.id;
-    return syncPortfolioValuation(tx, actor, account);
+    return syncPortfolioValuation(tx, actor, managed);
   });
 
   await recordAudit(exec, {
@@ -643,6 +663,8 @@ export async function updateHolding(
 
   let ticker = "";
   const result = await withHoldingsAccountLock(exec, account.id, async (tx) => {
+    // Re-resolve the guards inside the lock (see addHolding).
+    const managed = await loadManagedAccount(tx, actor, account.id);
     const holding = await loadHolding(tx, account.id, input.holdingId);
     ticker = holding.ticker;
     let averageCostQuantity: string;
@@ -676,7 +698,7 @@ export async function updateHolding(
         updatedAt: new Date()
       })
       .where(eq(portfolioHoldings.id, holding.id));
-    return syncPortfolioValuation(tx, actor, account);
+    return syncPortfolioValuation(tx, actor, managed);
   });
 
   await recordAudit(exec, {
@@ -700,10 +722,12 @@ export async function deleteHolding(
 
   let ticker = "";
   const result = await withHoldingsAccountLock(exec, account.id, async (tx) => {
+    // Re-resolve the guards inside the lock (see addHolding).
+    const managed = await loadManagedAccount(tx, actor, account.id);
     const holding = await loadHolding(tx, account.id, input.holdingId);
     ticker = holding.ticker;
     await tx.delete(portfolioHoldings).where(eq(portfolioHoldings.id, holding.id));
-    return syncPortfolioValuation(tx, actor, account);
+    return syncPortfolioValuation(tx, actor, managed);
   });
 
   await recordAudit(exec, {
@@ -756,6 +780,8 @@ export async function adjustHolding(
 
   let removed = false;
   const result = await withHoldingsAccountLock(exec, account.id, async (tx) => {
+    // Re-resolve the guards inside the lock (see addHolding).
+    const managed = await loadManagedAccount(tx, actor, account.id);
     const [existing] = await tx
       .select()
       .from(portfolioHoldings)
@@ -824,7 +850,7 @@ export async function adjustHolding(
           .where(eq(portfolioHoldings.id, existing.id));
       }
     }
-    return syncPortfolioValuation(tx, actor, account);
+    return syncPortfolioValuation(tx, actor, managed);
   });
 
   await recordAudit(exec, {

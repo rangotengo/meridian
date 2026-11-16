@@ -3,7 +3,7 @@ import type { Executor } from "../db/client";
 import { usesCloudStorage } from "../db/dialect";
 import { chunkParams, chunkRows } from "../db/params";
 import { balances as balancesTable } from "../db/schema";
-import { isValuationDriven } from "../authorization/access";
+import { isValuationTracked } from "../authorization/access";
 import { addDays, diffDays, isIsoDate, minDate, todayIn } from "@/lib/datetime";
 import { errors } from "@/lib/errors";
 
@@ -27,6 +27,8 @@ type AccountMeta = {
   id: string;
   currency: string;
   type: string;
+  /** True when this account's balance is its latest valuation, not its transactions. */
+  valuationTracked: boolean;
   openingBalanceMinor: number;
   openedOn: string;
   timezone: string;
@@ -34,7 +36,7 @@ type AccountMeta = {
 
 async function loadAccountMeta(exec: Executor, accountId: string): Promise<AccountMeta | null> {
   const res = await exec.execute<AccountMeta>(sql`
-    SELECT CAST(a.id AS TEXT) AS id, a.currency, a.type,
+    SELECT CAST(a.id AS TEXT) AS id, a.currency, a.type, a.balance_tracking,
            CAST(a.opening_balance_minor AS TEXT) AS opening_balance_minor,
            CAST(a.opened_on AS TEXT) AS opened_on,
            f.timezone
@@ -47,6 +49,7 @@ async function loadAccountMeta(exec: Executor, accountId: string): Promise<Accou
         id: string;
         currency: string;
         type: string;
+        balance_tracking: string | null;
         opening_balance_minor: string;
         opened_on: string;
         timezone: string;
@@ -57,6 +60,10 @@ async function loadAccountMeta(exec: Executor, accountId: string): Promise<Accou
     id: row.id,
     currency: row.currency,
     type: row.type,
+    valuationTracked: isValuationTracked({
+      type: row.type,
+      balanceTracking: row.balance_tracking
+    }),
     openingBalanceMinor: safeParseMinor(row.opening_balance_minor),
     openedOn: row.opened_on.slice(0, 10),
     timezone: row.timezone
@@ -90,7 +97,7 @@ export async function recalculateAccount(
 
   const eventsByDate = new Map<string, number>();
 
-  if (isValuationDriven(meta.type)) {
+  if (meta.valuationTracked) {
     // Same-date valuations resolve by write order: created_at first
     // (valuation writers stamp it at statement-execution time, under the
     // per-account lock), then a monotonic insertion-order tiebreaker for
@@ -137,11 +144,11 @@ export async function recalculateAccount(
 
   const rows: { accountId: string; asOf: string; balanceMinor: number; currency: string }[] = [];
   let displayBalance = baseline;
-  if (isValuationDriven(meta.type)) displayBalance = meta.openingBalanceMinor;
+  if (meta.valuationTracked) displayBalance = meta.openingBalanceMinor;
 
   let cursor = start;
   while (cursor <= today) {
-    if (isValuationDriven(meta.type)) {
+    if (meta.valuationTracked) {
       const event = eventsByDate.get(cursor);
       if (event !== undefined) displayBalance = event;
     } else {

@@ -21,6 +21,7 @@ import {
   valuations
 } from "../db/schema";
 import type { Actor } from "../auth/context";
+import { defaultBalanceTracking } from "../authorization/access";
 import { recalculateAccount } from "./balances";
 import { errors } from "@/lib/errors";
 import { isIsoDate, todayIn } from "@/lib/datetime";
@@ -188,6 +189,7 @@ async function importRecords(
         familyId: actor.familyId,
         ownerId: actor.userId,
         type,
+        balanceTracking: defaultBalanceTracking(type),
         subtype: optionalText(record.data.subtype, 100),
         name: requiredText(record.data.name, "account name", 120),
         institution: optionalText(record.data.institution_name ?? record.data.institution, 120),

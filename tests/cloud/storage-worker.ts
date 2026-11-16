@@ -18,6 +18,11 @@ import {
   updateValuation,
   deleteValuation
 } from "../../src/server/domain/valuations";
+import {
+  previewBalanceTracking,
+  switchBalanceTracking
+} from "../../src/server/domain/balance-tracking";
+import { createTransferFromTransactions } from "../../src/server/domain/transfers";
 import { createInvitation, acceptInvitationWithAccess } from "../../src/server/domain/invitations";
 import { setBudget } from "../../src/server/domain/budgets";
 import { buildFamilyExport } from "../../src/server/domain/exports";
@@ -102,6 +107,9 @@ export class StorageProbe {
       operation === "/ssis" ||
       operation === "/ssis-fixes" ||
       operation === "/ssis-round2" ||
+      operation === "/balance-tracking" ||
+      operation === "/balance-tracking-backdated" ||
+      operation === "/balance-tracking-transfer-leg" ||
       operation === "/holdings" ||
       operation === "/export-restore-precedence"
     ) {
@@ -163,6 +171,233 @@ export class StorageProbe {
           editedKind: edited.recentActivity.find((e) => e.id === entryId)?.valuationKind,
           deletedBalance: deleted.displayBalanceMinor,
           deletedEntryAbsent: !deleted.recentActivity.some((e) => e.id === entryId)
+        });
+      }
+      if (operation === "/balance-tracking") {
+        const daysAgo = (n: number) =>
+          new Date(Date.now() - n * 86_400_000).toISOString().slice(0, 10);
+        const { accountId } = await createAccount(exec, actor, {
+          name: "Cloud loan",
+          type: "other_asset",
+          currency: "NPR",
+          openedOn: daysAgo(60),
+          openingBalanceDisplayMinor: 0,
+          includedInReports: true,
+          joint: false
+        });
+        await recordValuation(exec, actor, {
+          accountId,
+          date: daysAgo(50),
+          amountDisplayMinor: 15_000_000,
+          kind: "opening",
+          name: "Original principal"
+        });
+        await addTransaction(exec, actor, {
+          accountId,
+          date: daysAgo(40),
+          name: "Lent",
+          amountLedgerMinor: -6_000_000
+        });
+        await addTransaction(exec, actor, {
+          accountId,
+          date: daysAgo(20),
+          name: "Repayed",
+          amountLedgerMinor: 5_000_000
+        });
+        await recalculateAccount(exec, accountId);
+        const before = await getAccountOverview(exec, actor, accountId);
+        const preview = await previewBalanceTracking(exec, actor, accountId, "transactions");
+        const switched = await switchBalanceTracking(exec, actor, {
+          accountId,
+          to: "transactions"
+        });
+        const after = await getAccountOverview(exec, actor, accountId);
+        let valuationRejected = false;
+        try {
+          await recordValuation(exec, actor, {
+            accountId,
+            date: daysAgo(1),
+            amountDisplayMinor: 1
+          });
+        } catch {
+          valuationRejected = true;
+        }
+        return Response.json({
+          beforeBalance: before.displayBalanceMinor,
+          previewResulting: preview.resultingBalanceMinor,
+          afterBalance: after.displayBalanceMinor,
+          switchedResulting: switched.resultingBalanceMinor,
+          valuationDrivenAfter: after.valuationDriven,
+          valuationRejected
+        });
+      }
+      if (operation === "/balance-tracking-backdated") {
+        // The review-round-2 probe on the cloud executor: convert a
+        // valuation dated yesterday, switch back, record the same
+        // balance as a valuation dated three days ago, and convert
+        // again against that earlier anchor. The conversion must stay
+        // date-correct: the balance ON the anchor date is the anchor
+        // valuation, and the earlier (later-dated) opening adjustment
+        // is restated to zero instead of being counted as already
+        // represented before its date or counted twice after it.
+        const { accountId } = await createAccount(exec, actor, {
+          name: "Cloud backdated loan",
+          type: "other_asset",
+          currency: "USD",
+          openedOn: isoDaysAgo(5),
+          openingBalanceDisplayMinor: 0,
+          includedInReports: true,
+          joint: false
+        });
+        const balanceOn = async (date: string) => {
+          const res = await exec.execute<{ balance_minor: string }>(sql`
+            SELECT CAST(balance_minor AS TEXT) AS balance_minor
+            FROM balances WHERE account_id = ${accountId} AND as_of = ${date}
+          `);
+          const row = (res.rows ?? [])[0];
+          return row ? Number(row.balance_minor) : null;
+        };
+        await recordValuation(exec, actor, {
+          accountId,
+          date: isoDaysAgo(1),
+          amountDisplayMinor: 100_000,
+          kind: "current",
+          name: "Principal"
+        });
+        await switchBalanceTracking(exec, actor, { accountId, to: "transactions" });
+        await switchBalanceTracking(exec, actor, { accountId, to: "valuation" });
+        await recordValuation(exec, actor, {
+          accountId,
+          date: isoDaysAgo(3),
+          amountDisplayMinor: 100_000,
+          kind: "current",
+          name: "Principal restated"
+        });
+        await recalculateAccount(exec, accountId);
+        const valuationModeAnchorBalance = await balanceOn(isoDaysAgo(3));
+        const preview = await previewBalanceTracking(exec, actor, accountId, "transactions");
+        const switched = await switchBalanceTracking(exec, actor, {
+          accountId,
+          to: "transactions"
+        });
+        const earlierRes = await exec.execute<{
+          amount_minor: string;
+          external_source: string | null;
+        }>(sql`
+          SELECT CAST(amount_minor AS TEXT) AS amount_minor, external_source
+          FROM entries WHERE account_id = ${accountId} AND name = ${"Principal"}
+        `);
+        const earlier = (earlierRes.rows ?? [])[0];
+        return Response.json({
+          valuationModeAnchorBalance,
+          previewPlug: preview.openingTransactionAmountMinor,
+          previewResulting: preview.resultingBalanceMinor,
+          previewRestated: preview.restatedOpeningAdjustments,
+          switchedPlug: switched.openingTransactionAmountMinor,
+          switchedRestated: switched.restatedOpeningAdjustments,
+          switchedResulting: switched.resultingBalanceMinor,
+          balanceBeforeAnchor: await balanceOn(isoDaysAgo(4)),
+          balanceOnAnchor: await balanceOn(isoDaysAgo(3)),
+          balanceOnAdjustment: await balanceOn(isoDaysAgo(1)),
+          balanceToday: await balanceOn(isoDaysAgo(0)),
+          earlierAdjustmentAmount: earlier ? Number(earlier.amount_minor) : null,
+          earlierAdjustmentSource: earlier?.external_source ?? null
+        });
+      }
+      if (operation === "/balance-tracking-transfer-leg") {
+        // The review-round-3 probe on the cloud executor: a converted
+        // opening adjustment that is one leg of a confirmed transfer
+        // must never be restated by a later backdated conversion —
+        // zeroing it would leave the transfer unbalanced. The plan
+        // rejects both the preview and the switch before any row
+        // changes, on this backend exactly as on Postgres.
+        const { accountId } = await createAccount(exec, actor, {
+          name: "Cloud transfer-legged loan",
+          type: "other_asset",
+          currency: "USD",
+          openedOn: isoDaysAgo(5),
+          openingBalanceDisplayMinor: 0,
+          includedInReports: true,
+          joint: false
+        });
+        const { accountId: bankId } = await createAccount(exec, actor, {
+          name: "Cloud bank",
+          type: "depository",
+          currency: "USD",
+          openedOn: isoDaysAgo(5),
+          openingBalanceDisplayMinor: 0,
+          includedInReports: true,
+          joint: false
+        });
+        await recordValuation(exec, actor, {
+          accountId,
+          date: isoDaysAgo(1),
+          amountDisplayMinor: 100_000,
+          kind: "current",
+          name: "Principal"
+        });
+        await switchBalanceTracking(exec, actor, { accountId, to: "transactions" });
+        const adjRes = await exec.execute<{ id: string }>(sql`
+          SELECT CAST(id AS TEXT) AS id FROM entries
+          WHERE account_id = ${accountId} AND name = ${"Principal"}
+        `);
+        const adjustmentId = (adjRes.rows ?? [])[0]!.id;
+        const bankEntry = await addTransaction(exec, actor, {
+          accountId: bankId,
+          date: isoDaysAgo(1),
+          name: "Counterpart leg",
+          amountLedgerMinor: 100_000
+        });
+        const { transferId } = await createTransferFromTransactions(
+          exec,
+          actor,
+          bankEntry.entryId,
+          adjustmentId
+        );
+        await switchBalanceTracking(exec, actor, { accountId, to: "valuation" });
+        await recordValuation(exec, actor, {
+          accountId,
+          date: isoDaysAgo(3),
+          amountDisplayMinor: 100_000,
+          kind: "current",
+          name: "Principal restated"
+        });
+        await recalculateAccount(exec, accountId);
+        let previewError = "";
+        try {
+          await previewBalanceTracking(exec, actor, accountId, "transactions");
+        } catch (e) {
+          previewError = e instanceof Error ? e.message : String(e);
+        }
+        let switchError = "";
+        try {
+          await switchBalanceTracking(exec, actor, { accountId, to: "transactions" });
+        } catch (e) {
+          switchError = e instanceof Error ? e.message : String(e);
+        }
+        const stateRes = await exec.execute<{
+          amount_minor: string;
+          balance_tracking: string;
+          legs_sum: string;
+          balance_today: string;
+        }>(sql`
+          SELECT
+            (SELECT CAST(amount_minor AS TEXT) FROM entries WHERE id = ${adjustmentId}) AS amount_minor,
+            (SELECT balance_tracking FROM accounts WHERE id = ${accountId}) AS balance_tracking,
+            (SELECT CAST(COALESCE(SUM(amount_minor), 0) AS TEXT) FROM entries
+             WHERE id IN (SELECT outflow_entry_id FROM transfers WHERE id = ${transferId})
+                OR id IN (SELECT inflow_entry_id FROM transfers WHERE id = ${transferId})) AS legs_sum,
+            (SELECT CAST(balance_minor AS TEXT) FROM balances
+             WHERE account_id = ${accountId} ORDER BY as_of DESC LIMIT 1) AS balance_today
+        `);
+        const state = (stateRes.rows ?? [])[0];
+        return Response.json({
+          previewRejected: previewError.includes("transfer"),
+          switchRejected: switchError.includes("transfer"),
+          adjustmentAmount: state ? Number(state.amount_minor) : null,
+          modeAfter: state?.balance_tracking ?? null,
+          legsSum: state ? Number(state.legs_sum) : null,
+          balanceToday: state ? Number(state.balance_today) : null
         });
       }
       if (operation === "/holdings") {
