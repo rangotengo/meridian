@@ -1,5 +1,6 @@
 import { sql } from "drizzle-orm";
 import type { Executor } from "../db/client";
+import { usesCloudStorage } from "../db/dialect";
 import { chunkParams, chunkRows } from "../db/params";
 import { balances as balancesTable } from "../db/schema";
 import { isValuationDriven } from "../authorization/access";
@@ -90,12 +91,18 @@ export async function recalculateAccount(
   const eventsByDate = new Map<string, number>();
 
   if (isValuationDriven(meta.type)) {
+    // Same-date valuations resolve by write order: created_at first
+    // (valuation writers stamp it at statement-execution time, under the
+    // per-account lock), then a monotonic insertion-order tiebreaker for
+    // exact timestamp ties — write_seq (a sequence) on PostgreSQL,
+    // SQLite's rowid on the cloud backend. The last row for a date wins.
+    const insertionOrder = usesCloudStorage ? sql`rowid` : sql`write_seq`;
     const res = await exec.execute<{ date: string; amount_minor: string }>(sql`
       SELECT CAST(date AS TEXT) AS date, CAST(amount_minor AS TEXT) AS amount_minor
       FROM entries
       WHERE account_id = ${accountId}
         AND entryable_type = 'valuation'
-      ORDER BY date ASC, created_at ASC
+      ORDER BY date ASC, created_at ASC, ${insertionOrder} ASC
     `);
     for (const r of res.rows ?? []) {
       eventsByDate.set(r.date.slice(0, 10), safeParseMinor(r.amount_minor));

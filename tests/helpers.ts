@@ -16,6 +16,7 @@ const TABLES = [
   "ssis_purchases",
   "ssis_nav_history",
   "ssis_insight_state",
+  "portfolio_holdings",
   "mero_share_transactions",
   "mero_share_holdings",
   "mero_share_accounts",

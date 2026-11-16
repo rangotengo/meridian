@@ -788,6 +788,41 @@ export const meroShareTransactions = sqliteTable(
 );
 
 /**
+ * Manual portfolio holdings (cloud/SQLite mirror of the Postgres table):
+ * user-entered stock positions on other_asset accounts. While an account
+ * has holdings, its balance is managed by them via a daily "holdings"
+ * valuation entry, and manual valuations are rejected.
+ */
+export const portfolioHoldings = sqliteTable(
+  "portfolio_holdings",
+  {
+    id: text("id")
+      .primaryKey()
+      .$defaultFn(() => crypto.randomUUID()),
+    accountId: text("account_id")
+      .notNull()
+      .references(() => accounts.id, { onDelete: "cascade" }),
+    ticker: text("ticker").notNull(),
+    companyName: text("company_name"),
+    quantity: text("quantity").notNull(),
+    averageCostMinor: integer("average_cost_minor"),
+    /** Quantity (decimal string, ≤6dp) that averageCostMinor applies to. */
+    averageCostQuantity: text("average_cost_quantity").notNull().default("0"),
+    currentPriceMinor: integer("current_price_minor"),
+    createdAt: isoTimestamp("created_at")
+      .notNull()
+      .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`),
+    updatedAt: isoTimestamp("updated_at")
+      .notNull()
+      .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`)
+  },
+  (t) => [
+    index("portfolio_holdings_account_idx").on(t.accountId),
+    uniqueIndex("portfolio_holdings_account_ticker_unique").on(t.accountId, t.ticker)
+  ]
+);
+
+/**
  * MCP OAuth 2.1 authorization-server tables — cloud mirror of the Postgres
  * schema (see postgres-schema.ts for the design notes).
  */

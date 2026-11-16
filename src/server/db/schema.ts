@@ -43,6 +43,7 @@ export const ssisPurchases = tables.ssisPurchases;
 export const ssisStatementEntries = tables.ssisStatementEntries;
 export const ssisNavHistory = tables.ssisNavHistory;
 export const ssisInsightState = tables.ssisInsightState;
+export const portfolioHoldings = tables.portfolioHoldings;
 export const oauthClients = tables.oauthClients;
 export const oauthGrants = tables.oauthGrants;
 export const oauthAuthorizationCodes = tables.oauthAuthorizationCodes;

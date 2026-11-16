@@ -256,7 +256,14 @@ export const entries = pgTable(
     externalId: text("external_id"),
     entryableType: text("entryable_type").notNull(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow()
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+    // Sequence-backed insertion order (migration 0014): the final
+    // tiebreaker when balances order same-date valuations by created_at.
+    // The cloud schema has no equivalent column — the balance engine
+    // tie-breaks by SQLite's rowid there instead.
+    writeSeq: bigint("write_seq", { mode: "number" })
+      .notNull()
+      .default(sql`nextval('entries_write_seq')`)
   },
   (t) => [
     index("entries_account_date_idx").on(t.accountId, t.date, t.id),
@@ -646,6 +653,39 @@ export const meroShareTransactions = pgTable(
       t.meroShareAccountId,
       t.externalId
     )
+  ]
+);
+
+/**
+ * Manual portfolio holdings: user-entered stock positions on valuation-driven
+ * (other_asset) accounts, for portfolios that can never arrive via a
+ * MeroShare sync (e.g. a demat tracked on someone else's behalf). While an
+ * account has holdings, its balance is managed by them: the domain writes a
+ * "holdings" valuation entry for today after every mutation and manual
+ * valuations are rejected. Quantity is a decimal string (up to 6dp) so the
+ * Postgres and cloud SQLite shapes stay identical; per-share prices are
+ * minor units.
+ */
+export const portfolioHoldings = pgTable(
+  "portfolio_holdings",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    accountId: uuid("account_id")
+      .notNull()
+      .references(() => accounts.id, { onDelete: "cascade" }),
+    ticker: text("ticker").notNull(),
+    companyName: text("company_name"),
+    quantity: text("quantity").notNull(),
+    averageCostMinor: bigint("average_cost_minor", { mode: "number" }),
+    /** Quantity (decimal string, ≤6dp) that averageCostMinor applies to. */
+    averageCostQuantity: text("average_cost_quantity").notNull().default("0"),
+    currentPriceMinor: bigint("current_price_minor", { mode: "number" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow()
+  },
+  (t) => [
+    index("portfolio_holdings_account_idx").on(t.accountId),
+    uniqueIndex("portfolio_holdings_account_ticker_unique").on(t.accountId, t.ticker)
   ]
 );
 
