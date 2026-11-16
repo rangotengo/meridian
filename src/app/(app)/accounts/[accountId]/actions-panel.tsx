@@ -20,6 +20,7 @@ export type TrackingPreview = {
   currentBalanceMinor: number;
   resultingBalanceMinor: number;
   openingTransactionAmountMinor: number | null;
+  restatedOpeningAdjustments: number;
   valuationCount: number;
   earliestValuationDate: string | null;
   meroshareLinked: boolean;
@@ -298,6 +299,9 @@ function BalanceTrackingPanel({
               : ""}
             {laterValuations > 0
               ? ` ${laterValuations} later valuation${laterValuations === 1 ? "" : "s"} will be removed — they are balance snapshots and have no meaning as transactions.`
+              : ""}
+            {preview.restatedOpeningAdjustments > 0
+              ? ` ${preview.restatedOpeningAdjustments} earlier opening adjustment${preview.restatedOpeningAdjustments === 1 ? "" : "s"} dated after that valuation will be restated to zero — this valuation now carries the balance ${preview.restatedOpeningAdjustments === 1 ? "it" : "they"} represented, so it is not counted twice.`
               : ""}
           </p>
         ) : (

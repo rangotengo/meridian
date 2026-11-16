@@ -26,6 +26,7 @@ import { importFamilyExport, parseFamilyExport } from "@/server/domain/family-im
 import {
   accounts as accountsTable,
   auditEvents,
+  balances as balancesTable,
   entries as entriesTable,
   families as familiesTable,
   meroShareAccounts,
@@ -87,6 +88,15 @@ async function entriesOf(accountId: string) {
     .from(entriesTable)
     .where(eq(entriesTable.accountId, accountId))
     .orderBy(entriesTable.date, entriesTable.createdAt);
+}
+
+/** The materialized balance on one date, from the daily snapshots. */
+async function balanceOn(accountId: string, date: string): Promise<number | undefined> {
+  const [row] = await db()
+    .select()
+    .from(balancesTable)
+    .where(and(eq(balancesTable.accountId, accountId), eq(balancesTable.asOf, date)));
+  return row?.balanceMinor;
 }
 
 describe("balance tracking: engine modes", () => {
@@ -1063,5 +1073,324 @@ describe("balance tracking: restore invariants (review round)", () => {
       .from(accountsTable)
       .where(eq(accountsTable.id, accId));
     expect(archiveAccounts).toHaveLength(0);
+  });
+});
+
+describe("balance tracking: backdated conversion after a round trip (review round 2)", () => {
+  it("asset: a backdated anchor after a round trip keeps the balance ON the anchor date", async () => {
+    const user = await makeUser();
+    const accountId = await makeAccount(user, {
+      type: "other_asset",
+      name: "Backdated loan",
+      currency: "USD",
+      openedOn: daysAgo(5),
+      openingBalanceDisplayMinor: 0
+    });
+    // Step 1: a 100,000 valuation dated yesterday, converted. The
+    // source-marked opening adjustment is dated yesterday.
+    await valuationsSvc.recordValuation(db(), actorOf(user), {
+      accountId,
+      date: daysAgo(1),
+      amountDisplayMinor: 100_000,
+      kind: "current",
+      name: "Principal"
+    });
+    const first = await trackingSvc.switchBalanceTracking(db(), actorOf(user), {
+      accountId,
+      to: "transactions"
+    });
+    expect(first.openingTransactionAmountMinor).toBe(-100_000);
+    expect(await balanceOn(accountId, daysAgo(2))).toBe(0);
+    expect(await balanceOn(accountId, daysAgo(1))).toBe(100_000);
+    expect(await balanceOn(accountId, daysAgo(0))).toBe(100_000);
+
+    // Step 2: back to valuations; record the same balance as a valuation
+    // dated three days ago. In valuation mode both that date and today
+    // show 100,000.
+    await trackingSvc.switchBalanceTracking(db(), actorOf(user), {
+      accountId,
+      to: "valuation"
+    });
+    await valuationsSvc.recordValuation(db(), actorOf(user), {
+      accountId,
+      date: daysAgo(3),
+      amountDisplayMinor: 100_000,
+      kind: "current",
+      name: "Principal restated"
+    });
+    await balancesSvc.recalculateAccount(db(), accountId);
+    expect(await balanceOn(accountId, daysAgo(3))).toBe(100_000);
+    expect(await balanceOn(accountId, daysAgo(0))).toBe(100_000);
+
+    // Step 3: convert again, now anchored three days ago — BEFORE the
+    // existing opening adjustment's date. The plan must be date-correct:
+    // the later adjustment is restated, not treated as already
+    // represented on a date before it exists.
+    const preview = await trackingSvc.previewBalanceTracking(
+      db(),
+      actorOf(user),
+      accountId,
+      "transactions"
+    );
+    expect(preview.openingTransactionAmountMinor).toBe(-100_000);
+    expect(preview.resultingBalanceMinor).toBe(100_000);
+    expect(preview.restatedOpeningAdjustments).toBe(1);
+
+    const result = await trackingSvc.switchBalanceTracking(db(), actorOf(user), {
+      accountId,
+      to: "transactions"
+    });
+    expect(result.openingTransactionAmountMinor).toBe(-100_000);
+    expect(result.resultingBalanceMinor).toBe(100_000);
+    expect(result.restatedOpeningAdjustments).toBe(1);
+
+    // The whole materialized series, not just today: the anchor date
+    // shows the anchor valuation, and the restated adjustment does not
+    // step the balance a second time when its own date arrives.
+    expect(await balanceOn(accountId, daysAgo(4))).toBe(0);
+    expect(await balanceOn(accountId, daysAgo(3))).toBe(100_000);
+    expect(await balanceOn(accountId, daysAgo(2))).toBe(100_000);
+    expect(await balanceOn(accountId, daysAgo(1))).toBe(100_000);
+    expect(await balanceOn(accountId, daysAgo(0))).toBe(100_000);
+
+    // The earlier adjustment is restated to zero in place: same entry,
+    // same date, and its durable source marker (provenance) intact.
+    const rows = await entriesOf(accountId);
+    const earlier = rows.find((r) => r.name === "Principal");
+    expect(earlier?.entryableType).toBe("transaction");
+    expect(earlier?.date).toBe(daysAgo(1));
+    expect(earlier?.amountMinor).toBe(0);
+    expect(earlier?.externalSource).toBe("balance_tracking");
+    const converted = rows.find((r) => r.name === "Principal restated");
+    expect(converted?.entryableType).toBe("transaction");
+    expect(converted?.date).toBe(daysAgo(3));
+    expect(converted?.amountMinor).toBe(-100_000);
+    expect(converted?.externalSource).toBe("balance_tracking");
+
+    // A third round trip must not drift either date.
+    await trackingSvc.switchBalanceTracking(db(), actorOf(user), {
+      accountId,
+      to: "valuation"
+    });
+    await valuationsSvc.recordValuation(db(), actorOf(user), {
+      accountId,
+      date: daysAgo(2),
+      amountDisplayMinor: 100_000,
+      kind: "current",
+      name: "Principal restated again"
+    });
+    const third = await trackingSvc.switchBalanceTracking(db(), actorOf(user), {
+      accountId,
+      to: "transactions"
+    });
+    expect(third.openingTransactionAmountMinor).toBe(0);
+    expect(third.resultingBalanceMinor).toBe(100_000);
+    expect(await balanceOn(accountId, daysAgo(3))).toBe(100_000);
+    expect(await balanceOn(accountId, daysAgo(2))).toBe(100_000);
+    expect(await balanceOn(accountId, daysAgo(1))).toBe(100_000);
+    expect(await balanceOn(accountId, daysAgo(0))).toBe(100_000);
+  });
+
+  it("liability: a backdated anchor after a round trip keeps the balance ON the anchor date", async () => {
+    const user = await makeUser();
+    const accountId = await makeAccount(user, {
+      type: "other_liability",
+      name: "Backdated liability",
+      currency: "USD",
+      openedOn: daysAgo(5),
+      openingBalanceDisplayMinor: 0
+    });
+    await valuationsSvc.recordValuation(db(), actorOf(user), {
+      accountId,
+      date: daysAgo(1),
+      amountDisplayMinor: 100_000,
+      kind: "current",
+      name: "Amount owed"
+    });
+    const first = await trackingSvc.switchBalanceTracking(db(), actorOf(user), {
+      accountId,
+      to: "transactions"
+    });
+    // Liability valuations store negative ledger amounts, so the plug
+    // that produces a −100,000 balance is +100,000.
+    expect(first.openingTransactionAmountMinor).toBe(100_000);
+    expect(await balanceOn(accountId, daysAgo(1))).toBe(-100_000);
+    expect(await balanceOn(accountId, daysAgo(0))).toBe(-100_000);
+
+    await trackingSvc.switchBalanceTracking(db(), actorOf(user), {
+      accountId,
+      to: "valuation"
+    });
+    await valuationsSvc.recordValuation(db(), actorOf(user), {
+      accountId,
+      date: daysAgo(3),
+      amountDisplayMinor: 100_000,
+      kind: "current",
+      name: "Amount owed restated"
+    });
+    await balancesSvc.recalculateAccount(db(), accountId);
+    expect(await balanceOn(accountId, daysAgo(3))).toBe(-100_000);
+    expect(await balanceOn(accountId, daysAgo(0))).toBe(-100_000);
+
+    const preview = await trackingSvc.previewBalanceTracking(
+      db(),
+      actorOf(user),
+      accountId,
+      "transactions"
+    );
+    expect(preview.openingTransactionAmountMinor).toBe(100_000);
+    expect(preview.resultingBalanceMinor).toBe(-100_000);
+    expect(preview.restatedOpeningAdjustments).toBe(1);
+
+    const result = await trackingSvc.switchBalanceTracking(db(), actorOf(user), {
+      accountId,
+      to: "transactions"
+    });
+    expect(result.openingTransactionAmountMinor).toBe(100_000);
+    expect(result.resultingBalanceMinor).toBe(-100_000);
+    expect(result.restatedOpeningAdjustments).toBe(1);
+    expect(await balanceOn(accountId, daysAgo(4))).toBe(0);
+    expect(await balanceOn(accountId, daysAgo(3))).toBe(-100_000);
+    expect(await balanceOn(accountId, daysAgo(2))).toBe(-100_000);
+    expect(await balanceOn(accountId, daysAgo(1))).toBe(-100_000);
+    expect(await balanceOn(accountId, daysAgo(0))).toBe(-100_000);
+
+    const earlier = (await entriesOf(accountId)).find((r) => r.name === "Amount owed");
+    expect(earlier?.amountMinor).toBe(0);
+    expect(earlier?.externalSource).toBe("balance_tracking");
+  });
+
+  it("genuine activity dated between the backdated anchor and the restated adjustment keeps its full effect", async () => {
+    const user = await makeUser();
+    const accountId = await makeAccount(user, {
+      type: "other_asset",
+      name: "Backdated loan with activity",
+      currency: "USD",
+      openedOn: daysAgo(10),
+      openingBalanceDisplayMinor: 0
+    });
+    await valuationsSvc.recordValuation(db(), actorOf(user), {
+      accountId,
+      date: daysAgo(2),
+      amountDisplayMinor: 100_000,
+      kind: "current",
+      name: "Principal"
+    });
+    await trackingSvc.switchBalanceTracking(db(), actorOf(user), {
+      accountId,
+      to: "transactions"
+    });
+    // A genuine lend dated between the future anchor and the existing
+    // opening adjustment: it is real activity, not representation, and
+    // must survive the backdated conversion untouched.
+    await addTxn(user, accountId, {
+      date: daysAgo(5),
+      name: "Lent more",
+      amountLedgerMinor: -20_000
+    });
+    await balancesSvc.recalculateAccount(db(), accountId);
+    expect(await balanceOn(accountId, daysAgo(5))).toBe(20_000);
+    expect(await balanceOn(accountId, daysAgo(2))).toBe(120_000);
+
+    await trackingSvc.switchBalanceTracking(db(), actorOf(user), {
+      accountId,
+      to: "valuation"
+    });
+    await valuationsSvc.recordValuation(db(), actorOf(user), {
+      accountId,
+      date: daysAgo(7),
+      amountDisplayMinor: 100_000,
+      kind: "current",
+      name: "Principal restated"
+    });
+    const result = await trackingSvc.switchBalanceTracking(db(), actorOf(user), {
+      accountId,
+      to: "transactions"
+    });
+    expect(result.openingTransactionAmountMinor).toBe(-100_000);
+    expect(result.restatedOpeningAdjustments).toBe(1);
+    expect(result.resultingBalanceMinor).toBe(120_000);
+    // Anchor date: exactly the anchor valuation. From the genuine lend:
+    // anchor + 20,000. The restated adjustment adds no second step when
+    // its date arrives.
+    expect(await balanceOn(accountId, daysAgo(7))).toBe(100_000);
+    expect(await balanceOn(accountId, daysAgo(6))).toBe(100_000);
+    expect(await balanceOn(accountId, daysAgo(5))).toBe(120_000);
+    expect(await balanceOn(accountId, daysAgo(2))).toBe(120_000);
+    expect(await balanceOn(accountId, daysAgo(0))).toBe(120_000);
+  });
+
+  it("the marker and the date-correct conversion survive a household export/restore round trip", async () => {
+    const source = await makeUser();
+    const accountId = await makeAccount(source, {
+      type: "other_asset",
+      name: "Restored backdated loan",
+      currency: "USD",
+      openedOn: daysAgo(5),
+      openingBalanceDisplayMinor: 0
+    });
+    await valuationsSvc.recordValuation(db(), actorOf(source), {
+      accountId,
+      date: daysAgo(1),
+      amountDisplayMinor: 100_000,
+      kind: "current",
+      name: "Principal"
+    });
+    await trackingSvc.switchBalanceTracking(db(), actorOf(source), {
+      accountId,
+      to: "transactions"
+    });
+    expect((await latestBalance(accountId))?.balanceMinor).toBe(100_000);
+
+    const exported = await exportsSvc.buildFamilyExport(db(), actorOf(source));
+    const target = await makeUser();
+    const encode = (v: unknown) => new TextEncoder().encode(JSON.stringify(v));
+    await importFamilyExport(
+      db(),
+      actorOf(target),
+      parseFamilyExport(encode(JSON.parse(JSON.stringify(exported))))
+    );
+
+    const [restored] = await db()
+      .select()
+      .from(accountsTable)
+      .where(
+        and(
+          eq(accountsTable.familyId, target.familyId),
+          eq(accountsTable.name, "Restored backdated loan")
+        )
+      );
+    expect(restored!.balanceTracking).toBe("transactions");
+    expect((await latestBalance(restored!.id))?.balanceMinor).toBe(100_000);
+    const restoredOpening = (await entriesOf(restored!.id)).find((r) => r.name === "Principal");
+    expect(restoredOpening?.entryableType).toBe("transaction");
+    expect(restoredOpening?.externalSource).toBe("balance_tracking");
+    expect(restoredOpening?.amountMinor).toBe(-100_000);
+    expect(restoredOpening?.date).toBe(daysAgo(1));
+
+    // The backdated conversion in the restored family behaves exactly
+    // as in the source family: the recognized marker keeps the
+    // conversion date-correct after the round trip.
+    await trackingSvc.switchBalanceTracking(db(), actorOf(target), {
+      accountId: restored!.id,
+      to: "valuation"
+    });
+    await valuationsSvc.recordValuation(db(), actorOf(target), {
+      accountId: restored!.id,
+      date: daysAgo(3),
+      amountDisplayMinor: 100_000,
+      kind: "current",
+      name: "Principal restated"
+    });
+    const result = await trackingSvc.switchBalanceTracking(db(), actorOf(target), {
+      accountId: restored!.id,
+      to: "transactions"
+    });
+    expect(result.openingTransactionAmountMinor).toBe(-100_000);
+    expect(result.restatedOpeningAdjustments).toBe(1);
+    expect(result.resultingBalanceMinor).toBe(100_000);
+    expect(await balanceOn(restored!.id, daysAgo(3))).toBe(100_000);
+    expect(await balanceOn(restored!.id, daysAgo(1))).toBe(100_000);
+    expect(await balanceOn(restored!.id, daysAgo(0))).toBe(100_000);
   });
 });

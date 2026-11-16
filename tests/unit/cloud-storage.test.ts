@@ -66,6 +66,23 @@ describe("Cloudflare SQLite storage", () => {
       valuationRejected: true
     });
   });
+  it("keeps a backdated conversion date-correct after a round trip in cloud DO", async () => {
+    expect(await probe("balance-tracking-backdated")).toEqual({
+      valuationModeAnchorBalance: 100000,
+      previewPlug: -100000,
+      previewResulting: 100000,
+      previewRestated: 1,
+      switchedPlug: -100000,
+      switchedRestated: 1,
+      switchedResulting: 100000,
+      balanceBeforeAnchor: 0,
+      balanceOnAnchor: 100000,
+      balanceOnAdjustment: 100000,
+      balanceToday: 100000,
+      earlierAdjustmentAmount: 0,
+      earlierAdjustmentSource: "balance_tracking"
+    });
+  });
   it("edits and deletes loan valuations with atomic balance repair in cloud DO", async () => {
     expect(await probe("valuation-edit")).toEqual({
       editedBalance: -22500,

@@ -97,6 +97,7 @@ export class StorageProbe {
       operation === "/import-meroshare" ||
       operation === "/valuation-edit" ||
       operation === "/balance-tracking" ||
+      operation === "/balance-tracking-backdated" ||
       operation === "/holdings" ||
       operation === "/export-restore-precedence"
     ) {
@@ -216,6 +217,79 @@ export class StorageProbe {
           switchedResulting: switched.resultingBalanceMinor,
           valuationDrivenAfter: after.valuationDriven,
           valuationRejected
+        });
+      }
+      if (operation === "/balance-tracking-backdated") {
+        // The review-round-2 probe on the cloud executor: convert a
+        // valuation dated yesterday, switch back, record the same
+        // balance as a valuation dated three days ago, and convert
+        // again against that earlier anchor. The conversion must stay
+        // date-correct: the balance ON the anchor date is the anchor
+        // valuation, and the earlier (later-dated) opening adjustment
+        // is restated to zero instead of being counted as already
+        // represented before its date or counted twice after it.
+        const { accountId } = await createAccount(exec, actor, {
+          name: "Cloud backdated loan",
+          type: "other_asset",
+          currency: "USD",
+          openedOn: isoDaysAgo(5),
+          openingBalanceDisplayMinor: 0,
+          includedInReports: true,
+          joint: false
+        });
+        const balanceOn = async (date: string) => {
+          const res = await exec.execute<{ balance_minor: string }>(sql`
+            SELECT CAST(balance_minor AS TEXT) AS balance_minor
+            FROM balances WHERE account_id = ${accountId} AND as_of = ${date}
+          `);
+          const row = (res.rows ?? [])[0];
+          return row ? Number(row.balance_minor) : null;
+        };
+        await recordValuation(exec, actor, {
+          accountId,
+          date: isoDaysAgo(1),
+          amountDisplayMinor: 100_000,
+          kind: "current",
+          name: "Principal"
+        });
+        await switchBalanceTracking(exec, actor, { accountId, to: "transactions" });
+        await switchBalanceTracking(exec, actor, { accountId, to: "valuation" });
+        await recordValuation(exec, actor, {
+          accountId,
+          date: isoDaysAgo(3),
+          amountDisplayMinor: 100_000,
+          kind: "current",
+          name: "Principal restated"
+        });
+        await recalculateAccount(exec, accountId);
+        const valuationModeAnchorBalance = await balanceOn(isoDaysAgo(3));
+        const preview = await previewBalanceTracking(exec, actor, accountId, "transactions");
+        const switched = await switchBalanceTracking(exec, actor, {
+          accountId,
+          to: "transactions"
+        });
+        const earlierRes = await exec.execute<{
+          amount_minor: string;
+          external_source: string | null;
+        }>(sql`
+          SELECT CAST(amount_minor AS TEXT) AS amount_minor, external_source
+          FROM entries WHERE account_id = ${accountId} AND name = ${"Principal"}
+        `);
+        const earlier = (earlierRes.rows ?? [])[0];
+        return Response.json({
+          valuationModeAnchorBalance,
+          previewPlug: preview.openingTransactionAmountMinor,
+          previewResulting: preview.resultingBalanceMinor,
+          previewRestated: preview.restatedOpeningAdjustments,
+          switchedPlug: switched.openingTransactionAmountMinor,
+          switchedRestated: switched.restatedOpeningAdjustments,
+          switchedResulting: switched.resultingBalanceMinor,
+          balanceBeforeAnchor: await balanceOn(isoDaysAgo(4)),
+          balanceOnAnchor: await balanceOn(isoDaysAgo(3)),
+          balanceOnAdjustment: await balanceOn(isoDaysAgo(1)),
+          balanceToday: await balanceOn(isoDaysAgo(0)),
+          earlierAdjustmentAmount: earlier ? Number(earlier.amount_minor) : null,
+          earlierAdjustmentSource: earlier?.external_source ?? null
         });
       }
       if (operation === "/holdings") {
