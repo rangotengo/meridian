@@ -17,13 +17,16 @@ export function Dialog({
   title,
   description,
   children,
-  width = "max-w-lg"
+  width = "max-w-lg",
+  onOpen
 }: {
   trigger: React.ReactNode;
   title: string;
   description?: string;
   children: React.ReactNode;
   width?: string;
+  /** Called each time the dialog is opened (e.g. to reset stale form state). */
+  onOpen?: () => void;
 }) {
   const ref = useRef<HTMLDialogElement>(null);
   const titleId = useId();
@@ -33,14 +36,30 @@ export function Dialog({
     const dialog = ref.current;
     if (!dialog) return;
     const onClose = () => {
-      const opener = (dialog.previousElementSibling as HTMLElement) ?? null;
-      opener?.focus();
+      const opener = dialog.previousElementSibling as HTMLElement | null;
+      if (!opener) return;
+      opener.focus();
+      // The trigger wrapper uses `display: contents` so the trigger's own
+      // styling governs layout — but Chromium treats such elements as
+      // unfocusable, leaving focus on <body>. Fall back to the trigger
+      // content itself (a real box) so keyboard users land back on the
+      // control they opened the dialog from.
+      if (document.activeElement !== opener) {
+        const target = opener.firstElementChild as HTMLElement | null;
+        if (target) {
+          if (!target.hasAttribute("tabindex")) target.setAttribute("tabindex", "-1");
+          target.focus({ preventScroll: true });
+        }
+      }
     };
     dialog.addEventListener("close", onClose);
     return () => dialog.removeEventListener("close", onClose);
   }, []);
 
-  const open = () => ref.current?.showModal();
+  const open = () => {
+    onOpen?.();
+    ref.current?.showModal();
+  };
   const close = () => ref.current?.close();
 
   return (

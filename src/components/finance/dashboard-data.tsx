@@ -46,6 +46,13 @@ export type DashboardData = {
   topCategories: { name: string; totalMinor: number }[];
   recent: DashboardEntry[];
   accounts: DashboardAccount[];
+  /** Data for the in-place transaction composer (Quick actions dialog). */
+  composer: {
+    accounts: { id: string; name: string; currency: string }[];
+    categories: { id: string; name: string }[];
+    tags: { id: string; name: string }[];
+    today: string;
+  };
   budgetOverall: {
     limitMinor: number;
     spentMinor: number;

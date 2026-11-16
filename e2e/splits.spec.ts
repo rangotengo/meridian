@@ -6,9 +6,9 @@ test.use({ storageState: authFile("admin") });
 test("split a transaction into parts that total the original amount", async ({ page }) => {
   // Create the expense to split, through the real create form.
   await page.goto("/transactions/new");
-  await page.locator("#accountId").selectOption(getData().accountA.id);
-  await page.locator("#amount").fill("100.00");
-  await page.locator("#name").fill("E2E Split Me");
+  await page.locator("#new-txn-entry-account").selectOption(getData().accountA.id);
+  await page.locator("#new-txn-entry-amount").fill("100.00");
+  await page.locator("#new-txn-entry-name").fill("E2E Split Me");
   await page.getByRole("button", { name: "Record expense" }).click();
   await expect(page).toHaveURL(/\/transactions$/);
 
