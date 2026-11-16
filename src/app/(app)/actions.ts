@@ -44,10 +44,15 @@ const createTxnSchema = z.object({
   notes: z.string().optional()
 });
 
-export async function createTransactionAction(
-  _prev: ActionState | undefined,
-  formData: FormData
-): Promise<ActionState> {
+/**
+ * Shared create-transaction mutation behind both action wrappers. Runs the
+ * domain write and revalidates every surface the new entry affects (the
+ * transaction list, the dashboard, the account list/sidebar data, and the
+ * account page) but never redirects — each wrapper decides what happens
+ * next. Returns the typed ActionState so dialog callers can surface errors
+ * without losing the form.
+ */
+async function createTransactionInternal(formData: FormData): Promise<ActionState> {
   const parsed = createTxnSchema.safeParse(formValues(formData));
   if (!parsed.success)
     return { ok: false, error: "Check the highlighted fields.", code: "validation.failed" };
@@ -69,9 +74,26 @@ export async function createTransactionAction(
     });
     revalidatePath("/transactions");
     revalidatePath("/");
+    revalidatePath("/accounts");
     revalidatePath(`/accounts/${input.accountId}`);
-    redirect("/transactions");
   });
+}
+
+export async function createTransactionAction(
+  _prev: ActionState | undefined,
+  formData: FormData
+): Promise<ActionState> {
+  const state = await createTransactionInternal(formData);
+  if (state.ok) redirect("/transactions");
+  return state;
+}
+
+/** Dialog variant: same mutation, typed result, no redirect. */
+export async function createTransactionDialogAction(
+  _prev: ActionState | undefined,
+  formData: FormData
+): Promise<ActionState> {
+  return createTransactionInternal(formData);
 }
 
 const updateTxnSchema = z.object({
@@ -219,10 +241,13 @@ const transferFormSchema = z.object({
   name: z.string().optional()
 });
 
-export async function createTransferAction(
-  _prev: ActionState | undefined,
-  formData: FormData
-): Promise<ActionState> {
+/**
+ * Shared create-transfer mutation behind both action wrappers (see
+ * createTransactionInternal). The domain creates both legs atomically; this
+ * layer only maps the form, converts the amount, and revalidates the list,
+ * the dashboard, the account list/sidebar data, and BOTH account pages.
+ */
+async function createTransferInternal(formData: FormData): Promise<ActionState> {
   const parsed = transferFormSchema.safeParse(formValues(formData));
   if (!parsed.success)
     return { ok: false, error: "Check the highlighted fields.", code: "validation.failed" };
@@ -241,8 +266,27 @@ export async function createTransferAction(
     );
     revalidatePath("/transactions");
     revalidatePath("/");
-    redirect("/transactions");
+    revalidatePath("/accounts");
+    revalidatePath(`/accounts/${input.fromAccountId}`);
+    revalidatePath(`/accounts/${input.toAccountId}`);
   });
+}
+
+export async function createTransferAction(
+  _prev: ActionState | undefined,
+  formData: FormData
+): Promise<ActionState> {
+  const state = await createTransferInternal(formData);
+  if (state.ok) redirect("/transactions");
+  return state;
+}
+
+/** Dialog variant: same mutation, typed result, no redirect. */
+export async function createTransferDialogAction(
+  _prev: ActionState | undefined,
+  formData: FormData
+): Promise<ActionState> {
+  return createTransferInternal(formData);
 }
 
 const valuationSchema = z.object({
