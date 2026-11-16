@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll } from "vitest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import {
   db,
   makeUser,
@@ -522,5 +522,57 @@ describe("balance tracking: export / restore", () => {
     });
     await balancesSvc.recalculateAccount(db(), restored!.id);
     expect((await latestBalance(restored!.id))?.balanceMinor).toBe(16_000_000);
+  });
+});
+
+describe("balance tracking: valuation precedence", () => {
+  it("previews the same winner as the engine when timestamps tie", async () => {
+    const user = await makeUser();
+    const actor = actorOf(user);
+    const accountId = await makeAccount(user, {
+      type: "other_asset",
+      balanceTracking: "transactions",
+      openingBalanceDisplayMinor: 0,
+      openedOn: "2026-01-01"
+    });
+    // Model ignored valuation history carried by a restore. The later
+    // insertion has the lower UUID, so ordering by UUID selects the wrong
+    // winner, while the engine's write sequence correctly selects 2000.
+    const first = "ffffffff-ffff-4fff-bfff-ffffffffffff";
+    const second = "00000000-0000-4000-8000-000000000001";
+    const createdAt = new Date("2026-01-01T00:00:00.000Z");
+    await db()
+      .insert(entriesTable)
+      .values([
+        {
+          id: first,
+          accountId,
+          date: "2026-01-01",
+          amountMinor: 1000,
+          currency: "USD",
+          name: "First",
+          entryableType: "valuation",
+          createdAt
+        },
+        {
+          id: second,
+          accountId,
+          date: "2026-01-01",
+          amountMinor: 2000,
+          currency: "USD",
+          name: "Second",
+          entryableType: "valuation",
+          createdAt
+        }
+      ]);
+    await db().execute(sql`INSERT INTO valuations(entry_id, kind)
+      VALUES (${first}, 'current'), (${second}, 'current')`);
+    const preview = await trackingSvc.previewBalanceTracking(db(), actor, accountId, "valuation");
+    const switched = await trackingSvc.switchBalanceTracking(db(), actor, {
+      accountId,
+      to: "valuation"
+    });
+    expect(preview.resultingBalanceMinor).toBe(2000);
+    expect(switched.resultingBalanceMinor).toBe(preview.resultingBalanceMinor);
   });
 });

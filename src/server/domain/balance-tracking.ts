@@ -93,11 +93,17 @@ async function listValuationEntries(
   exec: Executor,
   accountId: string
 ): Promise<ValuationEntryRow[]> {
+  // Match the balance engine, including exact timestamp ties restored
+  // from bulk history. UUID order is unrelated to valuation precedence.
   return exec
     .select()
     .from(entries)
     .where(and(eq(entries.accountId, accountId), eq(entries.entryableType, "valuation")))
-    .orderBy(asc(entries.date), asc(entries.createdAt), asc(entries.id));
+    .orderBy(
+      asc(entries.date),
+      asc(entries.createdAt),
+      usesCloudStorage ? sql`"entries"."rowid" ASC` : asc(entries.writeSeq)
+    );
 }
 
 /**
