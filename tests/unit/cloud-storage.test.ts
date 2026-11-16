@@ -202,6 +202,47 @@ describe("Cloudflare SQLite storage", () => {
     expect(result.synced).toBe(1);
     expect(result.encrypted).toBe(true);
   });
+  it("imports an SSIS snapshot and reads the insight back inside the Durable Object", async () => {
+    const result = await probe("ssis");
+    expect(result.counts).toEqual({ purchases: 1, statement: 1, navPoints: 1, skipped: 0 });
+    expect(result.holderName).toBe("Cloud Holder");
+    expect(result.totalUnits).toBe("100");
+    expect(result.totalInvestedMinor).toBe(100000);
+    expect(result.currentNavMinor).toBe(1050);
+    expect(result.currentValueMinor).toBe(105000);
+    expect(result.purchases).toBe(1);
+    expect(result.statement).toBe(1);
+  });
+  it("binds SSIS data to the configured holder and validates upstream data in the Durable Object", async () => {
+    const result = await probe("ssis-fixes");
+    expect(result.switchRejected).toBe(true);
+    expect(result.dataReset).toBe(true);
+    expect(result.purchasesAfterSwitch).toBe(0);
+    expect(result.holderAfterSwitch).toBeNull();
+    expect(result.inflightRejected).toBe(true);
+    expect(result.purchasesAfterInflight).toBe(0);
+    expect(result.boMaskedAfterInflight).toBe("••••2222");
+    expect(result.allErrorPayloadNull).toBe(true);
+    expect(result.allErrorWarnings).toBe(4);
+    expect(result.oversizedRejected).toBe(true);
+    expect(result.faultMessage).toContain("Could not save the SSIS BO account configuration.");
+    expect(result.faultChainHasBo).toBe(false);
+  });
+  it("closes the SSIS holder-binding and effective-bounds bypasses in the Durable Object", async () => {
+    const result = await probe("ssis-round2");
+    expect(result.bindKeptDataReset).toBe(false);
+    expect(result.purchasesAfterBindKept).toBe(1);
+    expect(result.bindResetDataReset).toBe(true);
+    expect(result.purchasesAfterBindReset).toBe(0);
+    expect(result.otherHolderRejected).toBe(true);
+    expect(result.anonymousRejected).toBe(true);
+    expect(result.purchasesAfterAnonymous).toBe(1);
+    expect(result.combinedRejected).toBe(true);
+    expect(result.purchasesAfterCombined).toBe(1);
+    expect(result.totalInvestedAfterCombined).toBe(5000000000000000);
+    expect(result.navOverflowRejected).toBe(true);
+    expect(result.navAfterNavOverflow).toBe(100);
+  });
   it("runs household, ledger, splits, transfers, reports and queue services", async () => {
     const result = await probe("ledger");
     expect(result.duplicate).toBe(true);
