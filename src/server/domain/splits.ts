@@ -12,6 +12,7 @@ import {
 import { errors } from "@/lib/errors";
 import { addMinor } from "@/lib/money";
 import { recordAudit } from "../observability/audit";
+import { BALANCE_TRACKING_OPENING_SOURCE } from "./balance-tracking";
 
 export type SplitChildInput = {
   name?: string;
@@ -54,6 +55,13 @@ export async function splitEntry(
   if (!txn) throw errors.notFound("Transaction");
   if (txn.transferId) {
     throw errors.conflict("Unlink the transfer before splitting this transaction.");
+  }
+  if (parent.externalSource === BALANCE_TRACKING_OPENING_SOURCE) {
+    // Splitting would reclassify the parts as ordinary transactions and
+    // leak a balance-only bookkeeping amount into report flows.
+    throw errors.conflict(
+      "This transaction is the opening adjustment created by a balance-tracking switch and cannot be split."
+    );
   }
 
   const [childCount] = await exec

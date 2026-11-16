@@ -15,7 +15,7 @@ import { errors } from "@/lib/errors";
 import { todayIn } from "@/lib/datetime";
 import { recordAudit } from "../observability/audit";
 import { latestBalancesFor, recalculateAccount } from "./balances";
-import { accountHasHoldings } from "./holdings";
+import { accountHasHoldings, lockHoldingsAccount } from "./holdings";
 
 /**
  * Per-account balance tracking for the valuation-driven types
@@ -23,10 +23,46 @@ import { accountHasHoldings } from "./holdings";
  * from valuations it records (property, investments) or from its
  * transactions (a loan that is lent and collected). Switching modes is a
  * deliberate, confirmed operation: the preview computes the exact outcome
- * first, and switching valuation → transactions converts the earliest
- * valuation into the opening transaction and removes the later ones —
- * they are balance snapshots and have no meaning as transactions.
+ * first with the same plan the switch executes, and switching
+ * valuation → transactions converts the earliest valuation into the
+ * opening transaction and removes the later ones — they are balance
+ * snapshots and have no meaning as transactions.
+ *
+ * The conversion is a NORMALIZED anchor, not a raw sign flip. A valuation
+ * states the account's whole balance on its date, so the converted entry
+ * carries the reconciliation plug: the amount that makes the opening
+ * balance plus every transaction dated up to the anchor date add up to
+ * exactly the valuation. Anything the history already represents of that
+ * value — a nonzero opening balance, pre-anchor transactions, or an
+ * earlier switch's opening adjustment (recognized by its durable source
+ * marker, wherever it is dated) — is therefore never counted twice, and
+ * repeated mode round trips are stable. Transactions dated after the
+ * anchor keep their full effect, which is what makes the motivating loan
+ * shape work: principal valuation + later lend/repay activity lands on
+ * principal + activity, not on the stale latest snapshot.
+ *
+ * Concurrency: the switch takes the SAME per-account advisory lock as
+ * the holdings and valuation writers (holdings-account:<id>, see
+ * holdings.ts), and resolves every guard — access, open state, mode,
+ * MeroShare link, holdings — after the lock is held. Those writers
+ * re-resolve the same state inside the lock before mutating, so a switch
+ * and a writer queued behind each other can never both act on pre-switch
+ * state. On the cloud backend the Durable Object executor serializes the
+ * whole transaction, which provides the same guarantee.
  */
+
+/**
+ * entries.external_source value marking the opening transaction a switch
+ * creates from the earliest valuation. It is the entry's durable
+ * classification: report flow queries exclude it (it is a balance-only
+ * opening adjustment, not income or spending — see reports.ts), and a
+ * later conversion recognizes it as already-represented principal so a
+ * round trip never counts the same principal twice. Household exports
+ * carry external_source verbatim, so the classification survives a
+ * household restore; operator backups copy raw rows, so it survives
+ * those too.
+ */
+export const BALANCE_TRACKING_OPENING_SOURCE = "balance_tracking";
 
 export type BalanceTrackingPreview = {
   accountId: string;
@@ -36,6 +72,15 @@ export type BalanceTrackingPreview = {
   currentBalanceMinor: number;
   /** Balance the account will show immediately after the switch. */
   resultingBalanceMinor: number;
+  /**
+   * The amount_minor the converted opening transaction will carry
+   * (ledger convention, outflow-positive; its balance contribution is
+   * the negation), or null when switching to valuations or when there
+   * is no valuation to convert. This is the normalized reconciliation
+   * plug, not the raw negated valuation: it is reduced by whatever the
+   * opening balance and earlier history already represent.
+   */
+  openingTransactionAmountMinor: number | null;
   valuationCount: number;
   earliestValuationDate: string | null;
   meroshareLinked: boolean;
@@ -49,6 +94,8 @@ export type BalanceTrackingSwitchResult = {
   to: BalanceTracking;
   resultingBalanceMinor: number;
   convertedValuationDate: string | null;
+  /** The amount_minor the converted opening transaction carries. */
+  openingTransactionAmountMinor: number | null;
   removedValuations: number;
 };
 
@@ -58,6 +105,18 @@ function safeParseMinor(raw: string | number): number {
     throw errors.validation("Amount exceeds safe integer range.");
   }
   return n;
+}
+
+function safeAdd(a: number, b: number): number {
+  const res = a + b;
+  if (!Number.isSafeInteger(res)) {
+    throw errors.validation("Calculated balance exceeds safe integer bounds.");
+  }
+  return res;
+}
+
+function safeSubtract(a: number, b: number): number {
+  return safeAdd(a, -b);
 }
 
 async function requireSwitchAccess(
@@ -106,36 +165,74 @@ async function listValuationEntries(
     );
 }
 
+async function familyToday(exec: Executor, familyId: string): Promise<string> {
+  const [family] = await exec
+    .execute<{ timezone: string }>(sql`SELECT timezone FROM families WHERE id = ${familyId}`)
+    .then((r) => r.rows ?? []);
+  return todayIn(family?.timezone ?? "UTC");
+}
+
 /**
- * The balance the engine settles on for a mode, computed with the same
- * rules recalculateAccount applies on its final day: only entries dated
- * within [openedOn, today] count, split parents are excluded (their leaf
- * children count), and a valuation sets the balance outright.
+ * The balance the engine settles on in valuation mode: the opening
+ * balance, overridden by each in-window valuation in write order. Only
+ * entries dated within [openedOn, today] count.
  */
-async function projectedBalance(
+async function projectedValuationBalance(
   exec: Executor,
   account: AccountRow,
-  mode: BalanceTracking,
   valuationEntries: ValuationEntryRow[]
 ): Promise<number> {
-  const [family] = await exec
-    .execute<{ timezone: string }>(
-      sql`SELECT timezone FROM families WHERE id = ${account.familyId}`
-    )
-    .then((r) => r.rows ?? []);
-  const today = todayIn(family?.timezone ?? "UTC");
+  const today = await familyToday(exec, account.familyId);
+  const inWindow = (date: string) => date >= account.openedOn && date <= today;
+  let balance = account.openingBalanceMinor;
+  for (const entry of valuationEntries) {
+    if (inWindow(entry.date)) balance = entry.amountMinor;
+  }
+  return balance;
+}
+
+export type ConversionPlan = {
+  /** The valuation entry that becomes the opening transaction, if any. */
+  anchor: ValuationEntryRow | null;
+  /**
+   * The amount_minor the converted entry will carry: the reconciliation
+   * plug that makes the transaction-mode balance ON the anchor date
+   * equal the anchor valuation exactly. Null when there is no valuation
+   * to convert.
+   */
+  openingTransactionAmountMinor: number | null;
+  /** Balance immediately after the switch, under engine window rules. */
+  resultingBalanceMinor: number;
+};
+
+/**
+ * The single normalized plan for a valuation → transactions switch. The
+ * preview and the switch both execute this, so the number the user
+ * confirms is the number the switch produces.
+ *
+ * The anchor valuation is an absolute balance at its date, so the plug
+ * is: opening balance − (transactions already representing that value)
+ * − the valuation amount. "Already representing" is every in-window
+ * transaction dated on or before the anchor date, plus any earlier
+ * conversion's opening adjustment (source-marked) wherever it is dated —
+ * its principal is already in the ledger and must not be counted again
+ * when a later valuation is converted on a round trip. Transactions
+ * dated after the anchor are untouched and keep their full effect.
+ */
+async function planConversionToTransactions(
+  exec: Executor,
+  account: AccountRow,
+  valuationEntries: ValuationEntryRow[]
+): Promise<ConversionPlan> {
+  const today = await familyToday(exec, account.familyId);
   const inWindow = (date: string) => date >= account.openedOn && date <= today;
 
-  if (mode === "valuation") {
-    let balance = account.openingBalanceMinor;
-    for (const entry of valuationEntries) {
-      if (inWindow(entry.date)) balance = entry.amountMinor;
-    }
-    return balance;
-  }
-
-  const res = await exec.execute<{ sum_minor: string }>(sql`
-    SELECT CAST(coalesce(sum(amount_minor), 0) AS TEXT) AS sum_minor
+  const res = await exec.execute<{
+    date: string;
+    amount_minor: string;
+    external_source: string | null;
+  }>(sql`
+    SELECT CAST(date AS TEXT) AS date, CAST(amount_minor AS TEXT) AS amount_minor, external_source
     FROM entries
     WHERE account_id = ${account.id}
       AND entryable_type = 'transaction'
@@ -145,16 +242,40 @@ async function projectedBalance(
         SELECT 1 FROM entries c WHERE c.parent_entry_id = entries.id
       )
   `);
-  const txSum = safeParseMinor((res.rows ?? [])[0]?.sum_minor ?? "0");
-  // The earliest valuation becomes the opening transaction on switch: its
-  // stored amount flips sign, so it contributes its valuation amount.
-  const earliest = valuationEntries[0];
-  const converted = earliest && inWindow(earliest.date) ? earliest.amountMinor : 0;
-  const result = account.openingBalanceMinor - txSum + converted;
-  if (!Number.isSafeInteger(result)) {
-    throw errors.validation("Calculated balance exceeds safe integer bounds.");
+  const txRows = (res.rows ?? []).map((r) => ({
+    date: r.date.slice(0, 10),
+    amountMinor: safeParseMinor(r.amount_minor),
+    openingAdjustment: r.external_source === BALANCE_TRACKING_OPENING_SOURCE
+  }));
+  let totalTx = 0;
+  for (const row of txRows) totalTx = safeAdd(totalTx, row.amountMinor);
+
+  const anchor = valuationEntries[0] ?? null;
+  if (!anchor) {
+    return {
+      anchor: null,
+      openingTransactionAmountMinor: null,
+      resultingBalanceMinor: safeSubtract(account.openingBalanceMinor, totalTx)
+    };
   }
-  return result;
+
+  let represented = 0;
+  for (const row of txRows) {
+    if (row.date <= anchor.date || row.openingAdjustment) {
+      represented = safeAdd(represented, row.amountMinor);
+    }
+  }
+  const plug = safeSubtract(
+    safeSubtract(account.openingBalanceMinor, represented),
+    anchor.amountMinor
+  );
+  // The converted entry sits on the anchor date, so it contributes to
+  // today's balance only when that date is inside the engine window —
+  // exactly how recalculateAccount will treat it after the switch.
+  const resulting = inWindow(anchor.date)
+    ? safeSubtract(safeSubtract(account.openingBalanceMinor, totalTx), plug)
+    : safeSubtract(account.openingBalanceMinor, totalTx);
+  return { anchor, openingTransactionAmountMinor: plug, resultingBalanceMinor: resulting };
 }
 
 export async function previewBalanceTracking(
@@ -167,16 +288,25 @@ export async function previewBalanceTracking(
   const from: BalanceTracking = isValuationTracked(account) ? "valuation" : "transactions";
   const valuationEntries = await listValuationEntries(exec, accountId);
   const current = await latestBalancesFor(exec, [accountId]);
-  const resulting =
-    to === from
-      ? (current.get(accountId)?.balanceMinor ?? account.openingBalanceMinor)
-      : await projectedBalance(exec, account, to, valuationEntries);
+  const currentBalanceMinor = current.get(accountId)?.balanceMinor ?? account.openingBalanceMinor;
+  let resulting = currentBalanceMinor;
+  let openingTransactionAmountMinor: number | null = null;
+  if (to !== from) {
+    if (to === "transactions") {
+      const plan = await planConversionToTransactions(exec, account, valuationEntries);
+      resulting = plan.resultingBalanceMinor;
+      openingTransactionAmountMinor = plan.openingTransactionAmountMinor;
+    } else {
+      resulting = await projectedValuationBalance(exec, account, valuationEntries);
+    }
+  }
   return {
     accountId,
     from,
     to,
-    currentBalanceMinor: current.get(accountId)?.balanceMinor ?? account.openingBalanceMinor,
+    currentBalanceMinor,
     resultingBalanceMinor: resulting,
+    openingTransactionAmountMinor,
     valuationCount: valuationEntries.length,
     earliestValuationDate: valuationEntries[0]?.date ?? null,
     meroshareLinked: await isMeroShareLinked(exec, accountId),
@@ -190,13 +320,13 @@ export async function switchBalanceTracking(
   input: { accountId: string; to: BalanceTracking }
 ): Promise<BalanceTrackingSwitchResult> {
   return exec.transaction(async (tx) => {
-    // Serialize switches per account (Postgres advisory transaction lock;
-    // the cloud Durable Object executor is already serialized).
-    if (!usesCloudStorage) {
-      await tx.execute(
-        sql`select pg_advisory_xact_lock(hashtext(${"balance-tracking:" + input.accountId}))`
-      );
-    }
+    // Serialize against every other writer of this account's balance
+    // under the shared per-account protocol: the switch takes the same
+    // advisory lock as the holdings and valuation writers (see
+    // holdings.ts), and every guard below is resolved after the lock is
+    // held. On the cloud backend the lock call is a no-op and the
+    // Durable Object executor serializes the whole transaction instead.
+    await lockHoldingsAccount(tx, input.accountId);
 
     const account = await requireSwitchAccess(tx, actor, input.accountId);
     if (account.status !== "active") {
@@ -222,22 +352,36 @@ export async function switchBalanceTracking(
     }
 
     let convertedValuationDate: string | null = null;
+    let openingTransactionAmountMinor: number | null = null;
     let removedValuations = 0;
 
     if (from === "valuation" && input.to === "transactions") {
       const valuationEntries = await listValuationEntries(tx, account.id);
+      // The switch executes exactly the plan the preview showed.
+      const plan = await planConversionToTransactions(tx, account, valuationEntries);
       const [earliest, ...later] = valuationEntries;
       if (earliest) {
         convertedValuationDate = earliest.date;
-        // Convert in place: the entry keeps its date and name, its amount
-        // flips from "the balance on that date" to the ledger transaction
-        // that produces that balance (ledger amounts are outflow-positive,
-        // so the opening transaction stores the negated valuation amount),
-        // and its detail row moves from valuations to transactions.
+        openingTransactionAmountMinor = plan.openingTransactionAmountMinor;
+        // Convert in place: the entry keeps its date and name, but its
+        // amount becomes the plan's reconciliation plug — the amount
+        // that makes the opening balance and the transactions up to
+        // that date add up to the valuation's absolute balance — and
+        // its detail row moves from valuations to transactions. The
+        // source marker classifies it durably as a balance-only opening
+        // adjustment (report flows exclude it; a later conversion
+        // recognizes its principal as already represented), and any
+        // source identity the valuation carried is dropped so no sync
+        // can mistake it for its own entry later.
         await tx.delete(valuations).where(eq(valuations.entryId, earliest.id));
         await tx
           .update(entries)
-          .set({ entryableType: "transaction", amountMinor: -earliest.amountMinor })
+          .set({
+            entryableType: "transaction",
+            amountMinor: plan.openingTransactionAmountMinor!,
+            externalSource: BALANCE_TRACKING_OPENING_SOURCE,
+            externalId: null
+          })
           .where(eq(entries.id, earliest.id));
         await tx.insert(transactions).values({ entryId: earliest.id });
       }
@@ -268,6 +412,7 @@ export async function switchBalanceTracking(
         from,
         to: input.to,
         convertedValuationDate,
+        openingTransactionAmountMinor,
         removedValuations,
         resultingBalanceMinor
       }
@@ -279,6 +424,7 @@ export async function switchBalanceTracking(
       to: input.to,
       resultingBalanceMinor,
       convertedValuationDate,
+      openingTransactionAmountMinor,
       removedValuations
     };
   });

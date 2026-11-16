@@ -19,6 +19,7 @@ export type TrackingPreview = {
   to: "valuation" | "transactions";
   currentBalanceMinor: number;
   resultingBalanceMinor: number;
+  openingTransactionAmountMinor: number | null;
   valuationCount: number;
   earliestValuationDate: string | null;
   meroshareLinked: boolean;
@@ -292,6 +293,9 @@ function BalanceTrackingPanel({
               ? ` (${fmtDate(preview.earliestValuationDate)})`
               : ""}{" "}
             becomes the opening transaction.
+            {preview.openingTransactionAmountMinor !== null
+              ? ` A valuation states the whole balance on its date, so the opening transaction is recorded as ${fmtMoney(-preview.openingTransactionAmountMinor, currency)} — the amount that reconciles your opening balance and any transactions up to that date with that balance. It counts toward the balance only; reports do not treat it as income or spending.`
+              : ""}
             {laterValuations > 0
               ? ` ${laterValuations} later valuation${laterValuations === 1 ? "" : "s"} will be removed — they are balance snapshots and have no meaning as transactions.`
               : ""}

@@ -22,7 +22,11 @@ import { accountHasHoldings, withHoldingsAccountLock } from "./holdings";
  * The guard and the write run inside the account's holdings lock (see
  * holdings.ts): holdings-mode transitions are writers for the account
  * like any holdings mutation, and an unlocked check-then-write could race
- * a concurrent holdings change into a state neither side intended.
+ * a concurrent holdings change into a state neither side intended. The
+ * balance-tracking switch takes the same lock, so recordValuation
+ * re-resolves access, open state, and the tracking mode INSIDE the lock
+ * before writing — the checks that ran before this writer queued on the
+ * lock are a snapshot a committed switch may have invalidated.
  */
 async function assertNotHoldingsManaged(exec: Executor, account: AccountRow): Promise<void> {
   if (account.type !== "other_asset") return;
@@ -72,12 +76,21 @@ export async function recordValuation(
     (input.kind === "reconciliation" ? "Reconciliation adjustment" : "Valuation update");
 
   const entryId = await withHoldingsAccountLock(exec, input.accountId, async (tx) => {
-    const [account] = await tx
-      .select()
-      .from(accounts)
-      .where(eq(accounts.id, input.accountId))
-      .limit(1);
-    if (!account) throw errors.notFound("Account");
+    // Re-resolve access, open state, and the tracking mode inside the
+    // lock, against fresh reads: a balance-tracking switch holding the
+    // same lock may have committed while this writer was queued on it,
+    // and writing from the pre-lock snapshot would land a valuation on
+    // an account that now tracks its balance from its transactions.
+    const innerLevel = await assertAccountAccessLevel(tx, actor, input.accountId);
+    if (innerLevel !== "full_control") {
+      throw errors.forbidden("Only full-control access can record valuations.");
+    }
+    const { account } = await assertAccountOpen(tx, actor, input.accountId, "manage");
+    if (!isValuationTracked(account)) {
+      throw errors.validation(
+        "This account tracks its balance from its transactions, so a valuation would not affect it. Switch the account to valuation tracking (Account settings → Balance tracking) before recording valuations."
+      );
+    }
     await assertNotHoldingsManaged(tx, account);
 
     const ledgerAmount = displayToLedgerBalance(input.amountDisplayMinor, account.type);

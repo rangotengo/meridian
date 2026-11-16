@@ -8,7 +8,8 @@ import {
   truncateAll,
   actorOf,
   latestBalance,
-  joinFamily
+  joinFamily,
+  daysAgo
 } from "../helpers";
 import * as accountsSvc from "@/server/domain/accounts";
 import * as valuationsSvc from "@/server/domain/valuations";
@@ -17,11 +18,16 @@ import * as trackingSvc from "@/server/domain/balance-tracking";
 import * as holdingsSvc from "@/server/domain/holdings";
 import * as orchestrate from "@/server/domain/orchestrate";
 import * as exportsSvc from "@/server/domain/exports";
+import * as reportsSvc from "@/server/domain/reports";
+import * as splitsSvc from "@/server/domain/splits";
+import * as backupsSvc from "@/server/domain/backups";
+import { currentFamily } from "@/server/auth/context";
 import { importFamilyExport, parseFamilyExport } from "@/server/domain/family-import";
 import {
   accounts as accountsTable,
   auditEvents,
   entries as entriesTable,
+  families as familiesTable,
   meroShareAccounts,
   meroShareConnections
 } from "@/server/db/schema";
@@ -574,5 +580,488 @@ describe("balance tracking: valuation precedence", () => {
     });
     expect(preview.resultingBalanceMinor).toBe(2000);
     expect(switched.resultingBalanceMinor).toBe(preview.resultingBalanceMinor);
+  });
+});
+
+describe("balance tracking: normalized conversion (review round)", () => {
+  it("does not double-count a nonzero opening balance that the valuation restates", async () => {
+    const user = await makeUser();
+    const accountId = await makeAccount(user, {
+      type: "other_asset",
+      name: "Restated opening",
+      currency: "USD",
+      openedOn: "2026-01-01",
+      openingBalanceDisplayMinor: 100_000
+    });
+    await valuationsSvc.recordValuation(db(), actorOf(user), {
+      accountId,
+      date: "2026-01-01",
+      amountDisplayMinor: 100_000,
+      kind: "opening",
+      name: "Opening valuation"
+    });
+    await balancesSvc.recalculateAccount(db(), accountId);
+    expect((await latestBalance(accountId))?.balanceMinor).toBe(100_000);
+
+    const preview = await trackingSvc.previewBalanceTracking(
+      db(),
+      actorOf(user),
+      accountId,
+      "transactions"
+    );
+    // The opening balance already represents the valuation's 100,000, so
+    // the conversion must add nothing: plug 0, balance unchanged.
+    expect(preview.openingTransactionAmountMinor).toBe(0);
+    expect(preview.resultingBalanceMinor).toBe(100_000);
+
+    const result = await trackingSvc.switchBalanceTracking(db(), actorOf(user), {
+      accountId,
+      to: "transactions"
+    });
+    expect(result.openingTransactionAmountMinor).toBe(0);
+    expect(result.resultingBalanceMinor).toBe(100_000);
+    expect((await latestBalance(accountId))?.balanceMinor).toBe(100_000);
+
+    const opening = (await entriesOf(accountId)).find((r) => r.name === "Opening valuation");
+    expect(opening?.entryableType).toBe("transaction");
+    expect(opening?.amountMinor).toBe(0);
+    expect(opening?.externalSource).toBe("balance_tracking");
+    expect(opening?.externalId).toBeNull();
+  });
+
+  it("absorbs pre-anchor transactions into the anchor; post-anchor activity keeps its full effect", async () => {
+    const user = await makeUser();
+    const accountId = await makeAccount(user, {
+      type: "other_asset",
+      name: "Loan with early activity",
+      currency: "USD",
+      openedOn: "2026-01-01",
+      openingBalanceDisplayMinor: 0
+    });
+    // Lent 500 BEFORE the valuation date: the valuation's absolute
+    // 100,000 already includes it.
+    await addTxn(user, accountId, {
+      date: "2026-01-10",
+      name: "Lent early",
+      amountLedgerMinor: -50_000
+    });
+    await valuationsSvc.recordValuation(db(), actorOf(user), {
+      accountId,
+      date: "2026-02-01",
+      amountDisplayMinor: 100_000,
+      kind: "current",
+      name: "Balance snapshot"
+    });
+    // Repaid 200 AFTER the anchor: counts in full.
+    await addTxn(user, accountId, {
+      date: "2026-03-01",
+      name: "Repaid later",
+      amountLedgerMinor: 20_000
+    });
+    await balancesSvc.recalculateAccount(db(), accountId);
+    expect((await latestBalance(accountId))?.balanceMinor).toBe(100_000);
+
+    const preview = await trackingSvc.previewBalanceTracking(
+      db(),
+      actorOf(user),
+      accountId,
+      "transactions"
+    );
+    // Plug: 0 − (−50,000 already represented) − 100,000 = −50,000.
+    expect(preview.openingTransactionAmountMinor).toBe(-50_000);
+    expect(preview.resultingBalanceMinor).toBe(80_000);
+
+    const result = await trackingSvc.switchBalanceTracking(db(), actorOf(user), {
+      accountId,
+      to: "transactions"
+    });
+    expect(result.openingTransactionAmountMinor).toBe(-50_000);
+    expect(result.resultingBalanceMinor).toBe(80_000);
+    expect((await latestBalance(accountId))?.balanceMinor).toBe(80_000);
+  });
+
+  it("repeated mode round trips never re-add the principal", async () => {
+    const user = await makeUser();
+    const accountId = await makeAccount(user, {
+      type: "other_asset",
+      name: "Round trip loan",
+      currency: "USD",
+      openedOn: "2026-01-01",
+      openingBalanceDisplayMinor: 0
+    });
+    await valuationsSvc.recordValuation(db(), actorOf(user), {
+      accountId,
+      date: "2026-01-01",
+      amountDisplayMinor: 100_000,
+      kind: "opening",
+      name: "Principal"
+    });
+
+    const first = await trackingSvc.switchBalanceTracking(db(), actorOf(user), {
+      accountId,
+      to: "transactions"
+    });
+    expect(first.openingTransactionAmountMinor).toBe(-100_000);
+    expect(first.resultingBalanceMinor).toBe(100_000);
+
+    // Two full round trips, each re-recording the same valuation: the
+    // previously converted opening transaction already represents the
+    // principal, so each new conversion must plug 0.
+    for (const date of ["2026-02-01", "2026-03-01"]) {
+      await trackingSvc.switchBalanceTracking(db(), actorOf(user), {
+        accountId,
+        to: "valuation"
+      });
+      await valuationsSvc.recordValuation(db(), actorOf(user), {
+        accountId,
+        date,
+        amountDisplayMinor: 100_000,
+        kind: "current",
+        name: "Principal restated"
+      });
+      const preview = await trackingSvc.previewBalanceTracking(
+        db(),
+        actorOf(user),
+        accountId,
+        "transactions"
+      );
+      expect(preview.openingTransactionAmountMinor).toBe(0);
+      expect(preview.resultingBalanceMinor).toBe(100_000);
+      const again = await trackingSvc.switchBalanceTracking(db(), actorOf(user), {
+        accountId,
+        to: "transactions"
+      });
+      expect(again.openingTransactionAmountMinor).toBe(0);
+      expect(again.resultingBalanceMinor).toBe(100_000);
+      expect((await latestBalance(accountId))?.balanceMinor).toBe(100_000);
+    }
+  });
+
+  it("liability: a restated nonzero opening balance is not doubled, and post-anchor activity counts fully", async () => {
+    const user = await makeUser();
+    const restatedId = await makeAccount(user, {
+      type: "other_liability",
+      name: "Restated liability",
+      currency: "USD",
+      openedOn: "2026-01-01",
+      openingBalanceDisplayMinor: 100_000
+    });
+    await valuationsSvc.recordValuation(db(), actorOf(user), {
+      accountId: restatedId,
+      date: "2026-01-01",
+      amountDisplayMinor: 100_000,
+      kind: "opening",
+      name: "Opening valuation"
+    });
+    const restated = await trackingSvc.switchBalanceTracking(db(), actorOf(user), {
+      accountId: restatedId,
+      to: "transactions"
+    });
+    expect(restated.openingTransactionAmountMinor).toBe(0);
+    expect(restated.resultingBalanceMinor).toBe(-100_000);
+    expect((await latestBalance(restatedId))?.balanceMinor).toBe(-100_000);
+
+    const activeId = await makeAccount(user, {
+      type: "other_liability",
+      name: "Active liability",
+      currency: "USD",
+      openedOn: "2026-01-01",
+      openingBalanceDisplayMinor: 0
+    });
+    await valuationsSvc.recordValuation(db(), actorOf(user), {
+      accountId: activeId,
+      date: "2026-01-01",
+      amountDisplayMinor: 100_000,
+      kind: "opening",
+      name: "Amount owed"
+    });
+    // A payment after the anchor reduces the amount owed by 300.
+    await addTxn(user, activeId, {
+      date: "2026-02-01",
+      name: "Payment",
+      amountLedgerMinor: -30_000
+    });
+    const active = await trackingSvc.switchBalanceTracking(db(), actorOf(user), {
+      accountId: activeId,
+      to: "transactions"
+    });
+    expect(active.openingTransactionAmountMinor).toBe(100_000);
+    expect(active.resultingBalanceMinor).toBe(-70_000);
+    expect((await latestBalance(activeId))?.balanceMinor).toBe(-70_000);
+  });
+});
+
+describe("balance tracking: report flows exclude the opening adjustment", () => {
+  it("asset: the converted principal is not income, before or after a round trip, while real activity still counts", async () => {
+    const user = await makeUser();
+    const family = await currentFamily(actorOf(user));
+    const accountId = await makeAccount(user, {
+      type: "other_asset",
+      name: "Report loan",
+      currency: "USD",
+      openedOn: "2026-01-01",
+      openingBalanceDisplayMinor: 0
+    });
+    await valuationsSvc.recordValuation(db(), actorOf(user), {
+      accountId,
+      date: daysAgo(0),
+      amountDisplayMinor: 100_000,
+      kind: "current",
+      name: "Principal"
+    });
+    await balancesSvc.recalculateAccount(db(), accountId);
+
+    const before = await reportsSvc.dashboardSummary(db(), family, user.userId);
+    expect(before.incomeThisMonthMinor).toBe(0);
+    expect(before.netWorthMinor).toBe(100_000);
+
+    await trackingSvc.switchBalanceTracking(db(), actorOf(user), {
+      accountId,
+      to: "transactions"
+    });
+    // Genuine activity after the switch must still flow into reports —
+    // only the bookkeeping adjustment is excluded.
+    await addTxn(user, accountId, {
+      date: daysAgo(0),
+      name: "Interest received",
+      amountLedgerMinor: -25_000
+    });
+    await balancesSvc.recalculateAccount(db(), accountId);
+
+    const after = await reportsSvc.dashboardSummary(db(), family, user.userId);
+    expect(after.incomeThisMonthMinor).toBe(25_000);
+    expect(after.expenseThisMonthMinor).toBe(0);
+    expect(after.netWorthMinor).toBe(125_000);
+
+    const series = await reportsSvc.incomeExpenseSeries(db(), family, user.userId, 1);
+    expect(series.flows[0]?.incomeMinor).toBe(25_000);
+    expect(series.flows[0]?.expenseMinor).toBe(0);
+
+    // Round trip: switch back, restate the valuation, switch again —
+    // reports must still see only the genuine 25,000.
+    await trackingSvc.switchBalanceTracking(db(), actorOf(user), {
+      accountId,
+      to: "valuation"
+    });
+    await valuationsSvc.recordValuation(db(), actorOf(user), {
+      accountId,
+      date: daysAgo(0),
+      amountDisplayMinor: 125_000,
+      kind: "current",
+      name: "Principal restated"
+    });
+    await trackingSvc.switchBalanceTracking(db(), actorOf(user), {
+      accountId,
+      to: "transactions"
+    });
+    const roundTripped = await reportsSvc.dashboardSummary(db(), family, user.userId);
+    expect(roundTripped.incomeThisMonthMinor).toBe(25_000);
+    expect(roundTripped.expenseThisMonthMinor).toBe(0);
+    expect(roundTripped.netWorthMinor).toBe(125_000);
+  });
+
+  it("liability: the converted principal is not an expense and not category spending", async () => {
+    const user = await makeUser();
+    const family = await currentFamily(actorOf(user));
+    const accountId = await makeAccount(user, {
+      type: "other_liability",
+      name: "Report liability",
+      currency: "USD",
+      openedOn: "2026-01-01",
+      openingBalanceDisplayMinor: 0
+    });
+    await valuationsSvc.recordValuation(db(), actorOf(user), {
+      accountId,
+      date: daysAgo(0),
+      amountDisplayMinor: 100_000,
+      kind: "current",
+      name: "Amount owed"
+    });
+    await balancesSvc.recalculateAccount(db(), accountId);
+    await trackingSvc.switchBalanceTracking(db(), actorOf(user), {
+      accountId,
+      to: "transactions"
+    });
+
+    const summary = await reportsSvc.dashboardSummary(db(), family, user.userId);
+    expect(summary.expenseThisMonthMinor).toBe(0);
+    expect(summary.incomeThisMonthMinor).toBe(0);
+    expect(summary.topCategories).toHaveLength(0);
+    // The balance contribution is fully retained.
+    expect(summary.liabilitiesMinor).toBe(100_000);
+    expect(summary.netWorthMinor).toBe(-100_000);
+
+    const range = reportsSvc.currentMonthRange(family.timezone);
+    const spending = await reportsSvc.spendingByCategory(db(), family, user.userId, range);
+    expect(spending.categories).toHaveLength(0);
+  });
+
+  it("the opening adjustment cannot be split into ordinary transactions", async () => {
+    const user = await makeUser();
+    const accountId = await makeAccount(user, {
+      type: "other_asset",
+      name: "Unsplitable loan",
+      currency: "USD",
+      openedOn: "2026-01-01",
+      openingBalanceDisplayMinor: 0
+    });
+    await valuationsSvc.recordValuation(db(), actorOf(user), {
+      accountId,
+      date: "2026-01-01",
+      amountDisplayMinor: 100_000,
+      kind: "opening",
+      name: "Principal"
+    });
+    await trackingSvc.switchBalanceTracking(db(), actorOf(user), {
+      accountId,
+      to: "transactions"
+    });
+    const opening = (await entriesOf(accountId)).find((r) => r.name === "Principal");
+    await expect(
+      splitsSvc.splitEntry(db(), actorOf(user), opening!.id, [
+        { amountLedgerMinor: -60_000 },
+        { amountLedgerMinor: -40_000 }
+      ])
+    ).rejects.toMatchObject({ code: "conflict" });
+  });
+});
+
+describe("balance tracking: restore invariants (review round)", () => {
+  it("household restore rejects holdings on a transaction-tracked account and commits nothing", async () => {
+    const source = await makeUser();
+    const accountId = await makeAccount(source, {
+      type: "other_asset",
+      name: "Holdings portfolio",
+      currency: "NPR",
+      openedOn: "2026-01-01",
+      openingBalanceDisplayMinor: 0
+    });
+    await holdingsSvc.addHolding(db(), actorOf(source), {
+      accountId,
+      ticker: "NABIL",
+      quantity: "10",
+      averageCostMinor: null,
+      currentPriceMinor: 100
+    });
+
+    const exported = await exportsSvc.buildFamilyExport(db(), actorOf(source));
+    const tampered = JSON.parse(JSON.stringify(exported)) as {
+      accounts: Array<{ name?: string; balanceTracking?: string }>;
+    };
+    const exportedAccount = tampered.accounts.find((a) => a.name === "Holdings portfolio");
+    expect(exportedAccount?.balanceTracking).toBe("valuation");
+    exportedAccount!.balanceTracking = "transactions";
+
+    const target = await makeUser();
+    const encode = (v: unknown) => new TextEncoder().encode(JSON.stringify(v));
+    await expect(
+      importFamilyExport(db(), actorOf(target), parseFamilyExport(encode(tampered)))
+    ).rejects.toMatchObject({ code: "validation.failed" });
+
+    const targetAccounts = await db()
+      .select()
+      .from(accountsTable)
+      .where(eq(accountsTable.familyId, target.familyId));
+    expect(targetAccounts).toHaveLength(0);
+  });
+
+  it("operator restore rejects holdings and MeroShare links on transaction-tracked accounts before inserting anything", async () => {
+    const famId = "11111111-1111-4111-8111-111111111111";
+    const accId = "22222222-2222-4222-8222-222222222222";
+    const baseTables = {
+      families: [
+        {
+          id: famId,
+          name: "Archive family",
+          currency: "USD",
+          locale: "en-US",
+          timezone: "UTC",
+          createdAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:00:00.000Z"
+        }
+      ],
+      accounts: [
+        {
+          id: accId,
+          familyId: famId,
+          ownerId: null,
+          type: "other_asset",
+          balanceTracking: "transactions",
+          subtype: null,
+          name: "Tampered loan",
+          institution: null,
+          currency: "USD",
+          status: "active",
+          includedInReports: true,
+          openingBalanceMinor: 0,
+          openedOn: "2026-01-01",
+          externalSource: null,
+          externalId: null,
+          createdAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:00:00.000Z"
+        }
+      ]
+    };
+    const familiesBefore = (await db().select({ id: familiesTable.id }).from(familiesTable)).length;
+
+    const withHolding = {
+      kind: "meridian-instance-export",
+      version: 1,
+      exportedAt: "2026-11-16T00:00:00.000Z",
+      tables: {
+        ...baseTables,
+        portfolioHoldings: [
+          {
+            id: "33333333-3333-4333-8333-333333333333",
+            accountId: accId,
+            ticker: "NABIL",
+            companyName: null,
+            quantity: "10",
+            averageCostMinor: null,
+            averageCostQuantity: "0",
+            currentPriceMinor: 100,
+            createdAt: "2026-01-01T00:00:00.000Z",
+            updatedAt: "2026-01-01T00:00:00.000Z"
+          }
+        ]
+      }
+    } as unknown as backupsSvc.InstanceExport;
+    await expect(backupsSvc.restoreInstanceExport(db(), withHolding)).rejects.toMatchObject({
+      code: "validation.failed"
+    });
+
+    const withLink = {
+      kind: "meridian-instance-export",
+      version: 1,
+      exportedAt: "2026-11-16T00:00:00.000Z",
+      tables: {
+        ...baseTables,
+        meroShareAccounts: [
+          {
+            id: "44444444-4444-4444-8444-444444444444",
+            connectionId: "55555555-5555-4555-8555-555555555555",
+            accountId: accId,
+            boid: "1234567890123456",
+            name: "Tampered loan",
+            currency: "NPR",
+            totalValueMinor: 1000,
+            lastSyncedAt: null,
+            createdAt: "2026-01-01T00:00:00.000Z",
+            updatedAt: "2026-01-01T00:00:00.000Z"
+          }
+        ]
+      }
+    } as unknown as backupsSvc.InstanceExport;
+    await expect(backupsSvc.restoreInstanceExport(db(), withLink)).rejects.toMatchObject({
+      code: "validation.failed"
+    });
+
+    const familiesAfter = (await db().select({ id: familiesTable.id }).from(familiesTable)).length;
+    expect(familiesAfter).toBe(familiesBefore);
+    const archiveAccounts = await db()
+      .select()
+      .from(accountsTable)
+      .where(eq(accountsTable.id, accId));
+    expect(archiveAccounts).toHaveLength(0);
   });
 });

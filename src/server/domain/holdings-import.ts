@@ -226,6 +226,10 @@ export async function importHoldingsCsv(
   let updated = 0;
   const applyErrors: HoldingsCsvRowError[] = [];
   await withHoldingsAccountLock(exec, account.id, async (tx) => {
+    // Re-resolve the managed-account guards inside the lock: the check
+    // above ran before this import queued on it, and a balance-tracking
+    // switch holding the same lock may have committed in between.
+    const managed = await loadManagedAccount(tx, actor, account.id);
     if (parsed.rows.length > 0) {
       await assertHoldingsActivationAllowed(tx, actor, account.id);
     }
@@ -276,7 +280,7 @@ export async function importHoldingsCsv(
         created++;
       }
     }
-    if (created + updated > 0) await syncPortfolioValuation(tx, actor, account);
+    if (created + updated > 0) await syncPortfolioValuation(tx, actor, managed);
   });
 
   const errors = [...parsed.errors, ...applyErrors].sort((a, b) => a.row - b.row);

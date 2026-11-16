@@ -30,6 +30,7 @@ import { TRANSFER_DATE_WINDOW_DAYS } from "./transfers";
 import {
   ACCOUNT_TYPES,
   defaultBalanceTracking,
+  isValuationTracked,
   type BalanceTracking
 } from "../authorization/access";
 import { errors } from "@/lib/errors";
@@ -914,6 +915,18 @@ function validateRestoredData(data: ParsedFamilyExport, pairs: ParsedTransfer[])
     if (account.type !== "other_asset") {
       throw errors.validation(
         "A holding in the export belongs to an account that is not an other-asset account."
+      );
+    }
+    // Holdings publish the account's balance as a valuation, so they can
+    // only exist while the account is valuation-tracked — the same
+    // one-controller invariant switchBalanceTracking and the holdings
+    // domain enforce. A recognized balanceTracking enum value is not
+    // enough: an export pairing holdings with transaction tracking
+    // would restore an account whose balance ignores its holdings and
+    // whose holdings can no longer be edited.
+    if (!isValuationTracked(account)) {
+      throw errors.validation(
+        "A holding in the export belongs to an account that tracks its balance from its transactions. Holdings require valuation tracking — correct the export file or re-export the household."
       );
     }
     const key = `${holding.accountId}:${holding.ticker}`;

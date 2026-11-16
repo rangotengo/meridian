@@ -1,6 +1,7 @@
 import { sql } from "drizzle-orm";
 import type { Executor } from "../db/client";
 import type { Family } from "../auth/context";
+import { BALANCE_TRACKING_OPENING_SOURCE } from "./balance-tracking";
 import { getRateInfo, convertMinor, type RateInfo } from "./exchange-rates";
 import { captureDebugLog } from "../observability/debug-log";
 import {
@@ -172,6 +173,17 @@ function accountFilter(accountIds?: string[]) {
   )})`;
 }
 
+/**
+ * Flow queries count ordinary transactions only: transfer legs are
+ * excluded through t.transfer_id, and the opening adjustment a
+ * balance-tracking switch creates from the earliest valuation (see
+ * balance-tracking.ts) is excluded through its source marker — it is a
+ * balance-only bookkeeping entry, not income or spending, though it
+ * keeps its full balance contribution. Listings (recent entries,
+ * transaction search) do NOT apply this: the entry stays visible.
+ */
+const NOT_OPENING_ADJUSTMENT_SQL = sql`AND (e.external_source IS NULL OR e.external_source <> ${BALANCE_TRACKING_OPENING_SOURCE})`;
+
 export async function dashboardSummary(
   exec: Executor,
   family: Family,
@@ -249,6 +261,7 @@ export async function dashboardSummary(
       ${accountFilter(accountIds)}
       AND e.entryable_type = 'transaction'
       AND t.transfer_id IS NULL
+      ${NOT_OPENING_ADJUSTMENT_SQL}
       AND NOT EXISTS (SELECT 1 FROM entries c WHERE c.parent_entry_id = e.id)
       AND e.date BETWEEN ${from} AND ${to}
     GROUP BY e.currency
@@ -295,6 +308,7 @@ export async function dashboardSummary(
       ${accountFilter(accountIds)}
       AND e.entryable_type = 'transaction'
       AND t.transfer_id IS NULL
+      ${NOT_OPENING_ADJUSTMENT_SQL}
       AND NOT EXISTS (SELECT 1 FROM entries c WHERE c.parent_entry_id = e.id)
       AND e.amount_minor > 0
       AND e.date BETWEEN ${from} AND ${to}
@@ -575,6 +589,7 @@ export async function incomeExpenseSeries(
       ${accountFilter(accountIds)}
       AND e.entryable_type = 'transaction'
       AND t.transfer_id IS NULL
+      ${NOT_OPENING_ADJUSTMENT_SQL}
       AND NOT EXISTS (SELECT 1 FROM entries c WHERE c.parent_entry_id = e.id)
       AND e.date BETWEEN ${fromDate} AND ${toDate}
     GROUP BY mk, e.currency
@@ -655,6 +670,7 @@ export async function spendingByCategory(
       ${accountFilter(accountIds)}
       AND e.entryable_type = 'transaction'
       AND t.transfer_id IS NULL
+      ${NOT_OPENING_ADJUSTMENT_SQL}
       AND NOT EXISTS (SELECT 1 FROM entries c WHERE c.parent_entry_id = e.id)
       AND e.amount_minor > 0
       AND e.date BETWEEN ${range.from} AND ${range.to}
@@ -734,6 +750,7 @@ export async function spendingByMerchant(
       ${accountFilter(accountIds)}
       AND e.entryable_type = 'transaction'
       AND t.transfer_id IS NULL
+      ${NOT_OPENING_ADJUSTMENT_SQL}
       AND NOT EXISTS (SELECT 1 FROM entries c WHERE c.parent_entry_id = e.id)
       AND e.amount_minor > 0
       AND e.date BETWEEN ${range.from} AND ${range.to}
@@ -799,6 +816,7 @@ export async function dailySpendingSeries(
       AND ${ACCESS_SQL(userId)}
       AND e.entryable_type = 'transaction'
       AND t.transfer_id IS NULL
+      ${NOT_OPENING_ADJUSTMENT_SQL}
       AND NOT EXISTS (SELECT 1 FROM entries c WHERE c.parent_entry_id = e.id)
       AND e.date BETWEEN ${from} AND ${today}
     GROUP BY e.date, e.currency
