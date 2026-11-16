@@ -41,7 +41,12 @@ import { fetchSsisSnapshot } from "./ssis-fetch";
  * FName/LName and statement Name alike): a snapshot naming a different
  * holder than the stored data is rejected instead of merged, and a file
  * import carrying no identity at all is rejected once the insight holds
- * holder data — missing identity is not permission to merge.
+ * holder data — missing identity is not permission to merge. The mirror
+ * case is rejected too: data imported without any identity stays
+ * unidentified, and a later named file import cannot silently bind those
+ * rows to a holder; the admin must clear them through a confirmed BO
+ * switch first. Only a live refresh — bound to the configured BO account
+ * by the generation check — may bind a name over unidentified data.
  */
 
 export const SSIS_SCHEME_NAME = "Siddhartha Systematic Investment Scheme";
@@ -702,7 +707,7 @@ export async function importSsisSnapshot(
         );
       }
     }
-    if (!options.expectedConfig && data.holderNames.length === 0) {
+    if (!options.expectedConfig) {
       const [storedPurchase] = await tx
         .select({ id: ssisPurchases.id })
         .from(ssisPurchases)
@@ -713,9 +718,25 @@ export async function importSsisSnapshot(
         .from(ssisStatementEntries)
         .where(eq(ssisStatementEntries.familyId, familyId))
         .limit(1);
-      if (storedPurchase || storedStatement || state?.holderName) {
+      const holdsRows = !!storedPurchase || !!storedStatement;
+      if (data.holderNames.length === 0) {
+        if (holdsRows || state?.holderName) {
+          throw errors.validation(
+            "This snapshot does not identify which holder it belongs to, and this insight already holds holder data — nothing was imported. Import the holder's own snapshot export, or switch holders from the BO account settings to start fresh."
+          );
+        }
+      } else if (!state?.holderName && holdsRows) {
+        // The mirror case: the stored data was imported WITHOUT a holder
+        // identity (holderName still null), so there is no stored holder
+        // for the incoming name to match. Merging would silently bind the
+        // anonymous rows to the named holder — the admin never confirmed
+        // they are the same person's data. Reject and point at the reset
+        // path, which clears the unidentified data so the named snapshot
+        // can seed the insight on its own. (A live refresh is exempt: it
+        // is bound to the configured BO account by the generation check,
+        // so the identity it carries is the configured holder's.)
         throw errors.validation(
-          "This snapshot does not identify which holder it belongs to, and this insight already holds holder data — nothing was imported. Import the holder's own snapshot export, or switch holders from the BO account settings to start fresh."
+          `This insight already holds data that was imported without a holder identity, and this snapshot names ${data.holderName}. Nothing was imported — the existing data cannot be silently bound to a named holder. If the existing data should be replaced, change the BO account number in the SSIS settings and confirm the switch to clear it, then import again.`
         );
       }
     }

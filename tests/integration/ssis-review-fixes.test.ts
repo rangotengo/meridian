@@ -845,3 +845,153 @@ describe("SSIS effective bounds use the household date", () => {
     }
   });
 });
+
+/** A statement-only snapshot carrying no holder identity anywhere. */
+function anonymousStatementPayload(transNo: string): unknown {
+  return [
+    {
+      unitPurchase: [],
+      statement: [
+        {
+          scheme_code: "001",
+          ccode: "1000",
+          SIP_Reg_No: "SIP0001",
+          trans_no: transNo,
+          installmentDate: "2024-01-15",
+          dueDate: null,
+          actionDate: "2024-01-16",
+          Amount_cr: "100.00",
+          Amount_dr: "-",
+          unit: "10",
+          appnav: "10.00",
+          payment: "E-Sewa",
+          otherCharges: "0",
+          sebon_fee: "0"
+        }
+      ],
+      navData: {},
+      overallNav: []
+    }
+  ];
+}
+
+describe("SSIS review round 3 — anonymous seed must not silently acquire a holder (Postgres)", () => {
+  beforeEach(async () => {
+    await truncateAll();
+  });
+
+  it("rejects a named purchase import over an anonymously seeded insight", async () => {
+    const user = await makeUser();
+    const actor = actorOf(user);
+    // Seed with a snapshot that identifies no holder in any dataset.
+    await importSsisSnapshot(db(), actor, anonymousPayload(9001), "import");
+    let insight = await getSsisInsight(db(), actor);
+    expect(insight.purchases).toHaveLength(1);
+    expect(insight.holderName).toBeNull();
+
+    // A later import naming a holder must not silently merge and bind the
+    // anonymous rows to that holder.
+    await expect(
+      importSsisSnapshot(db(), actor, holderPayload("Test", "Holder", 9002), "import")
+    ).rejects.toThrow(/silently bound/);
+    insight = await getSsisInsight(db(), actor);
+    expect(insight.purchases).toHaveLength(1);
+    expect(insight.holderName).toBeNull();
+    const importAudits = await db()
+      .select()
+      .from(auditEvents)
+      .where(eq(auditEvents.action, "ssis.imported"));
+    expect(importAudits).toHaveLength(1);
+  });
+
+  it("rejects a named purchase import over an anonymous statement-only seed", async () => {
+    const user = await makeUser();
+    const actor = actorOf(user);
+    await importSsisSnapshot(db(), actor, anonymousStatementPayload("TA1"), "import");
+    let insight = await getSsisInsight(db(), actor);
+    expect(insight.statement).toHaveLength(1);
+    expect(insight.holderName).toBeNull();
+
+    await expect(
+      importSsisSnapshot(db(), actor, holderPayload("Test", "Holder", 9003), "import")
+    ).rejects.toThrow(/silently bound/);
+    insight = await getSsisInsight(db(), actor);
+    expect(insight.purchases).toHaveLength(0);
+    expect(insight.statement).toHaveLength(1);
+    expect(insight.holderName).toBeNull();
+  });
+
+  it("rejects a named statement import over an anonymous purchase seed", async () => {
+    const user = await makeUser();
+    const actor = actorOf(user);
+    await importSsisSnapshot(db(), actor, anonymousPayload(9004), "import");
+    await expect(
+      importSsisSnapshot(db(), actor, statementOnlyPayload("Test Holder", "TA2"), "import")
+    ).rejects.toThrow(/silently bound/);
+    const insight = await getSsisInsight(db(), actor);
+    expect(insight.purchases).toHaveLength(1);
+    expect(insight.statement).toHaveLength(0);
+    expect(insight.holderName).toBeNull();
+  });
+
+  it("keeps anonymous data unidentified after a plain BO binding, and still rejects a named import", async () => {
+    const user = await makeUser();
+    const actor = actorOf(user);
+    await importSsisSnapshot(db(), actor, anonymousPayload(9005), "import");
+    // Setting the BO number without a reset binds the NUMBER to the
+    // imported data; it must not launder the anonymous rows into
+    // identified data — the BO number carries no holder name.
+    const result = await setSsisBoAccountNo(db(), actor, BO_A);
+    expect(result.dataReset).toBe(false);
+    let insight = await getSsisInsight(db(), actor);
+    expect(insight.hasBoAccount).toBe(true);
+    expect(insight.purchases).toHaveLength(1);
+    expect(insight.holderName).toBeNull();
+    // A named file import is still rejected afterwards.
+    await expect(
+      importSsisSnapshot(db(), actor, holderPayload("Test", "Holder", 9006), "import")
+    ).rejects.toThrow(/silently bound/);
+    insight = await getSsisInsight(db(), actor);
+    expect(insight.purchases).toHaveLength(1);
+    expect(insight.holderName).toBeNull();
+  });
+
+  it("allows a named import after a confirmed BO reset clears the anonymous data", async () => {
+    const user = await makeUser();
+    const actor = actorOf(user);
+    await importSsisSnapshot(db(), actor, anonymousPayload(9007), "import");
+    const result = await setSsisBoAccountNo(db(), actor, BO_A, { resetExistingData: true });
+    expect(result.dataReset).toBe(true);
+    let insight = await getSsisInsight(db(), actor);
+    expect(insight.purchases).toHaveLength(0);
+    expect(insight.holderName).toBeNull();
+    // The insight is empty again, so a named snapshot seeds and binds it.
+    const counts = await importSsisSnapshot(
+      db(),
+      actor,
+      holderPayload("Test", "Holder", 9008),
+      "import"
+    );
+    expect(counts.purchases).toBe(1);
+    insight = await getSsisInsight(db(), actor);
+    expect(insight.purchases).toHaveLength(1);
+    expect(insight.holderName).toBe("Test Holder");
+  });
+
+  it("still lets a live refresh bind the BO-configured holder over anonymous data", async () => {
+    const user = await makeUser();
+    const actor = actorOf(user);
+    await importSsisSnapshot(db(), actor, anonymousPayload(9009), "import");
+    await setSsisBoAccountNo(db(), actor, BO_A);
+    // Refresh semantics are unchanged: the refresh is bound to the
+    // configured BO account by the generation guard, so the identity it
+    // carries is the configured holder's — binding through it is the
+    // sanctioned path, unlike an arbitrary file import.
+    const result = await refreshSsis(db(), actor, stubUpstream());
+    expect(result.purchases).toBe(3);
+    const insight = await getSsisInsight(db(), actor);
+    expect(insight.holderName).toBe("Test Holder");
+    // The anonymous row remains alongside the refreshed rows.
+    expect(insight.purchases.length).toBeGreaterThanOrEqual(3);
+  });
+});
