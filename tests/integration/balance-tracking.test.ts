@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll } from "vitest";
+import { describe, it, expect, beforeAll, vi } from "vitest";
 import { and, eq, sql } from "drizzle-orm";
 import {
   db,
@@ -1393,4 +1393,55 @@ describe("balance tracking: backdated conversion after a round trip (review roun
     expect(await balanceOn(restored!.id, daysAgo(1))).toBe(100_000);
     expect(await balanceOn(restored!.id, daysAgo(0))).toBe(100_000);
   });
+});
+
+describe("balance tracking: scheduled pre-anchor activity", () => {
+  it.each(["other_asset", "other_liability"] as const)(
+    "%s: normalizes a future anchor without double-counting scheduled activity",
+    async (type) => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date("2026-11-16T12:00:00Z"));
+      try {
+        const user = await makeUser({ timezone: "UTC" });
+        const actor = actorOf(user);
+        const direction = type === "other_asset" ? 1 : -1;
+        const accountId = await makeAccount(user, {
+          type,
+          openedOn: "2026-11-15",
+          openingBalanceDisplayMinor: 0
+        });
+        await addTxn(user, accountId, {
+          date: "2026-11-17",
+          name: "Scheduled principal",
+          amountLedgerMinor: -200 * direction
+        });
+        await valuationsSvc.recordValuation(db(), actor, {
+          accountId,
+          date: "2026-11-18",
+          amountDisplayMinor: 1000
+        });
+        const preview = await trackingSvc.previewBalanceTracking(
+          db(),
+          actor,
+          accountId,
+          "transactions"
+        );
+        expect(preview.openingTransactionAmountMinor).toBe(-800 * direction);
+        expect(preview.resultingBalanceMinor).toBe(0);
+        const switched = await trackingSvc.switchBalanceTracking(db(), actor, {
+          accountId,
+          to: "transactions"
+        });
+        expect(switched.resultingBalanceMinor).toBe(0);
+        vi.setSystemTime(new Date("2026-11-17T12:00:00Z"));
+        await balancesSvc.recalculateAccount(db(), accountId);
+        expect((await latestBalance(accountId))?.balanceMinor).toBe(200 * direction);
+        vi.setSystemTime(new Date("2026-11-18T12:00:00Z"));
+        await balancesSvc.recalculateAccount(db(), accountId);
+        expect((await latestBalance(accountId))?.balanceMinor).toBe(1000 * direction);
+      } finally {
+        vi.useRealTimers();
+      }
+    }
+  );
 });

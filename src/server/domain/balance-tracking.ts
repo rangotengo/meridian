@@ -317,7 +317,11 @@ async function planConversionToTransactions(
   const restatedIds = new Set(restatements.map((r) => r.entryId));
 
   let represented = 0;
-  for (const row of windowRows) {
+  // The anchor can itself be future-dated: scheduled activity before
+  // that date is already represented in its absolute value, even if it
+  // has not affected today's balance yet. Keep the current-day window
+  // only for the resulting balance projection, not for this anchor sum.
+  for (const row of txRows) {
     if (row.date <= anchor.date) {
       represented = safeAdd(represented, row.amountMinor);
     }
