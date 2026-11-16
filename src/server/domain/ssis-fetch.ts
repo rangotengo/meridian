@@ -35,6 +35,17 @@ export type SsisFetchResult = {
   payload: unknown | null;
   warnings: string[];
   fetched: { purchases: number; statement: number; navPoints: number; hasNavData: boolean };
+  /**
+   * Per-dataset success: true only when that dataset was fetched AND its
+   * envelope/shape validated (a legitimately empty dataset counts as
+   * success — it is distinguishable from a failure here, unlike in the
+   * row counts above). The refresh commit persists these outcomes as
+   * dataset coverage so later readers can tell a failed holder fetch
+   * apart from a genuinely empty position. `nav` covers both NAV stages:
+   * either the current-NAV quote or the monthly history refreshing is
+   * enough to call the NAV dataset current.
+   */
+  datasets: { purchases: boolean; statement: boolean; nav: boolean };
 };
 
 type Stage = "purchases" | "statement" | "nav" | "navHistory";
@@ -267,6 +278,11 @@ export async function fetchSsisSnapshot(
     navPoints: navHistoryRows?.length ?? 0,
     hasNavData: navBody !== null
   };
+  const datasets = {
+    purchases: purchasesRows !== null,
+    statement: statementRows !== null,
+    nav: navBody !== null || navHistoryRows !== null
+  };
   // Nothing validated at all: no dataset actually succeeded, so there is
   // no snapshot to import and the caller must leave refresh state untouched.
   if (
@@ -275,7 +291,7 @@ export async function fetchSsisSnapshot(
     navBody === null &&
     navHistoryRows === null
   ) {
-    return { payload: null, warnings, fetched };
+    return { payload: null, warnings, fetched, datasets };
   }
   return {
     payload: [
@@ -287,6 +303,7 @@ export async function fetchSsisSnapshot(
       }
     ],
     warnings,
-    fetched
+    fetched,
+    datasets
   };
 }

@@ -857,6 +857,8 @@ export const oauthGrants = sqliteTable(
     clientName: text("client_name").notNull(),
     scopes: text("scopes", { mode: "json" }).$type<string[]>().notNull().default([]),
     accountIds: text("account_ids", { mode: "json" }).$type<string[]>().notNull().default([]),
+    /** Explicit per-connection SSIS permission; see the Postgres schema. */
+    ssisAccess: integer("ssis_access", { mode: "boolean" }).notNull().default(false),
     status: text("status").notNull().default("active"),
     expiresAt: isoTimestamp("expires_at").notNull(),
     lastUsedAt: isoTimestamp("last_used_at"),
@@ -1092,6 +1094,15 @@ export const ssisInsightState = sqliteTable("ssis_insight_state", {
   latestNavDate: text("latest_nav_date"),
   lastFetchedAt: isoTimestamp("last_fetched_at"),
   lastSource: text("last_source"),
+  // Per-dataset fetch coverage (migration 0019): last known outcome per
+  // dataset ('ok' | 'failed'; NULL = never established) and the last
+  // SUCCESSFUL fetch time; failures never move the timestamp.
+  purchasesCoverage: text("purchases_coverage"),
+  purchasesFetchedAt: isoTimestamp("purchases_fetched_at"),
+  statementCoverage: text("statement_coverage"),
+  statementFetchedAt: isoTimestamp("statement_fetched_at"),
+  navCoverage: text("nav_coverage"),
+  navFetchedAt: isoTimestamp("nav_fetched_at"),
   updatedAt: isoTimestamp("updated_at")
     .notNull()
     .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`)

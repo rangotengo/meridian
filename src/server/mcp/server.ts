@@ -1,5 +1,5 @@
 /**
- * The Meridian MCP server: eight read-only tools.
+ * The Meridian MCP server: twelve read-only tools.
  *
  * A fresh McpServer is built per request (stateless transport). Authority
  * comes from the McpAccess resolved by the route — token → grant → user →
@@ -8,6 +8,10 @@
  * annotations (annotations are presentation hints for clients, nothing
  * more). The grant's account ceiling is intersected with the user's
  * current account access on every call and passed down to the services.
+ * The four SSIS tools additionally require the grant's explicit SSIS
+ * permission (oauth_grants.ssis_access): SSIS is a household-wide
+ * insight dataset outside the account model, so finance:read alone
+ * never unlocks it.
  *
  * Financial figures come from the existing domain services
  * (dashboardSummary, latestBalancesFor, report/budget/recurring/entry
@@ -18,10 +22,17 @@
  * silently zeroed or presented as a complete total.
  */
 import { createMcpHandler, McpServer } from "@modelcontextprotocol/server";
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, asc, count, desc, eq, gte, inArray, lte } from "drizzle-orm";
 import { z } from "zod";
 import type { Executor } from "../db/client";
-import { accounts, entries } from "../db/schema";
+import {
+  accounts,
+  entries,
+  ssisInsightState,
+  ssisNavHistory,
+  ssisPurchases,
+  ssisStatementEntries
+} from "../db/schema";
 import type { McpConfig } from "@/lib/env";
 import { currencyExponent } from "@/lib/money";
 import { addDays, isIsoDate, todayIn } from "@/lib/datetime";
@@ -41,6 +52,15 @@ import {
   type FxCompleteness
 } from "../domain/reports";
 import { accessibleAccountIds } from "../authorization/access";
+import {
+  getSsisCoverage,
+  getSsisInsight,
+  resolveCurrentNav,
+  toSsisNavPoint,
+  toSsisPurchaseRow,
+  toSsisStatementRow,
+  type SsisDatasetCoverage
+} from "../domain/ssis";
 import { recordAudit } from "../observability/audit";
 import type { McpAccess } from "../domain/oauth";
 import { BREAKDOWN_MERCHANT_SCOPE, NOTES_SCOPE, TOOL_SCOPES } from "./scopes";
@@ -109,6 +129,59 @@ const READ_ONLY_ANNOTATIONS = {
   openWorldHint: false
 } as const;
 
+/** The SSIS scheme is NPR-denominated (the domain read model's currency). */
+const SSIS_CURRENCY = "NPR";
+
+const SSIS_SEPARATE_NOTE =
+  "SSIS is a separate household insight dataset; it is not part of account balances or net worth.";
+
+/** Bounded pagination shared by the SSIS row tools. */
+const ssisPageSchema = {
+  limit: z.number().int().min(1).max(100).default(50),
+  offset: z.number().int().min(0).max(10_000).default(0)
+};
+
+function ssisPage(limit: number, offset: number, returned: number, totalMatching: number) {
+  return {
+    limit,
+    offset,
+    returned,
+    totalMatching,
+    hasMore: offset + returned < totalMatching
+  };
+}
+
+/**
+ * Caveat lines for one SSIS dataset's persisted coverage, shared by the
+ * SSIS tools. An "ok" dataset needs no caveat; anything else is spelled
+ * out so stored rows are never mistaken for a complete, fresh dataset —
+ * a failed holder fetch must not read as a genuinely empty position.
+ */
+function ssisCoverageLimitations(label: string, coverage: SsisDatasetCoverage): string[] {
+  if (coverage.status === "ok") return [];
+  if (coverage.status === "failed") {
+    return [
+      `${label} data may be incomplete: the most recent refresh could not retrieve it from Siddhartha Capital${
+        coverage.fetchedAt
+          ? `; the rows shown date from the last complete fetch at ${coverage.fetchedAt}`
+          : "; it has never been fetched completely"
+      }.`
+    ];
+  }
+  if (coverage.status === "partial") {
+    return [
+      `${label} data may be incomplete: the most recent fetch succeeded but did not fully account for this dataset — some rows in the response could not be read, or rows already stored were absent from the response and are retained from an earlier fetch${
+        coverage.fetchedAt
+          ? `; the last fetch that fully accounted for this dataset was at ${coverage.fetchedAt}`
+          : "; this dataset has never been fetched completely"
+      }.`
+    ];
+  }
+  return [
+    `${label} coverage is unknown: Meridian has no recorded successful fetch of this dataset, so the rows shown cannot be confirmed complete.`
+  ];
+}
+
 const dateString = z
   .string()
   .regex(/^\d{4}-\d{2}-\d{2}$/, "date must be YYYY-MM-DD")
@@ -147,6 +220,28 @@ export function createMeridianMcpServer(ctx: McpRequestContext): McpServer {
     if (!grant.scopes.includes(scope)) {
       throw new Error(`This connection does not include the ${scope} scope.`);
     }
+  }
+
+  /**
+   * SSIS permission: the grant's explicit SSIS flag, checked AFTER the
+   * tool's finance:read scope. The flag is read from the grant row
+   * resolved for THIS call, so an owner toggling it in Connected AI
+   * agents takes effect immediately. The account ceiling deliberately
+   * does not apply — SSIS has no accounts; that is exactly why the
+   * permission is separate and opt-in.
+   */
+  function requireSsisPermission() {
+    if (!grant.ssisAccess) {
+      throw new Error(
+        "This connection does not include SSIS insight access. SSIS is a separate household dataset that finance:read does not cover; the connection owner can enable it in Settings → Connected AI agents."
+      );
+    }
+  }
+
+  /** SSIS amounts are always NPR; null stays null (unavailable is never
+   * presented as zero). */
+  function ssisMoney(amountMinor: number | null) {
+    return amountMinor === null ? null : money(amountMinor, SSIS_CURRENCY);
   }
 
   /** Accounts the caller may see right now: current access ∩ grant ceiling. */
@@ -825,6 +920,317 @@ export function createMeridianMcpServer(ctx: McpRequestContext): McpServer {
       };
 
       await audit("get_net_worth_history");
+      return respond(result);
+    }
+  );
+
+  server.registerTool(
+    "get_ssis_summary",
+    {
+      title: "Get SSIS summary",
+      description:
+        "Read-only summary of the household's SSIS insight (Siddhartha Systematic Investment Scheme): totals invested, units held, current NAV and value, profit and return, plus dataset counts and per-dataset coverage. Requires the finance:read scope AND this connection's explicit SSIS permission (the owner enables it in Settings → Connected AI agents); SSIS is household-wide data separate from accounts, so account restrictions on the connection do not apply to it. Amounts are integer minor units as strings in NPR. A figure that cannot be represented exactly is null, never approximated. SSIS figures are NOT part of account balances or net worth, and this tool never imports or refreshes data. coverage reports, per dataset (purchases, statement, nav), the last known fetch outcome and the last COMPLETE fetch time: a dataset is ok only when a fetch fully accounted for it — no rows in the response were skipped as unreadable, and no stored row was absent from the response (absent rows are retained, and a dataset with retained or skipped rows is reported partial, with its timestamp left at the last complete fetch); totals.complete is true only when purchase coverage is ok — otherwise the totals are subtotals of the rows currently stored and may understate the position (e.g. after a partially failed refresh), never a confirmed complete zero.",
+      inputSchema: z.object({}),
+      annotations: READ_ONLY_ANNOTATIONS
+    },
+    async () => {
+      requireScope(TOOL_SCOPES.get_ssis_summary);
+      requireSsisPermission();
+
+      // The domain read model the Insights page uses — same NAV
+      // selection, same summary math, same safe conversions.
+      const insight = await getSsisInsight(exec, actor);
+      const s = insight.summary;
+
+      const limitations = [SSIS_SEPARATE_NOTE];
+      if (insight.lastFetchedAt) {
+        limitations.push(
+          "dataAsOf is the most recent import or refresh of ANY SSIS dataset; it does not imply every dataset was refreshed then. Per-dataset freshness is reported under coverage, and MCP reads never fetch live data."
+        );
+      } else {
+        limitations.push(
+          "Freshness is unknown: no SSIS import or refresh timestamp is recorded for this household."
+        );
+      }
+      limitations.push(...ssisCoverageLimitations("Purchase", insight.coverage.purchases));
+      limitations.push(...ssisCoverageLimitations("Statement", insight.coverage.statement));
+      limitations.push(...ssisCoverageLimitations("NAV", insight.coverage.nav));
+      if (insight.coverage.purchases.status !== "ok") {
+        limitations.push(
+          "Totals are computed from the purchase rows currently stored and are observed subtotals, not a confirmed complete position (see totals.complete)."
+        );
+      }
+      if (!insight.hasData) {
+        limitations.push("No SSIS data has been imported for this household yet.");
+      }
+      if (s.purchaseCount > 0 && s.currentNavMinor === null) {
+        limitations.push(
+          "No current NAV is available, so current value, profit and return cannot be computed."
+        );
+      }
+      if (s.totalInvestedMinor === null) {
+        limitations.push(
+          "The invested total exceeds the exactly-representable range and is reported as null rather than approximated."
+        );
+      }
+
+      const result = {
+        ...envelope(),
+        ssis: {
+          schemeName: insight.schemeName,
+          currency: insight.currency,
+          hasData: insight.hasData,
+          dataAsOf: insight.lastFetchedAt,
+          lastSource: insight.lastSource,
+          coverage: insight.coverage,
+          counts: {
+            purchases: s.purchaseCount,
+            statementEntries: insight.statement.length,
+            navPoints: insight.navSeries.length
+          },
+          totals: {
+            complete: insight.coverage.purchases.status === "ok",
+            purchaseCount: s.purchaseCount,
+            totalUnits: s.totalUnits,
+            totalInvested: ssisMoney(s.totalInvestedMinor),
+            currentValue: ssisMoney(s.currentValueMinor),
+            profit: ssisMoney(s.profitMinor),
+            returnPercent: s.returnPercent
+          },
+          currentNav:
+            s.currentNavMinor === null
+              ? null
+              : { ...money(s.currentNavMinor, insight.currency), date: s.currentNavDate },
+          navStats: {
+            minNav: ssisMoney(insight.navStats.minNavMinor),
+            maxNav: ssisMoney(insight.navStats.maxNavMinor),
+            avgNav: ssisMoney(insight.navStats.avgNavMinor),
+            changeFromMinPercent: insight.navStats.changeFromMinPercent
+          },
+          limitations
+        }
+      };
+
+      await audit("get_ssis_summary");
+      return respond(result);
+    }
+  );
+
+  server.registerTool(
+    "list_ssis_purchases",
+    {
+      title: "List SSIS purchases",
+      description:
+        "Read-only, paginated list of the household's SSIS purchases (oldest first), with optional from/to filters on the apply date (YYYY-MM-DD). Requires the finance:read scope AND this connection's explicit SSIS permission. Amounts are integer minor units as strings in NPR; unit quantities are decimal strings. Returns page.totalMatching so a page is never mistaken for the full history — note totalMatching counts only the rows currently stored; coverage reports whether the purchase dataset was fetched successfully and when, so an incomplete or stale list is distinguishable from a complete one.",
+      inputSchema: z.object({
+        from: dateString.optional(),
+        to: dateString.optional(),
+        ...ssisPageSchema
+      }),
+      annotations: READ_ONLY_ANNOTATIONS
+    },
+    async (args) => {
+      requireScope(TOOL_SCOPES.list_ssis_purchases);
+      requireSsisPermission();
+      if (args.from && args.to && args.from > args.to) {
+        throw new Error("The from date must not be after the to date.");
+      }
+      const conditions = [eq(ssisPurchases.familyId, family.id)];
+      if (args.from) conditions.push(gte(ssisPurchases.applyDate, args.from));
+      if (args.to) conditions.push(lte(ssisPurchases.applyDate, args.to));
+      const where = and(...conditions);
+      const [countRow] = await exec.select({ total: count() }).from(ssisPurchases).where(where);
+      const rows = await exec
+        .select()
+        .from(ssisPurchases)
+        .where(where)
+        .orderBy(asc(ssisPurchases.applyDate), asc(ssisPurchases.requestNo))
+        .limit(args.limit)
+        .offset(args.offset);
+
+      const purchases = rows.map(toSsisPurchaseRow).map((p) => ({
+        requestNo: p.requestNo,
+        applyDate: p.applyDate,
+        units: p.units,
+        amount: money(p.amountMinor, SSIS_CURRENCY),
+        status: p.status,
+        purchaseNav: ssisMoney(p.purchaseNavMinor),
+        navDate: p.navDate,
+        schemeName: p.schemeName,
+        isSip: p.isSip
+      }));
+
+      const coverage = await getSsisCoverage(exec, family.id);
+      const result = {
+        ...envelope(),
+        note: SSIS_SEPARATE_NOTE,
+        dataAsOf: coverage.purchases.fetchedAt,
+        coverage,
+        limitations: [
+          "page.totalMatching counts only the purchase rows currently stored in Meridian.",
+          ...ssisCoverageLimitations("Purchase", coverage.purchases)
+        ],
+        period: { from: args.from ?? null, to: args.to ?? null },
+        purchases,
+        page: ssisPage(args.limit, args.offset, purchases.length, countRow?.total ?? 0)
+      };
+
+      await audit("list_ssis_purchases");
+      return respond(result);
+    }
+  );
+
+  server.registerTool(
+    "list_ssis_statement",
+    {
+      title: "List SSIS statement entries",
+      description:
+        "Read-only, paginated list of the household's SSIS statement entries (oldest first), with optional from/to filters on the installment date (YYYY-MM-DD). Requires the finance:read scope AND this connection's explicit SSIS permission. Amounts are integer minor units as strings in NPR (amountCr = credited, amountDr = debited); unit quantities are decimal strings. Returns page.totalMatching so a page is never mistaken for the full statement — note totalMatching counts only the rows currently stored; coverage reports whether the statement dataset was fetched successfully and when, so an incomplete or stale list is distinguishable from a complete one.",
+      inputSchema: z.object({
+        from: dateString.optional(),
+        to: dateString.optional(),
+        ...ssisPageSchema
+      }),
+      annotations: READ_ONLY_ANNOTATIONS
+    },
+    async (args) => {
+      requireScope(TOOL_SCOPES.list_ssis_statement);
+      requireSsisPermission();
+      if (args.from && args.to && args.from > args.to) {
+        throw new Error("The from date must not be after the to date.");
+      }
+      const conditions = [eq(ssisStatementEntries.familyId, family.id)];
+      if (args.from) conditions.push(gte(ssisStatementEntries.installmentDate, args.from));
+      if (args.to) conditions.push(lte(ssisStatementEntries.installmentDate, args.to));
+      const where = and(...conditions);
+      const [countRow] = await exec
+        .select({ total: count() })
+        .from(ssisStatementEntries)
+        .where(where);
+      const rows = await exec
+        .select()
+        .from(ssisStatementEntries)
+        .where(where)
+        .orderBy(asc(ssisStatementEntries.installmentDate), asc(ssisStatementEntries.transNo))
+        .limit(args.limit)
+        .offset(args.offset);
+
+      // Whitelisted DTO: the SIP registration number stored on the row
+      // is a holder identifier and is deliberately not exposed.
+      const statement = rows.map(toSsisStatementRow).map((r) => ({
+        transNo: r.transNo,
+        installmentDate: r.installmentDate,
+        dueDate: r.dueDate,
+        actionDate: r.actionDate,
+        amountCr: money(r.amountCrMinor, SSIS_CURRENCY),
+        amountDr: money(r.amountDrMinor, SSIS_CURRENCY),
+        units: r.units,
+        appliedNav: ssisMoney(r.appliedNavMinor),
+        payment: r.payment,
+        otherCharges: money(r.otherChargesMinor, SSIS_CURRENCY),
+        sebonFee: money(r.sebonFeeMinor, SSIS_CURRENCY)
+      }));
+
+      const coverage = await getSsisCoverage(exec, family.id);
+      const result = {
+        ...envelope(),
+        note: SSIS_SEPARATE_NOTE,
+        dataAsOf: coverage.statement.fetchedAt,
+        coverage,
+        limitations: [
+          "page.totalMatching counts only the statement rows currently stored in Meridian.",
+          ...ssisCoverageLimitations("Statement", coverage.statement)
+        ],
+        period: { from: args.from ?? null, to: args.to ?? null },
+        statement,
+        page: ssisPage(args.limit, args.offset, statement.length, countRow?.total ?? 0)
+      };
+
+      await audit("list_ssis_statement");
+      return respond(result);
+    }
+  );
+
+  server.registerTool(
+    "get_ssis_nav_history",
+    {
+      title: "Get SSIS NAV history",
+      description:
+        "Read-only, paginated NAV history for the household's SSIS scheme (oldest first), with optional from/to filters on the NAV date (YYYY-MM-DD). Requires the finance:read scope AND this connection's explicit SSIS permission. NAV values are integer minor units as strings in NPR. currentNav is the value in effect today under the domain's selection rules (latest recorded NAV not in the future, falling back to the last fetched quote); it is null when no NAV is known. coverage reports whether the NAV dataset was fetched successfully and when (dataAsOf alone is the most recent fetch of ANY SSIS dataset).",
+      inputSchema: z.object({
+        from: dateString.optional(),
+        to: dateString.optional(),
+        ...ssisPageSchema
+      }),
+      annotations: READ_ONLY_ANNOTATIONS
+    },
+    async (args) => {
+      requireScope(TOOL_SCOPES.get_ssis_nav_history);
+      requireSsisPermission();
+      if (args.from && args.to && args.from > args.to) {
+        throw new Error("The from date must not be after the to date.");
+      }
+      const conditions = [eq(ssisNavHistory.familyId, family.id)];
+      if (args.from) conditions.push(gte(ssisNavHistory.engDate, args.from));
+      if (args.to) conditions.push(lte(ssisNavHistory.engDate, args.to));
+      const where = and(...conditions);
+      const [countRow] = await exec.select({ total: count() }).from(ssisNavHistory).where(where);
+      const rows = await exec
+        .select()
+        .from(ssisNavHistory)
+        .where(where)
+        .orderBy(asc(ssisNavHistory.engDate))
+        .limit(args.limit)
+        .offset(args.offset);
+
+      // Current NAV under the domain's selection rules: the latest
+      // history point not in the future (a one-row candidate list is
+      // equivalent — resolveCurrentNav picks the latest eligible
+      // point), falling back to the last fetched quote in state.
+      const today = todayIn(family.timezone);
+      const [latestRow] = await exec
+        .select()
+        .from(ssisNavHistory)
+        .where(and(eq(ssisNavHistory.familyId, family.id), lte(ssisNavHistory.engDate, today)))
+        .orderBy(desc(ssisNavHistory.engDate))
+        .limit(1);
+      const [state] = await exec
+        .select()
+        .from(ssisInsightState)
+        .where(eq(ssisInsightState.familyId, family.id))
+        .limit(1);
+      const stateNav =
+        state?.latestNavMinor != null && state?.latestNavDate
+          ? { navMinor: state.latestNavMinor, navDate: state.latestNavDate }
+          : null;
+      const current = resolveCurrentNav(
+        latestRow ? [toSsisNavPoint(latestRow)] : [],
+        stateNav,
+        today
+      );
+
+      const points = rows.map(toSsisNavPoint).map((p) => ({
+        engDate: p.engDate,
+        nepDate: p.nepDate,
+        nav: money(p.navMinor, SSIS_CURRENCY)
+      }));
+
+      const coverage = await getSsisCoverage(exec, family.id);
+      const result = {
+        ...envelope(),
+        note: SSIS_SEPARATE_NOTE,
+        dataAsOf: state?.lastFetchedAt ? new Date(state.lastFetchedAt).toISOString() : null,
+        coverage,
+        limitations: ssisCoverageLimitations("NAV", coverage.nav),
+        period: { from: args.from ?? null, to: args.to ?? null },
+        currentNav: current
+          ? { ...money(current.navMinor, SSIS_CURRENCY), date: current.navDate }
+          : null,
+        points,
+        page: ssisPage(args.limit, args.offset, points.length, countRow?.total ?? 0)
+      };
+
+      await audit("get_ssis_nav_history");
       return respond(result);
     }
   );

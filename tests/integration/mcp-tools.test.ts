@@ -194,7 +194,7 @@ async function familyOf(user: TestUser) {
 }
 
 describe("tool registry", () => {
-  it("exposes exactly the eight read-only tools", async () => {
+  it("exposes exactly the twelve read-only tools", async () => {
     const user = await makeUser({ timezone: "UTC" });
     const flow = await connectFlow(user);
     const res = await rpc(flow.tokens.accessToken, {
@@ -210,8 +210,12 @@ describe("tool registry", () => {
       "get_income_expense_trend",
       "get_net_worth_history",
       "get_spending_breakdown",
+      "get_ssis_nav_history",
+      "get_ssis_summary",
       "list_accounts",
       "list_recurring_transactions",
+      "list_ssis_purchases",
+      "list_ssis_statement",
       "search_transactions"
     ]);
   });
