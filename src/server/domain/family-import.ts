@@ -23,6 +23,7 @@ import {
 import type { Actor } from "../auth/context";
 import { recordAudit } from "../observability/audit";
 import { recalculateAccount } from "./balances";
+import { normalizeTicker, parseQuantity } from "./holdings";
 import { validateSeriesConfig, type Frequency, type SeriesConfig } from "./recurring";
 import { assertFamilyIsEmpty } from "./sure-import";
 import { TRANSFER_DATE_WINDOW_DAYS } from "./transfers";
@@ -165,6 +166,7 @@ type ParsedHolding = {
   companyName: string | null;
   quantity: string;
   averageCostMinor: number | null;
+  averageCostQuantity: string;
   currentPriceMinor: number | null;
 };
 type ParsedSavedFilter = { id: string; userId: string; name: string; params: RecordData };
@@ -529,6 +531,7 @@ async function importRecords(
       companyName: record.companyName,
       quantity: record.quantity,
       averageCostMinor: record.averageCostMinor,
+      averageCostQuantity: record.averageCostQuantity,
       currentPriceMinor: record.currentPriceMinor
     });
     holdingCount++;
@@ -818,7 +821,8 @@ function validateRestoredData(data: ParsedFamilyExport, pairs: ParsedTransfer[])
 
   // Holdings are user-entered positions the holdings domain only allows on
   // other-asset accounts, unique per ticker; a tampered export must not
-  // restore states the domain forbids.
+  // restore states the domain forbids. Tickers were normalized at parse
+  // time, so this uniqueness check compares the canonical form.
   const holdingKeys = new Set<string>();
   for (const holding of data.holdings) {
     const account = accountById.get(holding.accountId);
@@ -960,21 +964,71 @@ function parseTransfer(raw: unknown): ParsedTransfer {
 
 function parseHolding(raw: unknown): ParsedHolding {
   const r = reqRecord(raw, "holding");
-  const quantity = reqText(r.quantity, "holding quantity", 32);
-  // Quantities are decimal strings with at most 6 decimal places (the
-  // holdings domain's storage contract); anything else could not have been
-  // written by Meridian and would corrupt the portfolio math on restore.
-  if (!/^\d+(?:\.\d{1,6})?$/.test(quantity)) {
+  // Restore applies the holdings domain's canonical invariants, not just
+  // its storage shape: tickers are normalized (trim + uppercase) exactly
+  // as the domain writes them — so per-account uniqueness is checked on
+  // the normalized form and ABC + abc cannot both land — the ticker
+  // policy is enforced, and the quantity must be a strictly positive
+  // decimal the domain's parser accepts, stored in its canonical form.
+  const ticker = normalizeTicker(reqText(r.ticker, "holding ticker", 200));
+  if (!ticker) throw errors.validation("A holding in the export has an empty ticker.");
+  if (ticker.length > 32) {
+    throw errors.validation("A holding in the export has a ticker longer than 32 characters.");
+  }
+  if (/\s/.test(ticker)) {
+    throw errors.validation("A holding in the export has a ticker containing spaces.");
+  }
+  let quantity: string;
+  let quantityScaled: bigint;
+  try {
+    const parsed = parseQuantity(reqText(r.quantity, "holding quantity", 32));
+    quantity = parsed.normalized;
+    quantityScaled = parsed.scaled;
+  } catch {
     throw errors.validation("A holding in the export has an invalid quantity.");
+  }
+  if (quantityScaled === 0n) {
+    throw errors.validation("A holding in the export has a zero quantity.");
+  }
+  const averageCostMinor = optMinor(r.averageCostMinor, "holding average cost");
+  const currentPriceMinor = optMinor(r.currentPriceMinor, "holding current price");
+  // Cost provenance: exports written before the field existed recorded an
+  // average that covered the whole position (the domain's backfill rule),
+  // so an absent field derives the known quantity from the average.
+  let averageCostQuantity: string;
+  if (r.averageCostQuantity === null || r.averageCostQuantity === undefined) {
+    averageCostQuantity = averageCostMinor !== null ? quantity : "0";
+  } else {
+    let knownScaled: bigint;
+    try {
+      const parsed = parseQuantity(
+        reqText(r.averageCostQuantity, "holding average cost quantity", 32)
+      );
+      averageCostQuantity = parsed.normalized;
+      knownScaled = parsed.scaled;
+    } catch {
+      throw errors.validation("A holding in the export has an invalid average cost quantity.");
+    }
+    if (averageCostMinor === null && knownScaled !== 0n) {
+      throw errors.validation(
+        "A holding in the export claims a cost quantity without an average cost."
+      );
+    }
+    if (knownScaled > quantityScaled) {
+      throw errors.validation(
+        "A holding in the export has a cost quantity larger than its quantity."
+      );
+    }
   }
   return {
     id: reqId(r.id, "holding"),
     accountId: reqId(r.accountId, "holding account"),
-    ticker: reqText(r.ticker, "holding ticker", 32),
+    ticker,
     companyName: optText(r.companyName, 200),
     quantity,
-    averageCostMinor: optMinor(r.averageCostMinor, "holding average cost"),
-    currentPriceMinor: optMinor(r.currentPriceMinor, "holding current price")
+    averageCostMinor,
+    averageCostQuantity,
+    currentPriceMinor
   };
 }
 

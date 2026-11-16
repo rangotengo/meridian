@@ -806,6 +806,8 @@ export const portfolioHoldings = sqliteTable(
     companyName: text("company_name"),
     quantity: text("quantity").notNull(),
     averageCostMinor: integer("average_cost_minor"),
+    /** Quantity (decimal string, ≤6dp) that averageCostMinor applies to. */
+    averageCostQuantity: text("average_cost_quantity").notNull().default("0"),
     currentPriceMinor: integer("current_price_minor"),
     createdAt: isoTimestamp("created_at")
       .notNull()

@@ -11,6 +11,7 @@ import { fmtDate } from "@/lib/format";
 import { ledgerToDisplayBalance, minorToDecimal } from "@/lib/money";
 import {
   holdingValueMinor,
+  knownCostScaled,
   listHoldings,
   parseQuantity,
   summarizeHoldings
@@ -50,10 +51,11 @@ export default async function AccountDetailPage({
   const holdingsSummary = summarizeHoldings(holdingRows);
   const holdingViews: HoldingView[] = holdingRows.map((row) => {
     const { scaled } = parseQuantity(row.quantity);
-    const valueMinor = holdingValueMinor(
-      scaled,
-      row.currentPriceMinor ?? row.averageCostMinor ?? 0
-    );
+    const unitPrice = row.currentPriceMinor ?? row.averageCostMinor ?? 0;
+    const valueMinor = holdingValueMinor(scaled, unitPrice);
+    // Gain/loss covers only the cost-known portion of the position; a
+    // position with no known cost has no honest gain to show.
+    const known = knownCostScaled(row);
     return {
       id: row.id,
       ticker: row.ticker,
@@ -63,9 +65,9 @@ export default async function AccountDetailPage({
       currentPriceMinor: row.currentPriceMinor,
       valueMinor,
       gainMinor:
-        row.averageCostMinor === null
+        row.averageCostMinor === null || known === 0n
           ? null
-          : valueMinor - holdingValueMinor(scaled, row.averageCostMinor)
+          : holdingValueMinor(known, unitPrice) - holdingValueMinor(known, row.averageCostMinor)
     };
   });
 

@@ -42,6 +42,7 @@ describe("summarizeHoldings", () => {
       companyName: null,
       quantity: "1",
       averageCostMinor: null,
+      averageCostQuantity: "0",
       currentPriceMinor: null,
       createdAt: new Date(),
       updatedAt: new Date(),
@@ -50,7 +51,13 @@ describe("summarizeHoldings", () => {
 
   it("computes value, cost, and gain with a partial-cost footnote flag", () => {
     const summary = summarizeHoldings([
-      row({ ticker: "A", quantity: "100", averageCostMinor: 200_00, currentPriceMinor: 250_00 }),
+      row({
+        ticker: "A",
+        quantity: "100",
+        averageCostMinor: 200_00,
+        averageCostQuantity: "100",
+        currentPriceMinor: 250_00
+      }),
       row({ ticker: "B", quantity: "10", averageCostMinor: null, currentPriceMinor: 50_00 })
     ]);
     expect(summary.totalValueMinor).toBe(2_500_000 + 50_000);
@@ -61,9 +68,34 @@ describe("summarizeHoldings", () => {
     expect(summary.unrealizedGainPercent).toBeCloseTo(25);
   });
 
+  it("costs and gains only the known portion of a partially costed position", () => {
+    // 101 shares, cost known for just 1 share at 200 (minor price units
+    // below are already minor: 200 = 2.00); current price 500.
+    const summary = summarizeHoldings([
+      row({
+        ticker: "A",
+        quantity: "101",
+        averageCostMinor: 200,
+        averageCostQuantity: "1",
+        currentPriceMinor: 500
+      })
+    ]);
+    expect(summary.totalValueMinor).toBe(101 * 500);
+    // The known portion costs 1 × 200 — never 101 × 200.
+    expect(summary.totalCostMinor).toBe(200);
+    expect(summary.partialCost).toBe(true);
+    // Gain over the known portion only: 1 × 500 − 1 × 200.
+    expect(summary.unrealizedGainMinor).toBe(300);
+  });
+
   it("falls back to average cost when no current price is set", () => {
     const summary = summarizeHoldings([
-      row({ quantity: "10", averageCostMinor: 100_00, currentPriceMinor: null })
+      row({
+        quantity: "10",
+        averageCostMinor: 100_00,
+        averageCostQuantity: "10",
+        currentPriceMinor: null
+      })
     ]);
     expect(summary.totalValueMinor).toBe(100_000);
     expect(summary.unrealizedGainMinor).toBe(0);
@@ -87,16 +119,21 @@ describe("parseHoldingsCsv", () => {
       ticker: "NABIL",
       quantity: "100",
       averageCostMinor: 200_00,
+      averageCostSet: true,
       currentPriceMinor: 250_50,
+      currentPriceSet: true,
       companyName: "Nabil Bank Limited"
     });
-    // Tickers normalize; an empty price cell means unknown.
+    // Tickers normalize; an empty price cell in a present column is an
+    // explicit clear (dictated, value unknown), not an omission.
     expect(parsed.rows[1]).toMatchObject({
       row: 3,
       ticker: "HIDCL",
       quantity: "50.5",
       averageCostMinor: 99_99,
-      currentPriceMinor: null
+      averageCostSet: true,
+      currentPriceMinor: null,
+      currentPriceSet: true
     });
   });
 
@@ -146,10 +183,14 @@ describe("parseHoldingsCsv", () => {
   it("accepts a header without the optional price columns", () => {
     const parsed = parseHoldingsCsv("ticker,quantity\nNABIL,10", "USD");
     expect(parsed.errors).toEqual([]);
+    // Omitted columns do not dictate the fields: on update the stored
+    // prices are preserved.
     expect(parsed.rows[0]).toMatchObject({
       ticker: "NABIL",
       averageCostMinor: null,
+      averageCostSet: false,
       currentPriceMinor: null,
+      currentPriceSet: false,
       companyName: null
     });
   });

@@ -6,10 +6,15 @@ import { DomainError, errors } from "@/lib/errors";
 import { parseAmountToMinor } from "@/lib/money";
 import { recordAudit } from "../observability/audit";
 import {
+  assertHoldingsActivationAllowed,
+  formatQuantity,
+  knownCostScaled,
   loadManagedAccount,
   normalizeTicker,
   parseQuantity,
-  syncPortfolioValuation
+  syncPortfolioValuation,
+  withHoldingsAccountLock,
+  type PortfolioHoldingRow
 } from "./holdings";
 
 /**
@@ -19,13 +24,22 @@ import {
  *   ticker,quantity,average_cost,current_price,company_name
  * `ticker` and `quantity` columns are required; the price and company
  * columns are optional. Prices are in MAJOR units (e.g. 250.50) and are
- * converted with the account's currency; empty price cells mean "unknown".
- * Quantities are decimal share counts (up to 6 decimal places).
+ * converted with the account's currency. Quantities are decimal share
+ * counts (up to 6 decimal places).
+ *
+ * Price columns are presence-aware on update: an OMITTED column leaves
+ * the stored price untouched, while a present-but-blank cell explicitly
+ * clears that price to unknown. A row whose result would leave a holding
+ * with neither price is an error (a holding needs at least one price) —
+ * the stored holding, if any, is left unchanged. A supplied average cost
+ * describes the row's whole quantity; a sparse row that omits the cost
+ * column keeps the stored cost provenance, clamped to the new quantity.
  *
  * Rows are upserted by (account, ticker). A row that fails validation is
  * skipped and reported with its row number (the header is row 1); valid
  * rows still apply. A file with no usable header — empty, not CSV-shaped,
- * or missing the ticker/quantity columns — is rejected outright.
+ * or missing the ticker/quantity columns — is rejected outright. The
+ * whole import runs under the account's holdings lock (see holdings.ts).
  */
 
 export type HoldingsCsvRow = {
@@ -34,7 +48,11 @@ export type HoldingsCsvRow = {
   companyName: string | null;
   quantity: string;
   averageCostMinor: number | null;
+  /** True when the file dictates the average cost (column present). */
+  averageCostSet: boolean;
   currentPriceMinor: number | null;
+  /** True when the file dictates the current price (column present). */
+  currentPriceSet: boolean;
 };
 
 export type HoldingsCsvRowError = { row: number; message: string };
@@ -149,21 +167,25 @@ export function parseHoldingsCsv(csvText: string, currency: string): HoldingsCsv
       }
       const { scaled, normalized } = parseQuantity(cell(quantityCol));
       if (scaled === 0n) throw errors.validation("Quantity must be greater than zero.");
-      const price = (idx: number, label: string): number | null => {
+      // Presence-aware prices: an absent column does not dictate the
+      // field; a present column dictates it, with a blank cell meaning an
+      // explicit clear to unknown.
+      const price = (idx: number, label: string): { set: boolean; value: number | null } => {
+        if (idx === -1) return { set: false, value: null };
         const raw = cell(idx);
-        if (raw === "") return null;
+        if (raw === "") return { set: true, value: null };
         try {
-          return parseAmountToMinor(raw.replace(/,/g, ""), currency);
+          return { set: true, value: parseAmountToMinor(raw.replace(/,/g, ""), currency) };
         } catch (e) {
           throw errors.validation(errorMessage(e, `Invalid ${label}.`));
         }
       };
-      const averageCostMinor = price(avgCostCol, "average cost");
-      if (averageCostMinor !== null && averageCostMinor < 0) {
+      const averageCost = price(avgCostCol, "average cost");
+      if (averageCost.value !== null && averageCost.value < 0) {
         throw errors.validation("Average cost cannot be negative.");
       }
-      const currentPriceMinor = price(currentPriceCol, "current price");
-      if (currentPriceMinor !== null && currentPriceMinor < 0) {
+      const currentPrice = price(currentPriceCol, "current price");
+      if (currentPrice.value !== null && currentPrice.value < 0) {
         throw errors.validation("Current price cannot be negative.");
       }
       const company = cell(companyCol);
@@ -172,8 +194,10 @@ export function parseHoldingsCsv(csvText: string, currency: string): HoldingsCsv
         ticker,
         companyName: company ? company.slice(0, 200) : null,
         quantity: normalized,
-        averageCostMinor,
-        currentPriceMinor
+        averageCostMinor: averageCost.value,
+        averageCostSet: averageCost.set,
+        currentPriceMinor: currentPrice.value,
+        currentPriceSet: currentPrice.set
       });
     } catch (e) {
       rowErrors.push({ row: rowNumber, message: errorMessage(e, "Invalid row.") });
@@ -181,6 +205,9 @@ export function parseHoldingsCsv(csvText: string, currency: string): HoldingsCsv
   }
   return { rows, errors: rowErrors };
 }
+
+const NO_PRICE_MESSAGE =
+  "A holding needs at least one price; this row would leave it with neither an average cost nor a current price.";
 
 export async function importHoldingsCsv(
   exec: Executor,
@@ -193,35 +220,45 @@ export async function importHoldingsCsv(
 
   let created = 0;
   let updated = 0;
-  await exec.transaction(async (tx) => {
+  const applyErrors: HoldingsCsvRowError[] = [];
+  await withHoldingsAccountLock(exec, account.id, async (tx) => {
+    if (parsed.rows.length > 0) {
+      await assertHoldingsActivationAllowed(tx, actor, account.id);
+    }
     for (const row of parsed.rows) {
       const [existing] = await tx
-        .select({ id: portfolioHoldings.id, companyName: portfolioHoldings.companyName })
+        .select()
         .from(portfolioHoldings)
         .where(
           and(eq(portfolioHoldings.accountId, account.id), eq(portfolioHoldings.ticker, row.ticker))
         )
         .limit(1);
       if (existing) {
+        const merged = mergeRowIntoExisting(existing, row);
+        if (!merged) {
+          applyErrors.push({ row: row.row, message: NO_PRICE_MESSAGE });
+          continue;
+        }
         await tx
           .update(portfolioHoldings)
-          .set({
-            companyName: row.companyName ?? existing.companyName,
-            quantity: row.quantity,
-            averageCostMinor: row.averageCostMinor,
-            currentPriceMinor: row.currentPriceMinor,
-            updatedAt: new Date()
-          })
+          .set({ ...merged, updatedAt: new Date() })
           .where(eq(portfolioHoldings.id, existing.id));
         updated++;
       } else {
+        const averageCostMinor = row.averageCostSet ? row.averageCostMinor : null;
+        const currentPriceMinor = row.currentPriceSet ? row.currentPriceMinor : null;
+        if (averageCostMinor === null && currentPriceMinor === null) {
+          applyErrors.push({ row: row.row, message: NO_PRICE_MESSAGE });
+          continue;
+        }
         await tx.insert(portfolioHoldings).values({
           accountId: account.id,
           ticker: row.ticker,
           companyName: row.companyName,
           quantity: row.quantity,
-          averageCostMinor: row.averageCostMinor,
-          currentPriceMinor: row.currentPriceMinor
+          averageCostMinor,
+          averageCostQuantity: averageCostMinor !== null ? row.quantity : "0",
+          currentPriceMinor
         });
         created++;
       }
@@ -229,14 +266,60 @@ export async function importHoldingsCsv(
     if (created + updated > 0) await syncPortfolioValuation(tx, actor, account);
   });
 
+  const errors = [...parsed.errors, ...applyErrors].sort((a, b) => a.row - b.row);
   await recordAudit(exec, {
     familyId: actor.familyId,
     actorUserId: actor.userId,
     action: "holding.imported",
     entityType: "account",
     entityId: account.id,
-    metadata: { accountId: account.id, created, updated, errors: parsed.errors.length }
+    metadata: { accountId: account.id, created, updated, errors: errors.length }
   });
 
-  return { created, updated, errors: parsed.errors };
+  return { created, updated, errors };
+}
+
+/**
+ * Merges a CSV row into a stored holding under the presence rules: a
+ * dictated field (column present) replaces the stored value, including an
+ * explicit clear; an omitted field preserves it. Returns null when the
+ * merge would leave the holding with neither price.
+ */
+function mergeRowIntoExisting(
+  existing: PortfolioHoldingRow,
+  row: HoldingsCsvRow
+): {
+  companyName: string | null;
+  quantity: string;
+  averageCostMinor: number | null;
+  averageCostQuantity: string;
+  currentPriceMinor: number | null;
+} | null {
+  const averageCostMinor = row.averageCostSet ? row.averageCostMinor : existing.averageCostMinor;
+  const currentPriceMinor = row.currentPriceSet
+    ? row.currentPriceMinor
+    : existing.currentPriceMinor;
+  if (averageCostMinor === null && currentPriceMinor === null) return null;
+
+  let averageCostQuantity: string;
+  if (row.averageCostSet) {
+    // A dictated cost describes the row's whole quantity; a dictated
+    // clear makes the whole position's cost unknown.
+    averageCostQuantity = averageCostMinor !== null ? row.quantity : "0";
+  } else if (averageCostMinor === null) {
+    averageCostQuantity = "0";
+  } else {
+    // Sparse row: keep the stored cost provenance, clamped to the new
+    // quantity (the known portion can never exceed the position).
+    const known = knownCostScaled(existing);
+    const { scaled } = parseQuantity(row.quantity);
+    averageCostQuantity = formatQuantity(known > scaled ? scaled : known);
+  }
+  return {
+    companyName: row.companyName ?? existing.companyName,
+    quantity: row.quantity,
+    averageCostMinor,
+    averageCostQuantity,
+    currentPriceMinor
+  };
 }

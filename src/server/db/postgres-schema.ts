@@ -670,6 +670,8 @@ export const portfolioHoldings = pgTable(
     companyName: text("company_name"),
     quantity: text("quantity").notNull(),
     averageCostMinor: bigint("average_cost_minor", { mode: "number" }),
+    /** Quantity (decimal string, ≤6dp) that averageCostMinor applies to. */
+    averageCostQuantity: text("average_cost_quantity").notNull().default("0"),
     currentPriceMinor: bigint("current_price_minor", { mode: "number" }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow()

@@ -7,12 +7,17 @@ import { errors } from "@/lib/errors";
 import { displayToLedgerBalance } from "@/lib/money";
 import { isIsoDate } from "@/lib/datetime";
 import { recordAudit } from "../observability/audit";
-import { accountHasHoldings } from "./holdings";
+import { accountHasHoldings, withHoldingsAccountLock } from "./holdings";
 
 /**
  * While an account has manual portfolio holdings, its value is managed by
  * them (the holdings domain writes the daily valuation), so manual
  * valuation changes are rejected until the last holding is removed.
+ *
+ * The guard and the write run inside the account's holdings lock (see
+ * holdings.ts): holdings-mode transitions are writers for the account
+ * like any holdings mutation, and an unlocked check-then-write could race
+ * a concurrent holdings change into a state neither side intended.
  */
 async function assertNotHoldingsManaged(exec: Executor, account: AccountRow): Promise<void> {
   if (account.type !== "other_asset") return;
@@ -45,21 +50,20 @@ export async function recordValuation(
     throw errors.validation("Unknown valuation kind.");
   }
 
-  const [account] = await exec
-    .select()
-    .from(accounts)
-    .where(eq(accounts.id, input.accountId))
-    .limit(1);
-  if (!account) throw errors.notFound("Account");
-  await assertNotHoldingsManaged(exec, account);
-
   const name =
     input.name?.trim() ||
     (input.kind === "reconciliation" ? "Reconciliation adjustment" : "Valuation update");
 
-  const ledgerAmount = displayToLedgerBalance(input.amountDisplayMinor, account.type);
+  const entryId = await withHoldingsAccountLock(exec, input.accountId, async (tx) => {
+    const [account] = await tx
+      .select()
+      .from(accounts)
+      .where(eq(accounts.id, input.accountId))
+      .limit(1);
+    if (!account) throw errors.notFound("Account");
+    await assertNotHoldingsManaged(tx, account);
 
-  const entryId = await exec.transaction(async (tx) => {
+    const ledgerAmount = displayToLedgerBalance(input.amountDisplayMinor, account.type);
     const [entry] = await tx
       .insert(entries)
       .values({
@@ -83,7 +87,7 @@ export async function recordValuation(
     action: "valuation.recorded",
     entityType: "entry",
     entityId: entryId,
-    metadata: { accountId: account.id, kind: input.kind ?? "current" }
+    metadata: { accountId: input.accountId, kind: input.kind ?? "current" }
   });
 
   return { entryId };
@@ -110,6 +114,13 @@ async function loadManagedValuation(
   return { entry, account };
 }
 
+/** Bare entry read used only to discover the owning account (immutable). */
+async function loadValuationAccountId(exec: Executor, entryId: string): Promise<string> {
+  const [entry] = await exec.select().from(entries).where(eq(entries.id, entryId)).limit(1);
+  if (!entry || entry.entryableType !== "valuation") throw errors.notFound("Valuation");
+  return entry.accountId;
+}
+
 export async function updateValuation(
   exec: Executor,
   actor: Actor,
@@ -124,10 +135,13 @@ export async function updateValuation(
   if (input.kind && !VALUATION_KINDS.includes(input.kind)) {
     throw errors.validation("Unknown valuation kind.");
   }
-  const { entry, account } = await loadManagedValuation(exec, actor, input.entryId);
-  const ledgerAmount = displayToLedgerBalance(input.amountDisplayMinor, account.type);
+  const accountId = await loadValuationAccountId(exec, input.entryId);
 
-  await exec.transaction(async (tx) => {
+  const result = await withHoldingsAccountLock(exec, accountId, async (tx) => {
+    // Access, open-state, and the holdings-mode guard are re-evaluated
+    // inside the lock, against the transaction's snapshot.
+    const { entry, account } = await loadManagedValuation(tx, actor, input.entryId);
+    const ledgerAmount = displayToLedgerBalance(input.amountDisplayMinor, account.type);
     await tx
       .update(entries)
       .set({ date: input.date, amountMinor: ledgerAmount })
@@ -135,6 +149,7 @@ export async function updateValuation(
     if (input.kind) {
       await tx.update(valuations).set({ kind: input.kind }).where(eq(valuations.entryId, entry.id));
     }
+    return { accountId: account.id, previousDate: entry.date, date: input.date };
   });
 
   await recordAudit(exec, {
@@ -142,11 +157,11 @@ export async function updateValuation(
     actorUserId: actor.userId,
     action: "valuation.updated",
     entityType: "entry",
-    entityId: entry.id,
-    metadata: { accountId: account.id, kind: input.kind }
+    entityId: input.entryId,
+    metadata: { accountId, kind: input.kind }
   });
 
-  return { accountId: account.id, previousDate: entry.date, date: input.date };
+  return result;
 }
 
 export async function deleteValuation(
@@ -154,19 +169,23 @@ export async function deleteValuation(
   actor: Actor,
   entryId: string
 ): Promise<{ accountId: string; date: string }> {
-  const { entry, account } = await loadManagedValuation(exec, actor, entryId);
+  const accountId = await loadValuationAccountId(exec, entryId);
 
-  // The valuations row is removed by the entries FK cascade.
-  await exec.delete(entries).where(eq(entries.id, entry.id));
+  const result = await withHoldingsAccountLock(exec, accountId, async (tx) => {
+    const { entry, account } = await loadManagedValuation(tx, actor, entryId);
+    // The valuations row is removed by the entries FK cascade.
+    await tx.delete(entries).where(eq(entries.id, entry.id));
+    return { accountId: account.id, date: entry.date };
+  });
 
   await recordAudit(exec, {
     familyId: actor.familyId,
     actorUserId: actor.userId,
     action: "valuation.deleted",
     entityType: "entry",
-    entityId: entry.id,
-    metadata: { accountId: account.id }
+    entityId: entryId,
+    metadata: { accountId }
   });
 
-  return { accountId: account.id, date: entry.date };
+  return result;
 }

@@ -1,6 +1,14 @@
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, eq, gt, isNull, ne, or, sql } from "drizzle-orm";
 import type { Executor } from "../db/client";
-import { accounts, entries, families, portfolioHoldings, valuations } from "../db/schema";
+import { usesCloudStorage } from "../db/dialect";
+import {
+  accounts,
+  entries,
+  families,
+  meroShareAccounts,
+  portfolioHoldings,
+  valuations
+} from "../db/schema";
 import type { Actor } from "../auth/context";
 import { assertAccountAccessLevel, assertAccountOpen } from "../authorization/access";
 import { errors } from "@/lib/errors";
@@ -17,11 +25,46 @@ import { recalculateAccount } from "./balances";
  *
  * Balance integration mirrors how MeroShare portfolios integrate: while an
  * account has at least one holding, its value is holdings-managed. Every
- * mutation recomputes the portfolio total and upserts a valuation entry for
- * today (externalSource "holdings", one per day, updated in place), then
- * recalculates balances — so the account balance always equals the sum of
- * its holdings. Manual valuations are rejected by the valuations domain
- * while holdings exist (see valuations.ts).
+ * mutation recomputes the portfolio total and writes a valuation entry for
+ * today (externalSource "holdings", one per day), then recalculates
+ * balances — so the account balance always equals the sum of its holdings.
+ * Manual valuations are rejected by the valuations domain while holdings
+ * exist (see valuations.ts), and an account with an active MeroShare link
+ * is rejected here: exactly one controller manages an account's value.
+ *
+ * Concurrency: every writer for an account — holdings CRUD, buy/sell, CSV
+ * import, and the valuations domain paths that interact with holdings
+ * mode — runs inside withHoldingsAccountLock, which takes a
+ * transaction-scoped advisory lock keyed by the account BEFORE any
+ * position is read or total computed, and holds it through the position
+ * write, the daily-valuation write, and recalculation. Positions are read
+ * under READ COMMITTED statement snapshots, so without the lock two
+ * writers can each read pre-mutation state and silently lose each other's
+ * changes. On the cloud backend the Durable Object executor serializes
+ * access behind its mutex and a transaction holds it across awaits, so
+ * the same transaction discipline is correct there and the advisory lock
+ * is a no-op. Operations touch a single account, so there is no lock
+ * ordering to violate.
+ *
+ * Same-day valuation precedence: balances resolve competing valuations
+ * for one date by (date, created_at) — the latest write wins. The
+ * holdings sync therefore REPLACES its daily entry instead of updating it
+ * in place, so (re)activation of holdings management — including the
+ * zero-value write when the last holding is removed — always outranks
+ * manual entries written earlier that day, and a manual valuation
+ * recorded while holdings are inactive (a fresh insert) equally outranks
+ * a stale holdings entry. Valuation history before today is never
+ * touched. A manual valuation dated in the FUTURE is the one case
+ * ordering cannot settle (it would silently take over when its date
+ * arrives), so entering holdings management while one exists is rejected
+ * until it is removed or re-dated.
+ *
+ * Cost provenance: averageCostMinor is a per-share average that applies
+ * to averageCostQuantity shares of the position, not necessarily all of
+ * them. Shares acquired without a recorded cost (a buy into a position
+ * whose cost was unknown) grow only the known portion; summaries cost
+ * and gain only the known portion and report the position as partial
+ * until the user explicitly supplies a whole-position cost.
  *
  * All quantity math is exact: quantities are decimal strings with up to 6
  * decimal places, scaled to integers (×10^6) and multiplied with BigInt, so
@@ -41,7 +84,7 @@ export function normalizeTicker(raw: string): string {
   return raw.trim().toUpperCase();
 }
 
-function assertValidTicker(ticker: string): void {
+export function assertValidTicker(ticker: string): void {
   if (!ticker) throw errors.validation("Enter a ticker symbol.");
   if (ticker.length > 32) throw errors.validation("Ticker symbols are at most 32 characters.");
   if (/\s/.test(ticker)) throw errors.validation("Ticker symbols cannot contain spaces.");
@@ -89,6 +132,20 @@ function assertPriceMinor(value: number | null | undefined, field: string): numb
   return value;
 }
 
+/**
+ * A position must carry at least one usable price: with neither a current
+ * price nor an average cost its value would silently compute as zero and
+ * replace a known balance. An explicit price of 0 is a real price and is
+ * allowed — only absence is rejected.
+ */
+function assertPriced(averageCostMinor: number | null, currentPriceMinor: number | null): void {
+  if (averageCostMinor === null && currentPriceMinor === null) {
+    throw errors.validation(
+      "Enter a current price or an average cost — a holding needs at least one price so its value is known."
+    );
+  }
+}
+
 /** Σ quantity × price over rows, in minor units, rounded per holding. */
 export function holdingValueMinor(quantityScaled: bigint, priceMinor: number): number {
   const product = quantityScaled * BigInt(priceMinor);
@@ -100,13 +157,25 @@ export function holdingValueMinor(quantityScaled: bigint, priceMinor: number): n
   return Number(rounded);
 }
 
+/**
+ * The scaled quantity that the row's average cost is known for: zero when
+ * the cost itself is unknown, otherwise the recorded cost quantity clamped
+ * to the position size.
+ */
+export function knownCostScaled(row: PortfolioHoldingRow): bigint {
+  if (row.averageCostMinor === null) return 0n;
+  const { scaled } = parseQuantity(row.quantity);
+  const known = parseQuantity(row.averageCostQuantity).scaled;
+  return known > scaled ? scaled : known;
+}
+
 export type HoldingsSummary = {
   totalValueMinor: number;
-  /** Σ quantity × average cost over holdings whose cost is known; null when none is. */
+  /** Σ known-cost quantity × average cost; null when no cost is known at all. */
   totalCostMinor: number | null;
-  /** True when at least one holding has no average cost, so the cost total is partial. */
+  /** True when part of any position has no known cost, so the cost total is partial. */
   partialCost: boolean;
-  /** Gain over the cost-known holdings only; null when no cost is known. */
+  /** Gain over the cost-known portions only; null when no cost is known. */
   unrealizedGainMinor: number | null;
   unrealizedGainPercent: number | null;
 };
@@ -121,12 +190,11 @@ export function summarizeHoldings(rows: PortfolioHoldingRow[]): HoldingsSummary 
     const unitPrice = row.currentPriceMinor ?? row.averageCostMinor ?? 0;
     const value = holdingValueMinor(scaled, unitPrice);
     totalValueMinor += value;
-    if (row.averageCostMinor === null) {
-      if (scaled > 0n) partialCost = true;
-      continue;
-    }
-    totalCostMinor = (totalCostMinor ?? 0) + holdingValueMinor(scaled, row.averageCostMinor);
-    coveredValueMinor += value;
+    const known = knownCostScaled(row);
+    if (scaled > 0n && known < scaled) partialCost = true;
+    if (row.averageCostMinor === null || known === 0n) continue;
+    totalCostMinor = (totalCostMinor ?? 0) + holdingValueMinor(known, row.averageCostMinor);
+    coveredValueMinor += holdingValueMinor(known, unitPrice);
   }
   const unrealizedGainMinor = totalCostMinor === null ? null : coveredValueMinor - totalCostMinor;
   const unrealizedGainPercent =
@@ -159,6 +227,97 @@ export async function accountHasHoldings(exec: Executor, accountId: string): Pro
   return row !== undefined;
 }
 
+/**
+ * True while a MeroShare connection actively manages this account (a
+ * mero_share_accounts link exists). Disconnecting deletes the link, so a
+ * formerly linked account returns false and accepts manual holdings.
+ */
+export async function accountHasActiveMeroShareLink(
+  exec: Executor,
+  accountId: string
+): Promise<boolean> {
+  const [row] = await exec
+    .select({ id: meroShareAccounts.id })
+    .from(meroShareAccounts)
+    .where(eq(meroShareAccounts.accountId, accountId))
+    .limit(1);
+  return row !== undefined;
+}
+
+/**
+ * Takes the per-account holdings advisory lock (Postgres). Must be called
+ * inside a transaction; the lock is held until that transaction ends. On
+ * the cloud backend the Durable Object executor serializes writers, so
+ * this is a no-op and the surrounding transaction provides the guarantee.
+ */
+export async function lockHoldingsAccount(tx: Executor, accountId: string): Promise<void> {
+  if (usesCloudStorage) return;
+  await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${"holdings-account:" + accountId}))`);
+}
+
+/**
+ * Runs `fn` in a transaction that first takes the account's holdings lock,
+ * so every read of positions and every computed total inside `fn` is
+ * serialized against all other writers for the account.
+ */
+export async function withHoldingsAccountLock<T>(
+  exec: Executor,
+  accountId: string,
+  fn: (tx: Executor) => Promise<T>
+): Promise<T> {
+  return exec.transaction(async (tx) => {
+    await lockHoldingsAccount(tx, accountId);
+    return fn(tx);
+  });
+}
+
+/**
+ * Entering holdings management is refused while a manual (non-holdings)
+ * valuation is dated in the future: same-day precedence is resolved by
+ * write order, but a future entry would silently take over the balance
+ * when its date arrives while the portfolio is the active controller.
+ */
+async function assertNoFutureManualValuation(
+  exec: Executor,
+  accountId: string,
+  today: string
+): Promise<void> {
+  const [row] = await exec
+    .select({ date: entries.date })
+    .from(entries)
+    .where(
+      and(
+        eq(entries.accountId, accountId),
+        eq(entries.entryableType, "valuation"),
+        gt(entries.date, today),
+        or(isNull(entries.externalSource), ne(entries.externalSource, HOLDINGS_SOURCE))
+      )
+    )
+    .orderBy(asc(entries.date))
+    .limit(1);
+  if (row) {
+    throw errors.validation(
+      `This account has a valuation dated ${row.date}, in the future. Remove it or change its date before adding holdings — it would override the portfolio value when its date arrives.`
+    );
+  }
+}
+
+/**
+ * Guard for transitions INTO holdings management (the account currently
+ * has no holdings): refuses while a future-dated manual valuation exists.
+ * Call inside the account's holdings lock, before the first position is
+ * written. No-op once any holding exists.
+ */
+export async function assertHoldingsActivationAllowed(
+  exec: Executor,
+  actor: Actor,
+  accountId: string
+): Promise<void> {
+  if ((await countHoldings(exec, accountId)) > 0) return;
+  const today = await familyToday(exec, actor.familyId);
+  await assertNoFutureManualValuation(exec, accountId, today);
+}
+
 async function loadViewableAccount(
   exec: Executor,
   actor: Actor,
@@ -170,7 +329,7 @@ async function loadViewableAccount(
   return account;
 }
 
-/** Full-control + open + other_asset guard shared by every holdings mutation. */
+/** Full-control + open + other_asset + not-MeroShare-linked guard for mutations. */
 export async function loadManagedAccount(
   exec: Executor,
   actor: Actor,
@@ -183,6 +342,11 @@ export async function loadManagedAccount(
   const { account } = await assertAccountOpen(exec, actor, accountId, "manage");
   if (account.type !== "other_asset") {
     throw errors.validation("Holdings can only be managed on other-asset accounts.");
+  }
+  if (await accountHasActiveMeroShareLink(exec, account.id)) {
+    throw errors.validation(
+      "This account is linked to MeroShare and its value is managed by that sync. Disconnect MeroShare before managing holdings manually."
+    );
   }
   return account;
 }
@@ -198,9 +362,13 @@ async function familyToday(exec: Executor, familyId: string): Promise<string> {
 
 /**
  * Recompute the portfolio total from the account's holdings and persist it
- * as today's valuation entry (upserted — one holdings valuation per day),
- * then recalculate balances from today. Runs inside the caller's executor,
- * which actions wrap in a transaction. Returns the total and the date used.
+ * as today's valuation entry (one holdings valuation per day), then
+ * recalculate balances from today. The previous holdings entry for the
+ * date is REPLACED, not updated in place: balances pick the same-date
+ * valuation with the latest created_at, so a fresh insert is what makes
+ * the active controller's write win over other entries for the date.
+ * Runs inside the caller's (locked) transaction. Returns the total and
+ * the date used.
  */
 export async function syncPortfolioValuation(
   exec: Executor,
@@ -228,27 +396,24 @@ export async function syncPortfolioValuation(
     )
     .limit(1);
   if (existing) {
-    await exec
-      .update(entries)
-      .set({ amountMinor: ledgerAmount, updatedAt: new Date() })
-      .where(eq(entries.id, existing.id));
-  } else {
-    const [entry] = await exec
-      .insert(entries)
-      .values({
-        accountId: account.id,
-        date,
-        amountMinor: ledgerAmount,
-        currency: account.currency,
-        name: HOLDINGS_VALUATION_NAME,
-        externalSource: HOLDINGS_SOURCE,
-        externalId,
-        entryableType: "valuation"
-      })
-      .returning({ id: entries.id });
-    if (!entry) throw errors.conflict("Could not record the portfolio valuation.");
-    await exec.insert(valuations).values({ entryId: entry.id, kind: "current" });
+    // The valuations row is removed by the entries FK cascade.
+    await exec.delete(entries).where(eq(entries.id, existing.id));
   }
+  const [entry] = await exec
+    .insert(entries)
+    .values({
+      accountId: account.id,
+      date,
+      amountMinor: ledgerAmount,
+      currency: account.currency,
+      name: HOLDINGS_VALUATION_NAME,
+      externalSource: HOLDINGS_SOURCE,
+      externalId,
+      entryableType: "valuation"
+    })
+    .returning({ id: entries.id });
+  if (!entry) throw errors.conflict("Could not record the portfolio valuation.");
+  await exec.insert(valuations).values({ entryId: entry.id, kind: "current" });
 
   await recalculateAccount(exec, account.id, date);
   return { date, portfolioValueMinor: total, holdingsCount: rows.length };
@@ -295,21 +460,22 @@ export async function addHolding(
   }
   const averageCostMinor = assertPriceMinor(input.averageCostMinor, "Average cost");
   const currentPriceMinor = assertPriceMinor(input.currentPriceMinor, "Current price");
+  assertPriced(averageCostMinor, currentPriceMinor);
   const companyName = input.companyName?.trim() ? input.companyName.trim().slice(0, 200) : null;
 
-  const [duplicate] = await exec
-    .select({ id: portfolioHoldings.id })
-    .from(portfolioHoldings)
-    .where(and(eq(portfolioHoldings.accountId, account.id), eq(portfolioHoldings.ticker, ticker)))
-    .limit(1);
-  if (duplicate) {
-    throw errors.validation(
-      `A holding for ${ticker} already exists on this account. Edit it instead.`
-    );
-  }
-
   let holdingId = "";
-  const result = await exec.transaction(async (tx) => {
+  const result = await withHoldingsAccountLock(exec, account.id, async (tx) => {
+    await assertHoldingsActivationAllowed(tx, actor, account.id);
+    const [duplicate] = await tx
+      .select({ id: portfolioHoldings.id })
+      .from(portfolioHoldings)
+      .where(and(eq(portfolioHoldings.accountId, account.id), eq(portfolioHoldings.ticker, ticker)))
+      .limit(1);
+    if (duplicate) {
+      throw errors.validation(
+        `A holding for ${ticker} already exists on this account. Edit it instead.`
+      );
+    }
     const [row] = await tx
       .insert(portfolioHoldings)
       .values({
@@ -318,6 +484,8 @@ export async function addHolding(
         companyName,
         quantity: normalized,
         averageCostMinor,
+        // An explicitly supplied cost describes the whole new position.
+        averageCostQuantity: averageCostMinor !== null ? normalized : "0",
         currentPriceMinor
       })
       .returning({ id: portfolioHoldings.id });
@@ -365,22 +533,29 @@ export async function updateHolding(
   }
 ): Promise<HoldingMutationResult> {
   const account = await loadManagedAccount(exec, actor, input.accountId);
-  const holding = await loadHolding(exec, account.id, input.holdingId);
   const { scaled, normalized } = parseQuantity(input.quantity);
   if (scaled === 0n) {
     throw errors.validation("Quantity must be greater than zero. Delete the holding instead.");
   }
   const averageCostMinor = assertPriceMinor(input.averageCostMinor, "Average cost");
   const currentPriceMinor = assertPriceMinor(input.currentPriceMinor, "Current price");
+  assertPriced(averageCostMinor, currentPriceMinor);
   const companyName = input.companyName?.trim() ? input.companyName.trim().slice(0, 200) : null;
 
-  const result = await exec.transaction(async (tx) => {
+  let ticker = "";
+  const result = await withHoldingsAccountLock(exec, account.id, async (tx) => {
+    const holding = await loadHolding(tx, account.id, input.holdingId);
+    ticker = holding.ticker;
     await tx
       .update(portfolioHoldings)
       .set({
         companyName,
         quantity: normalized,
         averageCostMinor,
+        // An edit restates the whole position: a supplied cost applies to
+        // every share (clearing any partial-cost state); clearing the cost
+        // makes the whole position's cost unknown.
+        averageCostQuantity: averageCostMinor !== null ? normalized : "0",
         currentPriceMinor,
         updatedAt: new Date()
       })
@@ -394,7 +569,7 @@ export async function updateHolding(
     action: "holding.updated",
     entityType: "account",
     entityId: account.id,
-    metadata: { accountId: account.id, ticker: holding.ticker }
+    metadata: { accountId: account.id, ticker }
   });
 
   return { accountId: account.id, ...result };
@@ -406,9 +581,11 @@ export async function deleteHolding(
   input: { accountId: string; holdingId: string }
 ): Promise<HoldingMutationResult> {
   const account = await loadManagedAccount(exec, actor, input.accountId);
-  const holding = await loadHolding(exec, account.id, input.holdingId);
 
-  const result = await exec.transaction(async (tx) => {
+  let ticker = "";
+  const result = await withHoldingsAccountLock(exec, account.id, async (tx) => {
+    const holding = await loadHolding(tx, account.id, input.holdingId);
+    ticker = holding.ticker;
     await tx.delete(portfolioHoldings).where(eq(portfolioHoldings.id, holding.id));
     return syncPortfolioValuation(tx, actor, account);
   });
@@ -419,7 +596,7 @@ export async function deleteHolding(
     action: "holding.deleted",
     entityType: "account",
     entityId: account.id,
-    metadata: { accountId: account.id, ticker: holding.ticker }
+    metadata: { accountId: account.id, ticker }
   });
 
   return { accountId: account.id, ...result };
@@ -428,11 +605,17 @@ export async function deleteHolding(
 /**
  * Record a buy or sell against a holding, creating it on a first buy.
  *
- * Buy: the average cost becomes the quantity-weighted average of the
- * existing position and the new shares at the trade price; when the
- * existing average cost is unknown, the trade price becomes the average.
- * Sell: the quantity decreases and the per-share average cost is unchanged;
- * selling the entire position removes the holding (`removed: true`).
+ * Buy: the bought shares join the cost-known portion of the position at
+ * the trade price — the average cost becomes the quantity-weighted
+ * average over the known portion (existing known shares at their average
+ * plus the new shares at the trade price). Shares whose cost was never
+ * recorded stay unknown: buying never fabricates a cost for them. A buy
+ * into a brand-new position seeds its cost (and current price) from the
+ * trade price.
+ * Sell: the quantity decreases, consuming the cost-unknown portion first
+ * so documented cost survives longest; the per-share average cost of the
+ * remaining known portion is unchanged. Selling the entire position
+ * removes the holding (`removed: true`).
  * A trade never changes the stored current price, except that a holding
  * created by a buy starts with the trade price as its current price.
  */
@@ -455,39 +638,45 @@ export async function adjustHolding(
   const priceMinor = assertPriceMinor(input.priceMinor, "Price");
   if (priceMinor === null) throw errors.validation("Enter the trade price.");
 
-  const [existing] = await exec
-    .select()
-    .from(portfolioHoldings)
-    .where(and(eq(portfolioHoldings.accountId, account.id), eq(portfolioHoldings.ticker, ticker)))
-    .limit(1);
-
   let removed = false;
-  const result = await exec.transaction(async (tx) => {
+  const result = await withHoldingsAccountLock(exec, account.id, async (tx) => {
+    const [existing] = await tx
+      .select()
+      .from(portfolioHoldings)
+      .where(and(eq(portfolioHoldings.accountId, account.id), eq(portfolioHoldings.ticker, ticker)))
+      .limit(1);
+
     if (input.side === "buy") {
       if (!existing) {
+        await assertHoldingsActivationAllowed(tx, actor, account.id);
         await tx.insert(portfolioHoldings).values({
           accountId: account.id,
           ticker,
           companyName: null,
           quantity: formatQuantity(tradeScaled),
           averageCostMinor: priceMinor,
+          averageCostQuantity: formatQuantity(tradeScaled),
           currentPriceMinor: priceMinor
         });
       } else {
         const { scaled: heldScaled } = parseQuantity(existing.quantity);
-        const newScaled = heldScaled + tradeScaled;
-        const averageCostMinor =
-          existing.averageCostMinor === null
-            ? priceMinor
-            : Number(
-                (heldScaled * BigInt(existing.averageCostMinor) +
-                  tradeScaled * BigInt(priceMinor) +
-                  newScaled / 2n) /
-                  newScaled
-              );
+        const knownScaled = knownCostScaled(existing);
+        const newKnownScaled = knownScaled + tradeScaled;
+        const previousAverage = existing.averageCostMinor ?? 0;
+        const averageCostMinor = Number(
+          (knownScaled * BigInt(previousAverage) +
+            tradeScaled * BigInt(priceMinor) +
+            newKnownScaled / 2n) /
+            newKnownScaled
+        );
         await tx
           .update(portfolioHoldings)
-          .set({ quantity: formatQuantity(newScaled), averageCostMinor, updatedAt: new Date() })
+          .set({
+            quantity: formatQuantity(heldScaled + tradeScaled),
+            averageCostMinor,
+            averageCostQuantity: formatQuantity(newKnownScaled),
+            updatedAt: new Date()
+          })
           .where(eq(portfolioHoldings.id, existing.id));
       }
     } else {
@@ -504,9 +693,18 @@ export async function adjustHolding(
         await tx.delete(portfolioHoldings).where(eq(portfolioHoldings.id, existing.id));
         removed = true;
       } else {
+        const knownScaled = knownCostScaled(existing);
+        const unknownScaled = heldScaled - knownScaled;
+        const fromUnknown = tradeScaled < unknownScaled ? tradeScaled : unknownScaled;
+        const newKnownScaled = knownScaled - (tradeScaled - fromUnknown);
         await tx
           .update(portfolioHoldings)
-          .set({ quantity: formatQuantity(heldScaled - tradeScaled), updatedAt: new Date() })
+          .set({
+            quantity: formatQuantity(heldScaled - tradeScaled),
+            averageCostMinor: newKnownScaled === 0n ? null : existing.averageCostMinor,
+            averageCostQuantity: formatQuantity(newKnownScaled),
+            updatedAt: new Date()
+          })
           .where(eq(portfolioHoldings.id, existing.id));
       }
     }

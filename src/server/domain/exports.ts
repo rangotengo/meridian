@@ -163,6 +163,7 @@ export async function buildFamilyExport(exec: Executor, actor: Actor): Promise<F
         companyName: portfolioHoldings.companyName,
         quantity: portfolioHoldings.quantity,
         averageCostMinor: portfolioHoldings.averageCostMinor,
+        averageCostQuantity: portfolioHoldings.averageCostQuantity,
         currentPriceMinor: portfolioHoldings.currentPriceMinor
       })
       .from(portfolioHoldings)
@@ -313,6 +314,7 @@ export type ExportedHolding = {
   companyName: string | null;
   quantity: string;
   averageCostMinor: number | null;
+  averageCostQuantity: string;
   currentPriceMinor: number | null;
 };
 

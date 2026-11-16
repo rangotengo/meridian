@@ -12,6 +12,7 @@ import migration9 from "../../../../db/cloud-migrations/0010_mcp_oauth.up.sql";
 import migration10 from "../../../../db/cloud-migrations/0011_oauth_authorization_requests.up.sql";
 import migration11 from "../../../../db/cloud-migrations/0012_oauth_family_invalidation.up.sql";
 import migration12 from "../../../../db/cloud-migrations/0013_portfolio_holdings.up.sql";
+import migration13 from "../../../../db/cloud-migrations/0014_holding_cost_quantity.up.sql";
 
 export const cloudMigrations = [
   { name: "0001_init", sql: migration0 },
@@ -26,5 +27,6 @@ export const cloudMigrations = [
   { name: "0010_mcp_oauth", sql: migration9 },
   { name: "0011_oauth_authorization_requests", sql: migration10 },
   { name: "0012_oauth_family_invalidation", sql: migration11 },
-  { name: "0013_portfolio_holdings", sql: migration12 }
+  { name: "0013_portfolio_holdings", sql: migration12 },
+  { name: "0014_holding_cost_quantity", sql: migration13 }
 ];

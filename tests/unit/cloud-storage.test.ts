@@ -64,6 +64,18 @@ describe("Cloudflare SQLite storage", () => {
       deletedEntryAbsent: true
     });
   });
+  it("runs manual holdings with serialized buys and honest cost provenance in cloud DO", async () => {
+    expect(await probe("holdings")).toEqual({
+      quantity: "103",
+      averageCostMinor: 200,
+      averageCostQuantity: "3",
+      partialCost: true,
+      totalCostMinor: 600,
+      balance: 51500,
+      valuationRejected: true,
+      unpriceableRejected: true
+    });
+  });
   it("does not expose uncommitted writes to concurrent readers", async () => {
     expect(await probe("concurrency")).toEqual({ observed: "original" });
   });
