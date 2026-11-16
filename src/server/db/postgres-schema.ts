@@ -256,7 +256,14 @@ export const entries = pgTable(
     externalId: text("external_id"),
     entryableType: text("entryable_type").notNull(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow()
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+    // Sequence-backed insertion order (migration 0014): the final
+    // tiebreaker when balances order same-date valuations by created_at.
+    // The cloud schema has no equivalent column — the balance engine
+    // tie-breaks by SQLite's rowid there instead.
+    writeSeq: bigint("write_seq", { mode: "number" })
+      .notNull()
+      .default(sql`nextval('entries_write_seq')`)
   },
   (t) => [
     index("entries_account_date_idx").on(t.accountId, t.date, t.id),

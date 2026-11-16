@@ -1,6 +1,6 @@
 import { and, asc, eq, gt, isNull, ne, or, sql } from "drizzle-orm";
 import type { Executor } from "../db/client";
-import { usesCloudStorage } from "../db/dialect";
+import { statementTimestamp, usesCloudStorage } from "../db/dialect";
 import {
   accounts,
   entries,
@@ -47,24 +47,50 @@ import { recalculateAccount } from "./balances";
  * ordering to violate.
  *
  * Same-day valuation precedence: balances resolve competing valuations
- * for one date by (date, created_at) — the latest write wins. The
- * holdings sync therefore REPLACES its daily entry instead of updating it
- * in place, so (re)activation of holdings management — including the
- * zero-value write when the last holding is removed — always outranks
- * manual entries written earlier that day, and a manual valuation
- * recorded while holdings are inactive (a fresh insert) equally outranks
- * a stale holdings entry. Valuation history before today is never
- * touched. A manual valuation dated in the FUTURE is the one case
- * ordering cannot settle (it would silently take over when its date
- * arrives), so entering holdings management while one exists is rejected
- * until it is removed or re-dated.
+ * for one date by write order — (date, created_at, insertion order) —
+ * the latest write wins. Two properties make "latest" mean the actual
+ * last writer rather than an accident of timing. First, every valuation
+ * writer (this sync, recordValuation, the MeroShare sync) stamps
+ * created_at EXPLICITLY at statement-execution time (see
+ * statementTimestamp in db/dialect): the column default is the
+ * transaction's start time, so a writer whose transaction began before
+ * it acquired the account lock would otherwise be stamped earlier than
+ * a competitor that committed in the meantime, and lose despite writing
+ * last. Second, the balance engine breaks exact timestamp ties by a
+ * monotonic insertion-order key (a sequence on PostgreSQL, rowid on
+ * SQLite), allocated when each INSERT executes — under the lock, that
+ * is lock order. The holdings sync also REPLACES its daily entry
+ * instead of updating it in place, so (re)activation of holdings
+ * management — including the zero-value write when the last holding is
+ * removed — always outranks manual entries written earlier that day,
+ * and a manual valuation recorded while holdings are inactive (a fresh
+ * insert) equally outranks a stale holdings entry. Valuation history
+ * before today is never touched. A manual valuation dated in the
+ * FUTURE is the one case ordering cannot settle (it would silently
+ * take over when its date arrives), so entering holdings management
+ * while one exists is rejected until it is removed or re-dated.
  *
  * Cost provenance: averageCostMinor is a per-share average that applies
  * to averageCostQuantity shares of the position, not necessarily all of
  * them. Shares acquired without a recorded cost (a buy into a position
  * whose cost was unknown) grow only the known portion; summaries cost
  * and gain only the known portion and report the position as partial
- * until the user explicitly supplies a whole-position cost.
+ * until the user explicitly supplies a whole-position cost (a CSV cost,
+ * or an edit that asserts the cost covers all shares — a plain edit
+ * never promotes a partial cost on its own).
+ *
+ * Priceability: a position's value may only be stated without inventing
+ * numbers when it has a current price, or an average cost covering the
+ * FULL quantity (the fallback values every share at that cost). A
+ * partial average is never extrapolated across shares it does not
+ * cover, and a position with neither price has no value at all. Every
+ * mutation validates the priceability of the account's resulting
+ * positions centrally in syncPortfolioValuation before a valuation is
+ * published, so no path — including a trade against a legacy restored
+ * position that was never priced — can publish a fabricated value.
+ * Positions that are not priceable can still exist (a restore keeps
+ * them); read paths exclude them from totals and flag the value as
+ * incomplete instead of writing anything.
  *
  * All quantity math is exact: quantities are decimal strings with up to 6
  * decimal places, scaled to integers (×10^6) and multiplied with BigInt, so
@@ -132,18 +158,35 @@ function assertPriceMinor(value: number | null | undefined, field: string): numb
   return value;
 }
 
+/** The price-bearing shape of a position, stored or about to be written. */
+export type PositionPricing = {
+  ticker: string;
+  quantity: string;
+  averageCostMinor: number | null;
+  averageCostQuantity: string;
+  currentPriceMinor: number | null;
+};
+
 /**
- * A position must carry at least one usable price: with neither a current
- * price nor an average cost its value would silently compute as zero and
- * replace a known balance. An explicit price of 0 is a real price and is
- * allowed — only absence is rejected.
+ * A position is PRICEABLE when its value can be stated without inventing
+ * numbers: it has a current price, or an average cost that covers the
+ * FULL quantity (the value fallback then prices every share at that
+ * cost). A partial average must never be extrapolated across the shares
+ * it does not cover, and a position with neither price has no value at
+ * all. An explicit price of 0 is a real price — only absence, or partial
+ * coverage without a current price, makes a position unpriceable.
  */
-function assertPriced(averageCostMinor: number | null, currentPriceMinor: number | null): void {
-  if (averageCostMinor === null && currentPriceMinor === null) {
-    throw errors.validation(
-      "Enter a current price or an average cost — a holding needs at least one price so its value is known."
-    );
-  }
+export function isPositionPriceable(row: PositionPricing): boolean {
+  if (row.currentPriceMinor !== null) return true;
+  if (row.averageCostMinor === null) return false;
+  return knownCostScaled(row) >= parseQuantity(row.quantity).scaled;
+}
+
+function assertPositionPriceable(row: PositionPricing): void {
+  if (isPositionPriceable(row)) return;
+  throw errors.validation(
+    `${row.ticker} has no usable price: set a current price, or supply an average cost that covers all ${row.quantity} shares. The portfolio value is only updated when every holding is priced.`
+  );
 }
 
 /** Σ quantity × price over rows, in minor units, rounded per holding. */
@@ -162,7 +205,11 @@ export function holdingValueMinor(quantityScaled: bigint, priceMinor: number): n
  * the cost itself is unknown, otherwise the recorded cost quantity clamped
  * to the position size.
  */
-export function knownCostScaled(row: PortfolioHoldingRow): bigint {
+export function knownCostScaled(row: {
+  quantity: string;
+  averageCostMinor: number | null;
+  averageCostQuantity: string;
+}): bigint {
   if (row.averageCostMinor === null) return 0n;
   const { scaled } = parseQuantity(row.quantity);
   const known = parseQuantity(row.averageCostQuantity).scaled;
@@ -175,6 +222,13 @@ export type HoldingsSummary = {
   totalCostMinor: number | null;
   /** True when part of any position has no known cost, so the cost total is partial. */
   partialCost: boolean;
+  /**
+   * False when at least one position is not priceable (see
+   * isPositionPriceable): totalValueMinor then covers only the priced
+   * positions and must be presented as incomplete, never as the
+   * portfolio's full value.
+   */
+  valueComplete: boolean;
   /** Gain over the cost-known portions only; null when no cost is known. */
   unrealizedGainMinor: number | null;
   unrealizedGainPercent: number | null;
@@ -185,16 +239,24 @@ export function summarizeHoldings(rows: PortfolioHoldingRow[]): HoldingsSummary 
   let totalCostMinor: number | null = null;
   let coveredValueMinor = 0;
   let partialCost = false;
+  let valueComplete = true;
   for (const row of rows) {
     const { scaled } = parseQuantity(row.quantity);
-    const unitPrice = row.currentPriceMinor ?? row.averageCostMinor ?? 0;
-    const value = holdingValueMinor(scaled, unitPrice);
-    totalValueMinor += value;
     const known = knownCostScaled(row);
     if (scaled > 0n && known < scaled) partialCost = true;
+    if (isPositionPriceable(row)) {
+      // Priceable guarantees one of the two prices exists; the average
+      // is only used when it covers the full quantity.
+      const unitPrice = row.currentPriceMinor ?? row.averageCostMinor ?? 0;
+      totalValueMinor += holdingValueMinor(scaled, unitPrice);
+    } else {
+      // No honest value exists for this position (reachable via legacy
+      // restored data): contribute nothing and flag the total.
+      valueComplete = false;
+    }
     if (row.averageCostMinor === null || known === 0n) continue;
     totalCostMinor = (totalCostMinor ?? 0) + holdingValueMinor(known, row.averageCostMinor);
-    coveredValueMinor += holdingValueMinor(known, unitPrice);
+    coveredValueMinor += holdingValueMinor(known, row.currentPriceMinor ?? row.averageCostMinor);
   }
   const unrealizedGainMinor = totalCostMinor === null ? null : coveredValueMinor - totalCostMinor;
   const unrealizedGainPercent =
@@ -205,6 +267,7 @@ export function summarizeHoldings(rows: PortfolioHoldingRow[]): HoldingsSummary 
     totalValueMinor,
     totalCostMinor,
     partialCost,
+    valueComplete,
     unrealizedGainMinor,
     unrealizedGainPercent
   };
@@ -365,8 +428,17 @@ async function familyToday(exec: Executor, familyId: string): Promise<string> {
  * as today's valuation entry (one holdings valuation per day), then
  * recalculate balances from today. The previous holdings entry for the
  * date is REPLACED, not updated in place: balances pick the same-date
- * valuation with the latest created_at, so a fresh insert is what makes
- * the active controller's write win over other entries for the date.
+ * valuation by write order, so a fresh insert — stamped at
+ * statement-execution time, under the account lock — is what makes the
+ * active controller's write win over other entries for the date.
+ *
+ * This is also the central priceability gate: EVERY holdings mutation
+ * ends here, so before anything is published, every resulting position
+ * must be priceable (see isPositionPriceable). A mutation whose end
+ * state contains an unpriceable position is rejected and rolls back —
+ * including a trade against a legacy restored position that was never
+ * priced. An empty portfolio is priceable and publishes 0.
+ *
  * Runs inside the caller's (locked) transaction. Returns the total and
  * the date used.
  */
@@ -378,7 +450,9 @@ export async function syncPortfolioValuation(
   const rows = await exec
     .select()
     .from(portfolioHoldings)
-    .where(eq(portfolioHoldings.accountId, account.id));
+    .where(eq(portfolioHoldings.accountId, account.id))
+    .orderBy(asc(portfolioHoldings.ticker));
+  for (const row of rows) assertPositionPriceable(row);
   const total = summarizeHoldings(rows).totalValueMinor;
   const date = await familyToday(exec, actor.familyId);
   const ledgerAmount = displayToLedgerBalance(total, account.type);
@@ -409,7 +483,10 @@ export async function syncPortfolioValuation(
       name: HOLDINGS_VALUATION_NAME,
       externalSource: HOLDINGS_SOURCE,
       externalId,
-      entryableType: "valuation"
+      entryableType: "valuation",
+      // Stamped at statement-execution time (after the account lock was
+      // acquired), not the transaction-start default — see the header.
+      createdAt: statementTimestamp()
     })
     .returning({ id: entries.id });
   if (!entry) throw errors.conflict("Could not record the portfolio valuation.");
@@ -460,7 +537,15 @@ export async function addHolding(
   }
   const averageCostMinor = assertPriceMinor(input.averageCostMinor, "Average cost");
   const currentPriceMinor = assertPriceMinor(input.currentPriceMinor, "Current price");
-  assertPriced(averageCostMinor, currentPriceMinor);
+  // A new position's supplied cost covers its whole initial quantity, so
+  // priceability here reduces to "at least one price present".
+  assertPositionPriceable({
+    ticker,
+    quantity: normalized,
+    averageCostMinor,
+    averageCostQuantity: averageCostMinor !== null ? normalized : "0",
+    currentPriceMinor
+  });
   const companyName = input.companyName?.trim() ? input.companyName.trim().slice(0, 200) : null;
 
   let holdingId = "";
@@ -530,6 +615,21 @@ export async function updateHolding(
     quantity: string;
     averageCostMinor?: number | null;
     currentPriceMinor?: number | null;
+    /**
+     * Explicit assertion that the supplied average cost covers EVERY
+     * share of the position. Without it, an edit PRESERVES cost
+     * provenance: the supplied average re-prices only the previously
+     * known portion, and the known quantity stays as stored (clamped
+     * down if the edit shrinks the position below it; shares added by a
+     * quantity increase are cost-unknown). This matters because the
+     * edit form prefills the stored average — resubmitting it unchanged
+     * (a price-only or name-only edit) must not silently promote a
+     * partial cost to full coverage. When the stored cost is unknown
+     * (known portion zero), a cost supplied without the assertion is
+     * recorded but applies to zero shares until coverage is asserted;
+     * the form's copy says so next to the checkbox that sets this flag.
+     */
+    costCoversAllShares?: boolean;
   }
 ): Promise<HoldingMutationResult> {
   const account = await loadManagedAccount(exec, actor, input.accountId);
@@ -539,23 +639,39 @@ export async function updateHolding(
   }
   const averageCostMinor = assertPriceMinor(input.averageCostMinor, "Average cost");
   const currentPriceMinor = assertPriceMinor(input.currentPriceMinor, "Current price");
-  assertPriced(averageCostMinor, currentPriceMinor);
   const companyName = input.companyName?.trim() ? input.companyName.trim().slice(0, 200) : null;
 
   let ticker = "";
   const result = await withHoldingsAccountLock(exec, account.id, async (tx) => {
     const holding = await loadHolding(tx, account.id, input.holdingId);
     ticker = holding.ticker;
+    let averageCostQuantity: string;
+    if (averageCostMinor === null) {
+      // Clearing the cost makes the whole position's cost unknown.
+      averageCostQuantity = "0";
+    } else if (input.costCoversAllShares) {
+      averageCostQuantity = normalized;
+    } else {
+      const known = knownCostScaled(holding);
+      averageCostQuantity = formatQuantity(known > scaled ? scaled : known);
+    }
+    // The resulting position must be priceable (the sync re-checks the
+    // whole account centrally; checking here names this holding before
+    // anything is written).
+    assertPositionPriceable({
+      ticker: holding.ticker,
+      quantity: normalized,
+      averageCostMinor,
+      averageCostQuantity,
+      currentPriceMinor
+    });
     await tx
       .update(portfolioHoldings)
       .set({
         companyName,
         quantity: normalized,
         averageCostMinor,
-        // An edit restates the whole position: a supplied cost applies to
-        // every share (clearing any partial-cost state); clearing the cost
-        // makes the whole position's cost unknown.
-        averageCostQuantity: averageCostMinor !== null ? normalized : "0",
+        averageCostQuantity,
         currentPriceMinor,
         updatedAt: new Date()
       })

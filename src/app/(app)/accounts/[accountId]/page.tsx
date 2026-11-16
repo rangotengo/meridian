@@ -11,6 +11,7 @@ import { fmtDate } from "@/lib/format";
 import { ledgerToDisplayBalance, minorToDecimal } from "@/lib/money";
 import {
   holdingValueMinor,
+  isPositionPriceable,
   knownCostScaled,
   listHoldings,
   parseQuantity,
@@ -52,7 +53,11 @@ export default async function AccountDetailPage({
   const holdingViews: HoldingView[] = holdingRows.map((row) => {
     const { scaled } = parseQuantity(row.quantity);
     const unitPrice = row.currentPriceMinor ?? row.averageCostMinor ?? 0;
-    const valueMinor = holdingValueMinor(scaled, unitPrice);
+    // A position that is not priceable (no current price and no
+    // full-coverage average cost — reachable via legacy restored data)
+    // has no honest value or gain to show; a partial average is never
+    // extrapolated across the whole position.
+    const priceable = isPositionPriceable(row);
     // Gain/loss covers only the cost-known portion of the position; a
     // position with no known cost has no honest gain to show.
     const known = knownCostScaled(row);
@@ -62,10 +67,11 @@ export default async function AccountDetailPage({
       companyName: row.companyName,
       quantity: row.quantity,
       averageCostMinor: row.averageCostMinor,
+      averageCostQuantity: row.averageCostQuantity,
       currentPriceMinor: row.currentPriceMinor,
-      valueMinor,
+      valueMinor: priceable ? holdingValueMinor(scaled, unitPrice) : null,
       gainMinor:
-        row.averageCostMinor === null || known === 0n
+        !priceable || row.averageCostMinor === null || known === 0n
           ? null
           : holdingValueMinor(known, unitPrice) - holdingValueMinor(known, row.averageCostMinor)
     };

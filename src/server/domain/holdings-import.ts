@@ -8,6 +8,7 @@ import { recordAudit } from "../observability/audit";
 import {
   assertHoldingsActivationAllowed,
   formatQuantity,
+  isPositionPriceable,
   knownCostScaled,
   loadManagedAccount,
   normalizeTicker,
@@ -29,11 +30,14 @@ import {
  *
  * Price columns are presence-aware on update: an OMITTED column leaves
  * the stored price untouched, while a present-but-blank cell explicitly
- * clears that price to unknown. A row whose result would leave a holding
- * with neither price is an error (a holding needs at least one price) —
- * the stored holding, if any, is left unchanged. A supplied average cost
- * describes the row's whole quantity; a sparse row that omits the cost
- * column keeps the stored cost provenance, clamped to the new quantity.
+ * clears that price to unknown. A row whose result would leave the
+ * holding without a usable price is an error — no current price and no
+ * full-coverage average cost (see isPositionPriceable in holdings.ts);
+ * e.g. clearing the current price of a position whose average cost
+ * covers only some shares. The stored holding, if any, is left
+ * unchanged. A supplied average cost describes the row's whole quantity;
+ * a sparse row that omits the cost column keeps the stored cost
+ * provenance, clamped to the new quantity.
  *
  * Rows are upserted by (account, ticker). A row that fails validation is
  * skipped and reported with its row number (the header is row 1); valid
@@ -207,7 +211,7 @@ export function parseHoldingsCsv(csvText: string, currency: string): HoldingsCsv
 }
 
 const NO_PRICE_MESSAGE =
-  "A holding needs at least one price; this row would leave it with neither an average cost nor a current price.";
+  "This row would leave the holding without a usable price — it needs a current price, or an average cost that covers all its shares. The stored holding was left unchanged.";
 
 export async function importHoldingsCsv(
   exec: Executor,
@@ -247,7 +251,16 @@ export async function importHoldingsCsv(
       } else {
         const averageCostMinor = row.averageCostSet ? row.averageCostMinor : null;
         const currentPriceMinor = row.currentPriceSet ? row.currentPriceMinor : null;
-        if (averageCostMinor === null && currentPriceMinor === null) {
+        const averageCostQuantity = averageCostMinor !== null ? row.quantity : "0";
+        if (
+          !isPositionPriceable({
+            ticker: row.ticker,
+            quantity: row.quantity,
+            averageCostMinor,
+            averageCostQuantity,
+            currentPriceMinor
+          })
+        ) {
           applyErrors.push({ row: row.row, message: NO_PRICE_MESSAGE });
           continue;
         }
@@ -257,7 +270,7 @@ export async function importHoldingsCsv(
           companyName: row.companyName,
           quantity: row.quantity,
           averageCostMinor,
-          averageCostQuantity: averageCostMinor !== null ? row.quantity : "0",
+          averageCostQuantity,
           currentPriceMinor
         });
         created++;
@@ -283,7 +296,9 @@ export async function importHoldingsCsv(
  * Merges a CSV row into a stored holding under the presence rules: a
  * dictated field (column present) replaces the stored value, including an
  * explicit clear; an omitted field preserves it. Returns null when the
- * merge would leave the holding with neither price.
+ * merged holding would not be priceable (no current price and no
+ * full-coverage average cost) — the caller reports a row error and the
+ * stored holding is left unchanged.
  */
 function mergeRowIntoExisting(
   existing: PortfolioHoldingRow,
@@ -299,7 +314,6 @@ function mergeRowIntoExisting(
   const currentPriceMinor = row.currentPriceSet
     ? row.currentPriceMinor
     : existing.currentPriceMinor;
-  if (averageCostMinor === null && currentPriceMinor === null) return null;
 
   let averageCostQuantity: string;
   if (row.averageCostSet) {
@@ -315,11 +329,13 @@ function mergeRowIntoExisting(
     const { scaled } = parseQuantity(row.quantity);
     averageCostQuantity = formatQuantity(known > scaled ? scaled : known);
   }
-  return {
+  const merged = {
     companyName: row.companyName ?? existing.companyName,
     quantity: row.quantity,
     averageCostMinor,
     averageCostQuantity,
     currentPriceMinor
   };
+  if (!isPositionPriceable({ ticker: existing.ticker, ...merged })) return null;
+  return merged;
 }

@@ -1,5 +1,6 @@
 import { eq } from "drizzle-orm";
 import type { Executor } from "../db/client";
+import { statementTimestamp } from "../db/dialect";
 import { accounts, entries, valuations } from "../db/schema";
 import type { Actor } from "../auth/context";
 import { assertAccountAccessLevel, assertAccountOpen } from "../authorization/access";
@@ -72,7 +73,12 @@ export async function recordValuation(
         amountMinor: ledgerAmount,
         currency: account.currency,
         name,
-        entryableType: "valuation"
+        entryableType: "valuation",
+        // Same-day precedence is write order: stamp the entry at
+        // statement-execution time (after the account lock above), not
+        // with the column default, which is the transaction's start
+        // time and could predate a competitor that already committed.
+        createdAt: statementTimestamp()
       })
       .returning({ id: entries.id });
     const entryId = entry?.id;

@@ -520,7 +520,10 @@ describe("finding 4: unknown cost stays unknown after a buy", () => {
       holdingId: rows[0]!.id,
       quantity: "101",
       averageCostMinor: 300,
-      currentPriceMinor: 500
+      currentPriceMinor: 500,
+      // Since round 2 (finding B), whole-position coverage requires the
+      // explicit assertion; a bare edit preserves provenance instead.
+      costCoversAllShares: true
     });
     const after = await holdingsSvc.listHoldings(db(), actor, accountId);
     expect(after[0]).toMatchObject({ averageCostMinor: 300, averageCostQuantity: "101" });
@@ -574,7 +577,7 @@ describe("finding 5: an unpriceable position cannot publish a zero valuation", (
         averageCostMinor: null,
         currentPriceMinor: null
       })
-    ).rejects.toThrow(/at least one price/);
+    ).rejects.toThrow(/no usable price/);
     expect(await holdingsSvc.listHoldings(db(), actor, accountId)).toHaveLength(0);
     expect(await balance(accountId)).toBe(50_000);
 
@@ -609,7 +612,7 @@ describe("finding 5: an unpriceable position cannot publish a zero valuation", (
         averageCostMinor: null,
         currentPriceMinor: null
       })
-    ).rejects.toThrow(/at least one price/);
+    ).rejects.toThrow(/no usable price/);
     const rows = await holdingsSvc.listHoldings(db(), actor, accountId);
     expect(rows[0]).toMatchObject({ averageCostMinor: 100_00 });
 

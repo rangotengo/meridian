@@ -3,6 +3,7 @@ import { parseHoldingsCsv } from "@/server/domain/holdings-import";
 import {
   formatQuantity,
   holdingValueMinor,
+  isPositionPriceable,
   parseQuantity,
   summarizeHoldings
 } from "@/server/domain/holdings";
@@ -99,6 +100,63 @@ describe("summarizeHoldings", () => {
     ]);
     expect(summary.totalValueMinor).toBe(100_000);
     expect(summary.unrealizedGainMinor).toBe(0);
+    expect(summary.valueComplete).toBe(true);
+  });
+
+  it("never extrapolates a partial average: an unpriceable position is excluded and flagged", () => {
+    const summary = summarizeHoldings([
+      // 101 shares whose average covers ONE share, and no current price:
+      // valuing all 101 at that average would fabricate the total.
+      row({
+        ticker: "A",
+        quantity: "101",
+        averageCostMinor: 200,
+        averageCostQuantity: "1",
+        currentPriceMinor: null
+      }),
+      row({ ticker: "B", quantity: "10", averageCostMinor: null, currentPriceMinor: 50_00 })
+    ]);
+    expect(summary.valueComplete).toBe(false);
+    expect(summary.totalValueMinor).toBe(50_000);
+    expect(summary.partialCost).toBe(true);
+  });
+
+  it("flags a position with neither price as making the value incomplete", () => {
+    const summary = summarizeHoldings([row({ quantity: "10" })]);
+    expect(summary.valueComplete).toBe(false);
+    expect(summary.totalValueMinor).toBe(0);
+  });
+});
+
+describe("isPositionPriceable", () => {
+  const base = {
+    ticker: "X",
+    quantity: "10",
+    averageCostMinor: null,
+    averageCostQuantity: "0",
+    currentPriceMinor: null
+  };
+
+  it("requires a current price or a full-coverage average cost", () => {
+    expect(isPositionPriceable(base)).toBe(false);
+    expect(isPositionPriceable({ ...base, currentPriceMinor: 100 })).toBe(true);
+    // An explicit zero is a real price.
+    expect(isPositionPriceable({ ...base, currentPriceMinor: 0 })).toBe(true);
+    expect(isPositionPriceable({ ...base, averageCostMinor: 100, averageCostQuantity: "10" })).toBe(
+      true
+    );
+    expect(isPositionPriceable({ ...base, averageCostMinor: 100, averageCostQuantity: "9" })).toBe(
+      false
+    );
+    // A partial average is fine when a current price exists.
+    expect(
+      isPositionPriceable({
+        ...base,
+        averageCostMinor: 100,
+        averageCostQuantity: "9",
+        currentPriceMinor: 100
+      })
+    ).toBe(true);
   });
 });
 

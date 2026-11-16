@@ -393,7 +393,10 @@ const updateHoldingSchema = z.object({
   companyName: z.string().optional(),
   quantity: z.string().min(1),
   averageCost: z.string().optional(),
-  currentPrice: z.string().optional()
+  currentPrice: z.string().optional(),
+  // Present (value "true") only when the user checks "Apply this average
+  // cost to all shares" on a partial-cost position.
+  costCoversAllShares: z.string().optional()
 });
 
 export async function updateHoldingAction(
@@ -414,7 +417,8 @@ export async function updateHoldingAction(
         companyName: optionalString(input.companyName),
         quantity: input.quantity,
         averageCostMinor: optionalPriceMinor(input.averageCost, currency),
-        currentPriceMinor: optionalPriceMinor(input.currentPrice, currency)
+        currentPriceMinor: optionalPriceMinor(input.currentPrice, currency),
+        costCoversAllShares: input.costCoversAllShares === "true"
       })
     );
     revalidatePath(`/accounts/${input.accountId}`);

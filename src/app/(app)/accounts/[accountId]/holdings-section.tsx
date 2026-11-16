@@ -22,8 +22,11 @@ export type HoldingView = {
   companyName: string | null;
   quantity: string;
   averageCostMinor: number | null;
+  /** The quantity the average cost is known for; less than quantity means partial cost. */
+  averageCostQuantity: string;
   currentPriceMinor: number | null;
-  valueMinor: number;
+  /** Null when the position has no usable price, so no honest value exists. */
+  valueMinor: number | null;
   gainMinor: number | null;
 };
 
@@ -125,6 +128,12 @@ export function HoldingsSection({
               only the holdings with known cost.
             </p>
           ) : null}
+          {!summary.valueComplete ? (
+            <p className="mb-3 text-xs text-muted-foreground">
+              Some holdings have no usable price, so the total value covers only the priced
+              holdings.
+            </p>
+          ) : null}
 
           <div className="overflow-x-auto">
             <table className="w-full min-w-[640px] text-sm">
@@ -180,7 +189,11 @@ export function HoldingsSection({
                       )}
                     </td>
                     <td className="py-2.5 text-right">
-                      <Amount minor={h.valueMinor} currency={currency} masked={masked} />
+                      {h.valueMinor === null ? (
+                        <span className="text-muted-foreground">—</span>
+                      ) : (
+                        <Amount minor={h.valueMinor} currency={currency} masked={masked} />
+                      )}
                     </td>
                     <td className="py-2.5 text-right">
                       {h.gainMinor === null ? (
@@ -373,6 +386,11 @@ function EditHoldingForm({
 }) {
   const [state, action] = useActionState(updateHoldingAction, undefined);
   const prefix = `holding-edit-${holding.id}`;
+  // The stored average may cover only part of the position (e.g. shares
+  // bought before any cost was recorded). The prefilled average is then
+  // NOT a whole-position figure: say so, and only extend it to every
+  // share when the user explicitly asserts that it applies to all.
+  const costIsPartial = Number(holding.averageCostQuantity) < Number(holding.quantity);
   return (
     <form action={action} className="grid gap-4">
       <input type="hidden" name="accountId" value={accountId} />
@@ -401,6 +419,19 @@ function EditHoldingForm({
         currentPriceMinor={holding.currentPriceMinor}
         idPrefix={prefix}
       />
+      {costIsPartial ? (
+        <div className="grid gap-2">
+          <p className="text-xs text-muted-foreground">
+            Average cost is known for {holding.averageCostQuantity} of {holding.quantity} shares.
+            Editing the average cost applies to those shares only, unless you apply it to all
+            shares.
+          </p>
+          <label className="flex items-center gap-2 text-sm">
+            <input type="checkbox" name="costCoversAllShares" value="true" className="h-4 w-4" />
+            Apply this average cost to all shares
+          </label>
+        </div>
+      ) : null}
       <FormButtons submitLabel="Save holding" saved={state?.ok === true} />
     </form>
   );
