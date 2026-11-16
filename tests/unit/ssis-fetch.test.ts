@@ -131,3 +131,18 @@ describe("SSIS fetch envelope validation", () => {
     expect(JSON.stringify(result)).not.toContain(BO);
   });
 });
+
+it("does not count a NAV that domain extraction cannot represent", async () => {
+  const result = await fetchSsisSnapshot(
+    BO,
+    stubUpstream({
+      purchasesBody: APP_ERROR_BODY,
+      statementBody: APP_ERROR_BODY,
+      wpBody: APP_ERROR_BODY,
+      navBody: { ResponseData: [{ nav_value: "9007199254740992", nav_date: "2026-11-16" }] }
+    })
+  );
+  expect(result.payload).toBeNull();
+  expect(result.fetched.hasNavData).toBe(false);
+  expect(result.warnings).toHaveLength(4);
+});

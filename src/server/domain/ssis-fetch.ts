@@ -162,7 +162,12 @@ function assertValidNavData(body: unknown): void {
   if (!isRecord(first)) throw new Error("Upstream returned no valid NAV.");
   const navMinor = navMinorOf(first.nav_value);
   const navDate = typeof first.nav_date === "string" ? first.nav_date.trim().slice(0, 10) : "";
-  if (navMinor === null || navMinor < 0n || !isIsoDate(navDate)) {
+  if (
+    navMinor === null ||
+    navMinor < 0n ||
+    navMinor > BigInt(Number.MAX_SAFE_INTEGER) ||
+    !isIsoDate(navDate)
+  ) {
     throw new Error("Upstream returned no valid NAV.");
   }
 }
