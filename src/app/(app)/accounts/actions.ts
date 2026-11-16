@@ -10,6 +10,7 @@ import { parseAmountToMinor } from "@/lib/money";
 import { errors } from "@/lib/errors";
 import { runAction, formValues, type ActionState } from "@/server/actions/runner";
 import * as accountsSvc from "@/server/domain/accounts";
+import * as balanceTrackingSvc from "@/server/domain/balance-tracking";
 import { recalculateAccount } from "@/server/domain/balances";
 
 const createSchema = z.object({
@@ -21,7 +22,8 @@ const createSchema = z.object({
   openingBalance: z.string().optional(),
   openedOn: z.string().min(8),
   includedInReports: z.string().optional(),
-  joint: z.string().optional()
+  joint: z.string().optional(),
+  balanceTracking: z.enum(["valuation", "transactions"]).optional()
 });
 
 export async function createAccountAction(
@@ -47,7 +49,8 @@ export async function createAccountAction(
           : 0,
         openedOn: input.openedOn,
         includedInReports: input.includedInReports === "on",
-        joint: input.joint === "on"
+        joint: input.joint === "on",
+        balanceTracking: input.balanceTracking
       });
       accountId = res.accountId;
       await recalculateAccount(tx, accountId);
@@ -158,6 +161,34 @@ export async function shareAccountAction(
         : accountsSvc.unshareAccount(tx, actor, input.accountId, input.userId)
     );
     revalidatePath(`/accounts/${input.accountId}`);
+    return undefined;
+  });
+}
+
+const switchTrackingSchema = z.object({
+  accountId: z.string().uuid(),
+  to: z.enum(["valuation", "transactions"])
+});
+
+export async function switchBalanceTrackingAction(
+  _prev: ActionState | undefined,
+  formData: FormData
+): Promise<ActionState> {
+  const parsed = switchTrackingSchema.safeParse(formValues(formData));
+  if (!parsed.success)
+    return { ok: false, error: "Check the highlighted fields.", code: "validation.failed" };
+  const input = parsed.data;
+  return runAction("account.balance_tracking", async () => {
+    const actor = await assertActor();
+    await withTransaction((tx) =>
+      balanceTrackingSvc.switchBalanceTracking(tx, actor, {
+        accountId: input.accountId,
+        to: input.to
+      })
+    );
+    revalidatePath("/accounts");
+    revalidatePath(`/accounts/${input.accountId}`);
+    revalidatePath("/");
     return undefined;
   });
 }

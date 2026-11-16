@@ -18,6 +18,10 @@ import {
   updateValuation,
   deleteValuation
 } from "../../src/server/domain/valuations";
+import {
+  previewBalanceTracking,
+  switchBalanceTracking
+} from "../../src/server/domain/balance-tracking";
 import { createInvitation, acceptInvitationWithAccess } from "../../src/server/domain/invitations";
 import { setBudget } from "../../src/server/domain/budgets";
 import { buildFamilyExport } from "../../src/server/domain/exports";
@@ -84,7 +88,8 @@ export class StorageProbe {
     if (
       operation === "/ledger" ||
       operation === "/import-meroshare" ||
-      operation === "/valuation-edit"
+      operation === "/valuation-edit" ||
+      operation === "/balance-tracking"
     ) {
       const exec = db as unknown as Executor;
       const user = await registerAccessHousehold(
@@ -144,6 +149,64 @@ export class StorageProbe {
           editedKind: edited.recentActivity.find((e) => e.id === entryId)?.valuationKind,
           deletedBalance: deleted.displayBalanceMinor,
           deletedEntryAbsent: !deleted.recentActivity.some((e) => e.id === entryId)
+        });
+      }
+      if (operation === "/balance-tracking") {
+        const daysAgo = (n: number) =>
+          new Date(Date.now() - n * 86_400_000).toISOString().slice(0, 10);
+        const { accountId } = await createAccount(exec, actor, {
+          name: "Cloud loan",
+          type: "other_asset",
+          currency: "NPR",
+          openedOn: daysAgo(60),
+          openingBalanceDisplayMinor: 0,
+          includedInReports: true,
+          joint: false
+        });
+        await recordValuation(exec, actor, {
+          accountId,
+          date: daysAgo(50),
+          amountDisplayMinor: 15_000_000,
+          kind: "opening",
+          name: "Original principal"
+        });
+        await addTransaction(exec, actor, {
+          accountId,
+          date: daysAgo(40),
+          name: "Lent",
+          amountLedgerMinor: -6_000_000
+        });
+        await addTransaction(exec, actor, {
+          accountId,
+          date: daysAgo(20),
+          name: "Repayed",
+          amountLedgerMinor: 5_000_000
+        });
+        await recalculateAccount(exec, accountId);
+        const before = await getAccountOverview(exec, actor, accountId);
+        const preview = await previewBalanceTracking(exec, actor, accountId, "transactions");
+        const switched = await switchBalanceTracking(exec, actor, {
+          accountId,
+          to: "transactions"
+        });
+        const after = await getAccountOverview(exec, actor, accountId);
+        let valuationRejected = false;
+        try {
+          await recordValuation(exec, actor, {
+            accountId,
+            date: daysAgo(1),
+            amountDisplayMinor: 1
+          });
+        } catch {
+          valuationRejected = true;
+        }
+        return Response.json({
+          beforeBalance: before.displayBalanceMinor,
+          previewResulting: preview.resultingBalanceMinor,
+          afterBalance: after.displayBalanceMinor,
+          switchedResulting: switched.resultingBalanceMinor,
+          valuationDrivenAfter: after.valuationDriven,
+          valuationRejected
         });
       }
       if (operation === "/import-meroshare") {

@@ -4,14 +4,25 @@ import { useActionState } from "react";
 import { ConfirmDialog, Dialog, useDialogClose } from "@/components/ds/dialog";
 import { Field, FormError, Input, Select } from "@/components/ds/form";
 import { SubmitButton } from "@/components/ds/submit-button";
+import { fmtDate, fmtMoney } from "@/lib/format";
 import {
   updateAccountAction,
   setAccountStatusAction,
   deleteAccountAction,
-  shareAccountAction
+  shareAccountAction,
+  switchBalanceTrackingAction
 } from "@/app/(app)/accounts/actions";
 
 type Member = { id: string; name: string; email: string };
+
+export type TrackingPreview = {
+  to: "valuation" | "transactions";
+  currentBalanceMinor: number;
+  resultingBalanceMinor: number;
+  valuationCount: number;
+  earliestValuationDate: string | null;
+  meroshareLinked: boolean;
+};
 
 export function AccountActions({
   accountId,
@@ -19,7 +30,10 @@ export function AccountActions({
   accountName,
   institution,
   includedInReports,
-  members
+  members,
+  balanceTracking,
+  currency,
+  trackingPreview
 }: {
   accountId: string;
   status: string;
@@ -27,6 +41,9 @@ export function AccountActions({
   institution: string | null;
   includedInReports: boolean;
   members: Member[];
+  balanceTracking?: "valuation" | "transactions";
+  currency?: string;
+  trackingPreview?: TrackingPreview | null;
 }) {
   return (
     <>
@@ -45,6 +62,29 @@ export function AccountActions({
           includedInReports={includedInReports}
         />
       </Dialog>
+
+      {trackingPreview && balanceTracking && currency ? (
+        <Dialog
+          trigger={
+            <span className="rounded-lg border border-border bg-surface px-3 py-2 text-sm font-medium">
+              Balance tracking
+            </span>
+          }
+          title="Balance tracking"
+          description={
+            balanceTracking === "valuation"
+              ? "This account's balance is its latest valuation; its transactions do not affect it."
+              : "This account's balance follows its transactions; valuations do not affect it."
+          }
+        >
+          <BalanceTrackingPanel
+            accountId={accountId}
+            currency={currency}
+            current={balanceTracking}
+            preview={trackingPreview}
+          />
+        </Dialog>
+      ) : null}
 
       <Dialog
         trigger={
@@ -201,6 +241,86 @@ function DeleteForm({ accountId, accountName }: { accountId: string; accountName
           Delete forever
         </SubmitButton>
       </div>
+    </form>
+  );
+}
+
+function BalanceTrackingPanel({
+  accountId,
+  currency,
+  current,
+  preview
+}: {
+  accountId: string;
+  currency: string;
+  current: "valuation" | "transactions";
+  preview: TrackingPreview;
+}) {
+  const [state, action] = useActionState(switchBalanceTrackingAction, undefined);
+  const toTransactions = preview.to === "transactions";
+  const laterValuations = Math.max(0, preview.valuationCount - 1);
+  const blocked = toTransactions && preview.meroshareLinked;
+
+  return (
+    <form action={action} className="space-y-4">
+      <input type="hidden" name="accountId" value={accountId} />
+      <input type="hidden" name="to" value={preview.to} />
+      <FormError message={state?.ok === false ? state.error : undefined} />
+      {state?.ok ? <p className="text-sm text-success">Balance tracking switched.</p> : null}
+
+      <dl className="space-y-2 text-sm">
+        <div className="flex items-baseline justify-between gap-3">
+          <dt className="text-muted-foreground">Current balance</dt>
+          <dd className="tabular font-medium">{fmtMoney(preview.currentBalanceMinor, currency)}</dd>
+        </div>
+        <div className="flex items-baseline justify-between gap-3">
+          <dt className="text-muted-foreground">
+            Balance after switching to {toTransactions ? "transactions" : "valuations"}
+          </dt>
+          <dd className="tabular font-medium">
+            {fmtMoney(preview.resultingBalanceMinor, currency)}
+          </dd>
+        </div>
+      </dl>
+
+      {toTransactions ? (
+        preview.valuationCount > 0 ? (
+          <p className="text-sm text-muted-foreground">
+            Your earliest valuation
+            {preview.earliestValuationDate
+              ? ` (${fmtDate(preview.earliestValuationDate)})`
+              : ""}{" "}
+            becomes the opening transaction.
+            {laterValuations > 0
+              ? ` ${laterValuations} later valuation${laterValuations === 1 ? "" : "s"} will be removed — they are balance snapshots and have no meaning as transactions.`
+              : ""}
+          </p>
+        ) : (
+          <p className="text-sm text-muted-foreground">
+            This account has no valuations to convert. Its balance will be rebuilt from the opening
+            balance and its existing transactions.
+          </p>
+        )
+      ) : (
+        <p className="text-sm text-muted-foreground">
+          Existing transactions will stop counting toward the balance. The balance will follow
+          valuations again — the latest recorded valuation, or the opening balance if there is none
+          — until you record a new valuation.
+        </p>
+      )}
+
+      {blocked ? (
+        <p className="text-sm text-destructive">
+          This account is linked to MeroShare, which controls its balance through valuations.
+          Disconnect MeroShare before switching it to transaction tracking.
+        </p>
+      ) : (
+        <SubmitButton>
+          {current === "valuation"
+            ? "Switch to transaction tracking"
+            : "Switch to valuation tracking"}
+        </SubmitButton>
+      )}
     </form>
   );
 }

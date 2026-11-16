@@ -56,6 +56,16 @@ describe("Cloudflare SQLite storage", () => {
   it("rolls back earlier writes when a foreign key fails after an await", async () => {
     expect(await probe("rollback")).toEqual({ rejected: true, remaining: 0 });
   });
+  it("tracks a loan by transactions after a balance-tracking switch in cloud DO", async () => {
+    expect(await probe("balance-tracking")).toEqual({
+      beforeBalance: 15000000,
+      previewResulting: 16000000,
+      afterBalance: 16000000,
+      switchedResulting: 16000000,
+      valuationDrivenAfter: false,
+      valuationRejected: true
+    });
+  });
   it("edits and deletes loan valuations with atomic balance repair in cloud DO", async () => {
     expect(await probe("valuation-edit")).toEqual({
       editedBalance: -22500,

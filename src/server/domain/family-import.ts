@@ -25,7 +25,11 @@ import { recalculateAccount } from "./balances";
 import { validateSeriesConfig, type Frequency, type SeriesConfig } from "./recurring";
 import { assertFamilyIsEmpty } from "./sure-import";
 import { TRANSFER_DATE_WINDOW_DAYS } from "./transfers";
-import { ACCOUNT_TYPES } from "../authorization/access";
+import {
+  ACCOUNT_TYPES,
+  defaultBalanceTracking,
+  type BalanceTracking
+} from "../authorization/access";
 import { errors } from "@/lib/errors";
 import { diffDays, isIsoDate } from "@/lib/datetime";
 import { isValidCurrency } from "@/lib/money";
@@ -99,6 +103,7 @@ type ParsedAccount = {
   id: string;
   name: string;
   type: string;
+  balanceTracking: BalanceTracking;
   subtype: string | null;
   institution: string | null;
   currency: string;
@@ -369,6 +374,7 @@ async function importRecords(
         // cannot be matched to a target member falls back to the admin.
         ownerId: record.ownerId === null ? null : (resolveUser(record.ownerId) ?? actor.userId),
         type: record.type,
+        balanceTracking: record.balanceTracking,
         subtype: record.subtype,
         name: record.name,
         institution: record.institution,
@@ -825,10 +831,17 @@ function parseAccount(raw: unknown): ParsedAccount {
   const status = reqText(r.status ?? "active", "account status", 20);
   if (!ACCOUNT_STATUSES.has(status))
     throw errors.validation(`The export contains an unsupported account status "${status}".`);
+  // balanceTracking is an additive field: exports written before it existed
+  // (or with an unrecognized value) fall back to the type's default mode.
+  const balanceTracking: BalanceTracking =
+    r.balanceTracking === "transactions" || r.balanceTracking === "valuation"
+      ? r.balanceTracking
+      : defaultBalanceTracking(type);
   return {
     id: reqId(r.id, "account"),
     name: reqText(r.name, "account name", 120),
     type,
+    balanceTracking,
     subtype: optText(r.subtype, 100),
     institution: optText(r.institution, 120),
     currency: reqCurrency(r.currency),

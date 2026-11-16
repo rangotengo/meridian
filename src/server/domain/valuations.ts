@@ -2,7 +2,11 @@ import { eq } from "drizzle-orm";
 import type { Executor } from "../db/client";
 import { accounts, entries, valuations } from "../db/schema";
 import type { Actor } from "../auth/context";
-import { assertAccountAccessLevel, assertAccountOpen } from "../authorization/access";
+import {
+  assertAccountAccessLevel,
+  assertAccountOpen,
+  isValuationTracked
+} from "../authorization/access";
 import { errors } from "@/lib/errors";
 import { displayToLedgerBalance } from "@/lib/money";
 import { isIsoDate } from "@/lib/datetime";
@@ -38,6 +42,11 @@ export async function recordValuation(
     .where(eq(accounts.id, input.accountId))
     .limit(1);
   if (!account) throw errors.notFound("Account");
+  if (!isValuationTracked(account)) {
+    throw errors.validation(
+      "This account tracks its balance from its transactions, so a valuation would not affect it. Switch the account to valuation tracking (Account settings → Balance tracking) before recording valuations."
+    );
+  }
 
   const name =
     input.name?.trim() ||

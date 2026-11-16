@@ -6,10 +6,13 @@ import type { Actor } from "../auth/context";
 import {
   ACCOUNT_TYPES,
   AccountType,
+  BALANCE_TRACKING_MODES,
   canManageAccountSettings,
+  defaultBalanceTracking,
   getAccountAccess,
-  isValuationDriven,
-  type AccountRow
+  isValuationTracked,
+  type AccountRow,
+  type BalanceTracking
 } from "../authorization/access";
 import { errors } from "@/lib/errors";
 import { isValidCurrency, displayToLedgerBalance, isLiability } from "@/lib/money";
@@ -36,6 +39,8 @@ export type CreateAccountInput = {
   openedOn: string;
   includedInReports: boolean;
   joint: boolean;
+  /** Only meaningful for other_asset / other_liability; defaults by type. */
+  balanceTracking?: BalanceTracking;
 };
 
 export async function createAccount(
@@ -51,6 +56,19 @@ export async function createAccount(
   if (!isValidCurrency(input.currency)) throw errors.validation("Unknown currency code.");
   if (!isIsoDate(input.openedOn)) throw errors.validation("Opened-on date must be YYYY-MM-DD.");
 
+  if (
+    input.balanceTracking !== undefined &&
+    !(BALANCE_TRACKING_MODES as string[]).includes(input.balanceTracking)
+  ) {
+    throw errors.validation("Unknown balance tracking mode.");
+  }
+  // Depository / credit_card accounts are always transaction-tracked; the
+  // choice only exists for the valuation-driven types.
+  const balanceTracking: BalanceTracking =
+    defaultBalanceTracking(input.type) === "transactions"
+      ? "transactions"
+      : (input.balanceTracking ?? defaultBalanceTracking(input.type));
+
   const opening = displayToLedgerBalance(input.openingBalanceDisplayMinor, input.type);
   const accountId = await exec.transaction(async (tx) => {
     const [account] = await tx
@@ -59,6 +77,7 @@ export async function createAccount(
         familyId: actor.familyId,
         ownerId: input.joint ? null : actor.userId,
         type: input.type as AccountType,
+        balanceTracking,
         subtype: input.subtype?.trim() || null,
         name,
         institution: input.institution?.trim() || null,
@@ -367,7 +386,7 @@ export async function getAccountOverview(
       valuationKind: r.valuationKind ?? null
     })),
     shares: shareRows,
-    valuationDriven: isValuationDriven(account.type)
+    valuationDriven: isValuationTracked(account)
   };
 }
 

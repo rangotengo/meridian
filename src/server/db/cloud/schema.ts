@@ -245,6 +245,7 @@ export const accounts = sqliteTable(
       .references(() => families.id, { onDelete: "cascade" }),
     ownerId: text("owner_id").references(() => users.id, { onDelete: "set null" }),
     type: text("type").notNull(),
+    balanceTracking: text("balance_tracking").notNull().default("valuation"),
     subtype: text("subtype"),
     name: text("name").notNull(),
     institution: text("institution"),
