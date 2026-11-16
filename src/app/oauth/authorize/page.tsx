@@ -38,10 +38,12 @@ function single(params: RawParams, key: string): string | null {
  * token. Everything the approval acts on — client, redirect_uri, scopes,
  * resource, code challenge, household — is read back from the record,
  * so a decision cannot be transplanted onto a different request. The
- * one exception is the account picker's selection, which is a consent
- * CHOICE rather than request data: it is validated at approval time
- * against the accounts the user can currently access (see
- * approveAuthorizationRequest) and can only narrow the grant.
+ * exceptions are the consent CHOICES rather than request data: the
+ * account picker's selection (validated at approval time against the
+ * accounts the user can currently access, see
+ * approveAuthorizationRequest, and can only narrow the grant) and the
+ * SSIS opt-in checkbox (unchecked by default; it can only add the
+ * separate SSIS permission the user is explicitly offered here).
  */
 function hiddenFields(recordId: string, csrfToken: string) {
   return (
@@ -155,6 +157,30 @@ export default async function AuthorizePage({
               </li>
             ))}
           </ul>
+        </div>
+
+        <div>
+          <p className="font-medium">SSIS investment insight (optional)</p>
+          <p className="mt-1 text-muted-foreground">
+            Meridian also keeps an SSIS insight for this household — the Siddhartha Systematic
+            Investment Scheme tracker, with its purchase history, statement entries and NAV history.
+            It is household-wide data held separately from your accounts, so the account choices
+            above do not restrict it.
+          </p>
+          <label className="mt-2 flex items-start gap-2 text-muted-foreground">
+            <input
+              type="checkbox"
+              name="ssis_access"
+              value="1"
+              form="oauth-approve-form"
+              className="mt-0.5 h-4 w-4 shrink-0"
+            />
+            <span>
+              Allow {request.client.clientName} to read the SSIS insight for this household. Leave
+              this unchecked to keep SSIS private — you can change it later under Settings →
+              Connected AI agents.
+            </span>
+          </label>
         </div>
 
         {consentAccounts.length > 1 ? (

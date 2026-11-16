@@ -857,6 +857,8 @@ export const oauthGrants = sqliteTable(
     clientName: text("client_name").notNull(),
     scopes: text("scopes", { mode: "json" }).$type<string[]>().notNull().default([]),
     accountIds: text("account_ids", { mode: "json" }).$type<string[]>().notNull().default([]),
+    /** Explicit per-connection SSIS permission; see the Postgres schema. */
+    ssisAccess: integer("ssis_access", { mode: "boolean" }).notNull().default(false),
     status: text("status").notNull().default("active"),
     expiresAt: isoTimestamp("expires_at").notNull(),
     lastUsedAt: isoTimestamp("last_used_at"),

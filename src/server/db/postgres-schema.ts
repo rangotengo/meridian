@@ -725,6 +725,11 @@ export const oauthGrants = pgTable(
     /** Account ceiling consented to; empty means "all accounts the user can
      * currently access" (re-resolved per call, never a snapshot of rights). */
     accountIds: jsonb("account_ids").$type<string[]>().notNull().default([]),
+    /** Explicit per-connection permission for the SSIS insight dataset.
+     * SSIS is household-wide and separate from accounts, so finance:read
+     * never implies it: default false, owner opt-in only, checked on the
+     * live grant row by every SSIS tool handler. */
+    ssisAccess: boolean("ssis_access").notNull().default(false),
     status: text("status").notNull().default("active"),
     expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
     lastUsedAt: timestamp("last_used_at", { withTimezone: true }),

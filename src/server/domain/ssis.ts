@@ -223,6 +223,48 @@ export type SsisStatementRow = {
 
 export type SsisNavPoint = { engDate: string; nepDate: string; navMinor: number };
 
+/**
+ * Stored-row → read-model projections, shared by the insight page
+ * (getSsisInsight) and the MCP SSIS tools so both surfaces expose
+ * exactly the same whitelisted fields for a row.
+ */
+export function toSsisPurchaseRow(row: typeof ssisPurchases.$inferSelect): SsisPurchaseRow {
+  return {
+    requestNo: row.requestNo,
+    applyDate: row.applyDate,
+    units: row.units,
+    amountMinor: row.amountMinor,
+    status: row.status,
+    purchaseNavMinor: row.purchaseNavMinor,
+    navDate: row.navDate,
+    schemeName: row.schemeName,
+    isSip: row.isSip
+  };
+}
+
+export function toSsisStatementRow(
+  row: typeof ssisStatementEntries.$inferSelect
+): SsisStatementRow {
+  return {
+    transNo: row.transNo,
+    installmentDate: row.installmentDate,
+    dueDate: row.dueDate,
+    actionDate: row.actionDate,
+    amountCrMinor: row.amountCrMinor,
+    amountDrMinor: row.amountDrMinor,
+    units: row.units,
+    appliedNavMinor: row.appliedNavMinor,
+    payment: row.payment,
+    otherChargesMinor: row.otherChargesMinor,
+    sebonFeeMinor: row.sebonFeeMinor,
+    sipRegNo: row.sipRegNo
+  };
+}
+
+export function toSsisNavPoint(row: typeof ssisNavHistory.$inferSelect): SsisNavPoint {
+  return { engDate: row.engDate, nepDate: row.nepDate, navMinor: row.navMinor };
+}
+
 export type SsisExtractedSnapshot = {
   purchases: SsisPurchaseRow[];
   statement: SsisStatementRow[];
@@ -1092,36 +1134,9 @@ export async function getSsisInsight(exec: Executor, actor: Actor): Promise<Ssis
   ]);
   const state = stateRows[0] ?? null;
   const today = todayIn(familyRows[0]?.timezone ?? "UTC");
-  const purchases: SsisPurchaseRow[] = purchaseRows.map((row) => ({
-    requestNo: row.requestNo,
-    applyDate: row.applyDate,
-    units: row.units,
-    amountMinor: row.amountMinor,
-    status: row.status,
-    purchaseNavMinor: row.purchaseNavMinor,
-    navDate: row.navDate,
-    schemeName: row.schemeName,
-    isSip: row.isSip
-  }));
-  const statement: SsisStatementRow[] = statementRows.map((row) => ({
-    transNo: row.transNo,
-    installmentDate: row.installmentDate,
-    dueDate: row.dueDate,
-    actionDate: row.actionDate,
-    amountCrMinor: row.amountCrMinor,
-    amountDrMinor: row.amountDrMinor,
-    units: row.units,
-    appliedNavMinor: row.appliedNavMinor,
-    payment: row.payment,
-    otherChargesMinor: row.otherChargesMinor,
-    sebonFeeMinor: row.sebonFeeMinor,
-    sipRegNo: row.sipRegNo
-  }));
-  const navHistory: SsisNavPoint[] = navRows.map((row) => ({
-    engDate: row.engDate,
-    nepDate: row.nepDate,
-    navMinor: row.navMinor
-  }));
+  const purchases: SsisPurchaseRow[] = purchaseRows.map(toSsisPurchaseRow);
+  const statement: SsisStatementRow[] = statementRows.map(toSsisStatementRow);
+  const navHistory: SsisNavPoint[] = navRows.map(toSsisNavPoint);
   const stateNav =
     state?.latestNavMinor != null && state?.latestNavDate
       ? { navMinor: state.latestNavMinor, navDate: state.latestNavDate }

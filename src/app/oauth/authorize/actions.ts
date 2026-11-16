@@ -37,16 +37,19 @@ export async function approveConnectionAction(formData: FormData): Promise<void>
   // accounts is an explicit empty selection the domain rejects. The ids
   // themselves are validated in approveAuthorizationRequest against the
   // actor's current account access — the form values are never trusted.
-  const selection =
-    formValue(formData, "account_selection") !== null
-      ? {
-          actor,
-          accountIds: formData
+  // The SSIS checkbox is a separate consent choice: unchecked (or
+  // absent) means the grant is minted without SSIS access.
+  const consent = {
+    actor,
+    accountIds:
+      formValue(formData, "account_selection") !== null
+        ? formData
             .getAll("account_id")
             .filter((value): value is string => typeof value === "string")
-        }
-      : undefined;
-  const { code } = await approveAuthorizationRequest(exec, record, config, selection);
+        : undefined,
+    ssisAccess: formValue(formData, "ssis_access") === "1"
+  };
+  const { code } = await approveAuthorizationRequest(exec, record, config, consent);
   const url = new URL(record.redirectUri);
   url.searchParams.set("code", code);
   if (record.state) url.searchParams.set("state", record.state);

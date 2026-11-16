@@ -200,7 +200,11 @@ describe("Cloudflare SQLite storage", () => {
       breakdownMerchantOk: true,
       summaryOk: true,
       summaryExcludesCeilingAccount: true,
-      netWorthPartialFlagged: true
+      netWorthPartialFlagged: true,
+      ssisDeniedWithoutPermission: true,
+      ssisSummaryOk: true,
+      ssisPurchasesOk: true,
+      ssisDeniedAfterDisable: true
     });
   });
 

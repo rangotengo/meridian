@@ -7,13 +7,15 @@ import { Badge, Card, EmptyState } from "@/components/ds/card";
 import { Dialog, useDialogClose } from "@/components/ds/dialog";
 import { FormError } from "@/components/ds/form";
 import { SubmitButton } from "@/components/ds/submit-button";
-import { SCOPE_LABELS } from "@/server/mcp/scopes";
+import { SCOPE_LABELS, SSIS_ACCESS_LABEL } from "@/server/mcp/scopes";
 
 export type ConnectionItem = {
   id: string;
   clientName: string;
   status: "active" | "revoked" | "expired";
   scopes: string[];
+  /** Explicit per-connection SSIS permission (not a scope). */
+  ssisAccess: boolean;
   familyName: string | null;
   /** null = all accounts the user can access; otherwise the named subset. */
   accounts: { id: string; name: string }[] | null;
@@ -38,6 +40,7 @@ function formatDateTime(value: Date, timezone: string): string {
 function historyLabel(entry: ConnectionItem["history"][number]): string {
   if (entry.action === "oauth_grant.created") return "Connected";
   if (entry.action === "oauth_grant.revoked") return "Disconnected";
+  if (entry.action === "oauth_grant.ssis_access_changed") return "SSIS access changed";
   if (entry.action === "mcp.tool_called") return entry.tool ?? "Tool call";
   return entry.action;
 }
@@ -82,6 +85,56 @@ function DisconnectForm({ connectionId }: { connectionId: string }) {
         <SubmitButton variant="destructive">Disconnect</SubmitButton>
       </div>
     </form>
+  );
+}
+
+function SsisAccessToggle({ connection }: { connection: ConnectionItem }) {
+  const router = useRouter();
+  const [enabled, setEnabled] = useState(connection.ssisAccess);
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const onToggle = async (next: boolean) => {
+    setPending(true);
+    setError(null);
+    try {
+      const res = await fetch(`/api/mcp/connections/${connection.id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ssisAccess: next })
+      });
+      if (!res.ok) throw new Error("update failed");
+      setEnabled(next);
+      router.refresh();
+    } catch {
+      setError("Could not update SSIS access. Please try again.");
+    } finally {
+      setPending(false);
+    }
+  };
+
+  return (
+    <div>
+      <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+        {SSIS_ACCESS_LABEL}
+      </p>
+      <p className="mt-1.5 text-muted-foreground">
+        The household&rsquo;s SSIS insight — purchases, statement entries and NAV history. This data
+        is household-wide and kept separate from accounts, so the account access above does not
+        restrict it. Changes take effect immediately.
+      </p>
+      <label className="mt-2 flex items-center gap-2">
+        <input
+          type="checkbox"
+          checked={enabled}
+          disabled={pending}
+          onChange={(event) => void onToggle(event.target.checked)}
+          className="h-4 w-4 shrink-0"
+        />
+        <span>{enabled ? "Allowed" : "Not allowed"}</span>
+      </label>
+      {error ? <p className="mt-1.5 text-xs text-destructive">{error}</p> : null}
+    </div>
   );
 }
 
@@ -165,6 +218,19 @@ export function AiAgentsManager({ connections }: { connections: ConnectionItem[]
               </p>
             </div>
           </div>
+
+          {c.status === "active" ? (
+            <SsisAccessToggle connection={c} />
+          ) : (
+            <div>
+              <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                {SSIS_ACCESS_LABEL}
+              </p>
+              <p className="mt-1.5 text-muted-foreground">
+                {c.ssisAccess ? "Allowed" : "Not allowed"}
+              </p>
+            </div>
+          )}
 
           {c.history.length > 0 ? (
             <div>
