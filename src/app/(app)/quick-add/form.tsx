@@ -11,12 +11,23 @@ export function QuickAddForm({
   accounts,
   categories,
   tags,
-  today
+  today,
+  onSaved,
+  onCancel
 }: {
   accounts: { id: string; name: string; currency: string }[];
   categories: { id: string; name: string }[];
   tags: { id: string; name: string }[];
   today: string;
+  /**
+   * Dialog hosts (e.g. the dashboard Quick actions shortcut) pass this to
+   * take over the success path — close + refresh — instead of the
+   * standalone page's reset-and-flash rapid-entry cycle. The standalone
+   * /quick-add page passes nothing and keeps its current behavior.
+   */
+  onSaved?: () => void;
+  /** Dialog hosts pass this to render a Cancel button that closes. */
+  onCancel?: () => void;
 }) {
   const [kind, setKind] = useState<"expense" | "income">("expense");
   const [savedFlash, setSavedFlash] = useState(false);
@@ -28,6 +39,10 @@ export function QuickAddForm({
     const result = await quickAddAction(undefined, formData);
     setState(result);
     if (result.ok) {
+      if (onSaved) {
+        onSaved();
+        return;
+      }
       formRef.current?.reset();
       setKind("expense");
       amountRef.current?.focus();
@@ -130,6 +145,15 @@ export function QuickAddForm({
       <input type="hidden" name="date" value={today} />
 
       <SubmitButton className="w-full py-3 text-base">Save transaction</SubmitButton>
+      {onCancel ? (
+        <button
+          type="button"
+          onClick={onCancel}
+          className="w-full rounded-lg px-3.5 py-2 text-sm font-medium hover:bg-surface-inset-hover"
+        >
+          Cancel
+        </button>
+      ) : null}
     </form>
   );
 }

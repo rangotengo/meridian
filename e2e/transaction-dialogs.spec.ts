@@ -90,8 +90,8 @@ test("account page: Escape and Cancel write nothing and reset the form", async (
   await page.keyboard.press("Escape");
   await expect(dialog).toBeHidden();
   await expect(page.getByText("Escape Ghost")).toHaveCount(0);
-  // Focus returns to the triggering shortcut (its content element — the
-  // display:contents wrapper button is unfocusable in Chromium).
+  // Focus returns to the triggering shortcut itself (the styled span is
+  // the dialog's trigger control — a real tab stop, not a wrapper).
   await expect(page.locator("span", { hasText: "+ New transaction" })).toBeFocused();
 
   await page.getByRole("button", { name: "+ New transaction" }).click();
@@ -193,6 +193,173 @@ test("closed accounts hide the creation shortcuts", async ({ page }) => {
   await page.goto(`/accounts/${id}`);
   await expect(page.getByRole("button", { name: "+ New transaction" })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Move money", exact: true })).toHaveCount(0);
+});
+
+async function createCategoryViaUi(
+  page: import("@playwright/test").Page,
+  name: string
+): Promise<void> {
+  await page.goto("/settings/categories");
+  await page.locator("#cat-name").fill(name);
+  await page.getByRole("button", { name: "Create category" }).click();
+  await expect(page.locator("li", { hasText: name }).first()).toBeVisible();
+}
+
+async function createTagViaUi(page: import("@playwright/test").Page, name: string): Promise<void> {
+  await page.goto("/settings/tags");
+  await page.locator("#tag-name").fill(name);
+  await page.getByRole("button", { name: "Create tag" }).click();
+  await expect(page.locator("li", { hasText: `#${name}` }).first()).toBeVisible();
+}
+
+test("dialog validation error preserves the whole expense draft", async ({ page }) => {
+  const { accountA, accountB } = getData();
+  await createCategoryViaUi(page, "Draft Category");
+  await createTagViaUi(page, "drafttag");
+
+  await page.goto(`/accounts/${accountA.id}`);
+  await page.getByRole("button", { name: "+ New transaction" }).click();
+  const dialog = page.locator("dialog[open]");
+  await expect(dialog).toBeVisible();
+
+  await dialog.locator("#account-txn-entry-account").selectOption(accountB.id);
+  await dialog.locator("#account-txn-entry-date").fill("2026-01-15");
+  // Over-precise for USD: passes HTML validation, the server rejects it.
+  await dialog.locator("#account-txn-entry-amount").fill("123.456");
+  await dialog.locator("#account-txn-entry-name").fill("Draft Keeper");
+  await dialog.locator("#account-txn-entry-category").selectOption({ label: "Draft Category" });
+  const categoryValue = await dialog.locator("#account-txn-entry-category").inputValue();
+  expect(categoryValue).not.toBe("");
+  await dialog.locator("#account-txn-entry-merchant").fill("Draft Merchant");
+  await dialog.locator("#account-txn-entry-notes").fill("Draft notes survive");
+  await dialog.getByRole("checkbox", { name: "drafttag" }).check();
+
+  await dialog.getByRole("button", { name: "Record expense" }).click();
+
+  // The server's refusal is shown and the dialog stays open…
+  await expect(dialog.getByRole("alert")).toContainText(/precision/);
+  await expect(dialog).toBeVisible();
+  // …with EVERY entered field exactly as typed.
+  await expect(dialog.locator("#account-txn-entry-account")).toHaveValue(accountB.id);
+  await expect(dialog.locator("#account-txn-entry-date")).toHaveValue("2026-01-15");
+  await expect(dialog.locator("#account-txn-entry-amount")).toHaveValue("123.456");
+  await expect(dialog.locator("#account-txn-entry-name")).toHaveValue("Draft Keeper");
+  await expect(dialog.locator("#account-txn-entry-category")).toHaveValue(categoryValue);
+  await expect(dialog.locator("#account-txn-entry-merchant")).toHaveValue("Draft Merchant");
+  await expect(dialog.locator("#account-txn-entry-notes")).toHaveValue("Draft notes survive");
+  await expect(dialog.getByRole("checkbox", { name: "drafttag" })).toBeChecked();
+
+  // Nothing was recorded.
+  await page.keyboard.press("Escape");
+  await expect(page.getByText("Draft Keeper")).toHaveCount(0);
+});
+
+test("dialog validation error preserves the whole transfer draft", async ({ page }) => {
+  const { accountA, accountB } = getData();
+  await page.goto(`/accounts/${accountA.id}`);
+  await page.getByRole("button", { name: "Move money", exact: true }).click();
+  const dialog = page.locator("dialog[open]");
+  await expect(dialog).toBeVisible();
+
+  await dialog.locator("#account-transfer-transfer-from").selectOption(accountB.id);
+  await expect(dialog.locator("#account-transfer-transfer-to")).toHaveValue(accountA.id);
+  await dialog.locator("#account-transfer-transfer-date").fill("2026-02-20");
+  await dialog.locator("#account-transfer-transfer-amount").fill("99.999");
+  await dialog.locator("#account-transfer-transfer-name").fill("Draft Transfer Note");
+
+  await dialog.getByRole("button", { name: "Move money" }).click();
+
+  await expect(dialog.getByRole("alert")).toContainText(/precision/);
+  await expect(dialog).toBeVisible();
+  await expect(dialog.locator("#account-transfer-transfer-from")).toHaveValue(accountB.id);
+  await expect(dialog.locator("#account-transfer-transfer-to")).toHaveValue(accountA.id);
+  await expect(dialog.locator("#account-transfer-transfer-date")).toHaveValue("2026-02-20");
+  await expect(dialog.locator("#account-transfer-transfer-amount")).toHaveValue("99.999");
+  await expect(dialog.locator("#account-transfer-transfer-name")).toHaveValue(
+    "Draft Transfer Note"
+  );
+
+  await page.keyboard.press("Escape");
+  await expect(page.getByText("Draft Transfer Note")).toHaveCount(0);
+});
+
+test("dialog shortcut is Tab-reachable, opens with Enter and Space, focus returns on Escape", async ({
+  page
+}) => {
+  const { accountA } = getData();
+  await page.goto(`/accounts/${accountA.id}`);
+  const trigger = page.getByRole("button", { name: "+ New transaction" });
+
+  // Walk the tab order from the top of the page until the shortcut has
+  // focus — it must be a real tab stop, not just programmatically
+  // focusable.
+  let reached = false;
+  for (let i = 0; i < 120 && !reached; i++) {
+    await page.keyboard.press("Tab");
+    reached = await trigger.evaluate((el) => el === document.activeElement).catch(() => false);
+  }
+  expect(reached).toBe(true);
+
+  const dialog = page.locator("dialog[open]");
+  await page.keyboard.press("Enter");
+  await expect(dialog).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeHidden();
+  await expect(trigger).toBeFocused();
+
+  await page.keyboard.press(" ");
+  await expect(dialog).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeHidden();
+  await expect(trigger).toBeFocused();
+});
+
+test("dashboard: Quick add opens in a dialog and saves without leaving the dashboard", async ({
+  page
+}) => {
+  const { accountA } = getData();
+  await page.goto("/");
+  const urlBefore = page.url();
+
+  await page.getByRole("button", { name: /Quick add/ }).click();
+  const dialog = page.locator("dialog[open]");
+  await expect(dialog).toBeVisible();
+  await dialog.getByLabel("Amount").fill("11.25");
+  await dialog.getByLabel("Description").fill("Quick Dialog Snack");
+  await dialog.getByLabel("Account").selectOption(accountA.id);
+  await dialog.getByRole("button", { name: "Save transaction" }).click();
+
+  // Saved in place: dialog closed, still on the dashboard, entry visible.
+  await expect(dialog).toBeHidden();
+  expect(page.url()).toBe(urlBefore);
+  await expect(page.getByText("Quick Dialog Snack").first()).toBeVisible();
+});
+
+test("dashboard: cancelling Quick add writes nothing; the sidebar still opens the standalone page", async ({
+  page
+}) => {
+  await page.goto("/");
+  const urlBefore = page.url();
+
+  await page.getByRole("button", { name: /Quick add/ }).click();
+  const dialog = page.locator("dialog[open]");
+  await expect(dialog).toBeVisible();
+  await dialog.getByLabel("Amount").fill("5.00");
+  await dialog.getByLabel("Description").fill("Quick Cancel Ghost");
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeHidden();
+  expect(page.url()).toBe(urlBefore);
+  await expect(page.getByText("Quick Cancel Ghost")).toHaveCount(0);
+
+  // The sidebar navigation item keeps opening the standalone page, whose
+  // save flow still works as before (Saved flash, stays on /quick-add).
+  await page.getByRole("link", { name: "Quick add" }).first().click();
+  await expect(page).toHaveURL(/\/quick-add$/);
+  await page.getByLabel("Amount").fill("3.50");
+  await page.getByLabel("Description").fill("Standalone Snack");
+  await page.getByRole("button", { name: "Save transaction" }).click();
+  await expect(page.getByText("Saved", { exact: true })).toBeVisible();
+  await expect(page).toHaveURL(/\/quick-add$/);
 });
 
 test.describe("read-only member", () => {

@@ -1,6 +1,18 @@
 "use client";
 
-import { createContext, useContext, useEffect, useId, useRef, useState } from "react";
+import {
+  createContext,
+  isValidElement,
+  useCallback,
+  useContext,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type MouseEvent as ReactMouseEvent,
+  type ReactElement
+} from "react";
 import { SubmitButton } from "./submit-button";
 import { FormError } from "./form";
 
@@ -29,6 +41,10 @@ export function Dialog({
   onOpen?: () => void;
 }) {
   const ref = useRef<HTMLDialogElement>(null);
+  const triggerRef = useRef<HTMLElement | null>(null);
+  const setTriggerRef = useCallback((node: HTMLElement | null) => {
+    triggerRef.current = node;
+  }, []);
   const titleId = useId();
   const descId = useId();
 
@@ -36,21 +52,10 @@ export function Dialog({
     const dialog = ref.current;
     if (!dialog) return;
     const onClose = () => {
-      const opener = dialog.previousElementSibling as HTMLElement | null;
-      if (!opener) return;
-      opener.focus();
-      // The trigger wrapper uses `display: contents` so the trigger's own
-      // styling governs layout — but Chromium treats such elements as
-      // unfocusable, leaving focus on <body>. Fall back to the trigger
-      // content itself (a real box) so keyboard users land back on the
-      // control they opened the dialog from.
-      if (document.activeElement !== opener) {
-        const target = opener.firstElementChild as HTMLElement | null;
-        if (target) {
-          if (!target.hasAttribute("tabindex")) target.setAttribute("tabindex", "-1");
-          target.focus({ preventScroll: true });
-        }
-      }
+      // Focus returns to the very control that opened the dialog. The
+      // trigger element is a real tab stop (see below), so this works for
+      // keyboard and pointer users alike.
+      triggerRef.current?.focus();
     };
     dialog.addEventListener("close", onClose);
     return () => dialog.removeEventListener("close", onClose);
@@ -62,11 +67,57 @@ export function Dialog({
   };
   const close = () => ref.current?.close();
 
+  // Accessible trigger API: the caller's element IS the control — the
+  // Dialog forwards the open behavior, a ref, and (for elements that are
+  // not natively interactive) button semantics onto it instead of
+  // wrapping it in a `display: contents` button. A contents wrapper
+  // generates no box, so Chromium drops it from the tab order entirely:
+  // the shortcuts were mouse-only, and focus "restoration" on close could
+  // only park focus on the child span with tabindex=-1, which Tab still
+  // skipped. Enhancing the element itself keeps every caller's layout
+  // untouched (the styled span stays the layout box) while making it a
+  // genuine tab stop that Enter/Space activate.
+  type TriggerProps = {
+    className?: string;
+    role?: string;
+    tabIndex?: number;
+    onClick?: (event: ReactMouseEvent) => void;
+    onKeyDown?: (event: ReactKeyboardEvent) => void;
+  };
+  const triggerElement = (
+    isValidElement(trigger) ? trigger : <span>{trigger}</span>
+  ) as ReactElement<TriggerProps>;
+  const triggerProps = triggerElement.props;
+  const nativelyInteractive =
+    typeof triggerElement.type === "string" &&
+    (triggerElement.type === "button" || triggerElement.type === "a");
+  const TriggerTag = triggerElement.type as React.ElementType;
+  const triggerButtonProps = nativelyInteractive
+    ? {}
+    : {
+        role: "button",
+        tabIndex: triggerProps.tabIndex ?? 0,
+        onKeyDown: (event: ReactKeyboardEvent) => {
+          triggerProps.onKeyDown?.(event);
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            open();
+          }
+        }
+      };
+
   return (
     <DialogCloseContext.Provider value={close}>
-      <button type="button" onClick={open} className="contents cursor-pointer">
-        {trigger}
-      </button>
+      <TriggerTag
+        {...triggerProps}
+        ref={setTriggerRef}
+        className={[triggerProps.className, "cursor-pointer"].filter(Boolean).join(" ")}
+        onClick={(event: ReactMouseEvent) => {
+          triggerProps.onClick?.(event);
+          open();
+        }}
+        {...triggerButtonProps}
+      />
       <dialog
         ref={ref}
         closedby="any"

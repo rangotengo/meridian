@@ -1,6 +1,6 @@
 "use client";
 
-import { useActionState, useEffect, useState } from "react";
+import { useActionState, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
   createTransactionAction,
@@ -48,6 +48,30 @@ export type TransactionComposerProps = {
 };
 
 const MODES: readonly ComposerMode[] = ["expense", "income", "transfer"];
+
+/**
+ * React resets form fields in the DOM when a form action resolves, and
+ * controlled fields are only re-applied from state on the NEXT render —
+ * so right after a { ok: false } result, some controls (a select, the
+ * tag checkboxes) can visibly snap back to their defaults even though
+ * their state still holds the draft. Force one extra render when a
+ * failure result lands so every controlled field is re-synced from
+ * state. The render must be scheduled after the error commit (React's
+ * reset lands after a same-commit re-render, which is why this defers
+ * by one frame instead of adjusting state during render). Verified
+ * against React 19: a post-error re-render heals the desynced controls.
+ */
+function useDraftResyncOnError(state: { ok: boolean } | undefined) {
+  const [, setResyncTick] = useState(0);
+  const seenState = useRef(state);
+  useEffect(() => {
+    if (seenState.current === state) return;
+    seenState.current = state;
+    if (state?.ok !== false) return;
+    const frame = requestAnimationFrame(() => setResyncTick((t) => t + 1));
+    return () => cancelAnimationFrame(frame);
+  }, [state]);
+}
 
 export function TransactionComposer({
   accounts,
@@ -146,9 +170,27 @@ function EntryForm({
     dialog ? createTransactionDialogAction : createTransactionAction,
     undefined
   );
+  useDraftResyncOnError(state);
   useEffect(() => {
     if (dialog && state?.ok) onSuccess?.();
   }, [dialog, state, onSuccess]);
+
+  // Every field is controlled. React resets UNCONTROLLED inputs when a
+  // form action resolves — including a { ok: false } validation/domain
+  // refusal — which silently erased the whole draft while the error
+  // stayed on screen. Keeping the draft in state means a refusal only
+  // adds the error message (useDraftResyncOnError above covers the
+  // DOM/state desync React's reset leaves behind on some controls);
+  // deliberate resets still happen because the dialog remounts the
+  // composer on every open and the page variant redirects on success.
+  const [accountId, setAccountId] = useState(presetAccount || accounts[0]?.id || "");
+  const [date, setDate] = useState(today);
+  const [amount, setAmount] = useState("");
+  const [entryName, setEntryName] = useState("");
+  const [categoryId, setCategoryId] = useState("");
+  const [merchant, setMerchant] = useState("");
+  const [notes, setNotes] = useState("");
+  const [selectedTagIds, setSelectedTagIds] = useState<string[]>([]);
 
   const body = (
     <form action={action} className="grid gap-4 sm:grid-cols-2">
@@ -158,7 +200,8 @@ function EntryForm({
         <Select
           id={`${idPrefix}-account`}
           name="accountId"
-          defaultValue={presetAccount || accounts[0]?.id}
+          value={accountId}
+          onChange={(e) => setAccountId(e.target.value)}
         >
           {accounts.map((a) => (
             <option key={a.id} value={a.id}>
@@ -168,7 +211,14 @@ function EntryForm({
         </Select>
       </Field>
       <Field label="Date" htmlFor={`${idPrefix}-date`}>
-        <Input id={`${idPrefix}-date`} name="date" type="date" defaultValue={today} required />
+        <Input
+          id={`${idPrefix}-date`}
+          name="date"
+          type="date"
+          value={date}
+          onChange={(e) => setDate(e.target.value)}
+          required
+        />
       </Field>
       <Field label="Amount" htmlFor={`${idPrefix}-amount`}>
         <Input
@@ -176,6 +226,8 @@ function EntryForm({
           name="amount"
           inputMode="decimal"
           placeholder="0.00"
+          value={amount}
+          onChange={(e) => setAmount(e.target.value)}
           required
         />
       </Field>
@@ -186,10 +238,17 @@ function EntryForm({
           required
           maxLength={240}
           placeholder={mode === "expense" ? "Grocery run" : "Salary"}
+          value={entryName}
+          onChange={(e) => setEntryName(e.target.value)}
         />
       </Field>
       <Field label="Category" htmlFor={`${idPrefix}-category`}>
-        <Select id={`${idPrefix}-category`} name="categoryId" defaultValue="">
+        <Select
+          id={`${idPrefix}-category`}
+          name="categoryId"
+          value={categoryId}
+          onChange={(e) => setCategoryId(e.target.value)}
+        >
           <option value="">Uncategorized</option>
           {categories.map((c) => (
             <option key={c.id} value={c.id}>
@@ -199,15 +258,27 @@ function EntryForm({
         </Select>
       </Field>
       <Field label="Merchant (optional)" htmlFor={`${idPrefix}-merchant`}>
-        <Input id={`${idPrefix}-merchant`} name="merchant" maxLength={120} />
+        <Input
+          id={`${idPrefix}-merchant`}
+          name="merchant"
+          maxLength={120}
+          value={merchant}
+          onChange={(e) => setMerchant(e.target.value)}
+        />
       </Field>
       <div className="sm:col-span-2">
         <Field label="Notes (optional)" htmlFor={`${idPrefix}-notes`}>
-          <Textarea id={`${idPrefix}-notes`} name="notes" maxLength={5000} />
+          <Textarea
+            id={`${idPrefix}-notes`}
+            name="notes"
+            maxLength={5000}
+            value={notes}
+            onChange={(e) => setNotes(e.target.value)}
+          />
         </Field>
       </div>
       <div className="sm:col-span-2">
-        <TagPicker tags={tags} />
+        <TagPicker tags={tags} selected={selectedTagIds} onSelectedChange={setSelectedTagIds} />
       </div>
       <div className="flex items-center gap-2 sm:col-span-2">
         <SubmitButton>Record {mode}</SubmitButton>
@@ -247,12 +318,19 @@ function TransferForm({
     dialog ? createTransferDialogAction : createTransferAction,
     undefined
   );
+  useDraftResyncOnError(state);
   useEffect(() => {
     if (dialog && state?.ok) onSuccess?.();
   }, [dialog, state, onSuccess]);
 
   const [sourceId, setSourceId] = useState(presetAccount || accounts[0]?.id || "");
   const [destId, setDestId] = useState<string | null>(null);
+  // Date/amount/note are controlled for the same reason as in EntryForm:
+  // an { ok: false } action result must not reset the draft (React resets
+  // uncontrolled fields when a form action resolves).
+  const [date, setDate] = useState(today);
+  const [amount, setAmount] = useState("");
+  const [note, setNote] = useState("");
   const source = accounts.find((a) => a.id === sourceId);
   // Destination options are a function of the CURRENT source: a different
   // account in the source's currency. Recomputed on every source change.
@@ -309,7 +387,14 @@ function TransferForm({
         </Field>
       )}
       <Field label="Date" htmlFor={`${idPrefix}-date`}>
-        <Input id={`${idPrefix}-date`} name="date" type="date" defaultValue={today} required />
+        <Input
+          id={`${idPrefix}-date`}
+          name="date"
+          type="date"
+          value={date}
+          onChange={(e) => setDate(e.target.value)}
+          required
+        />
       </Field>
       <Field label="Amount" htmlFor={`${idPrefix}-amount`}>
         <Input
@@ -317,6 +402,8 @@ function TransferForm({
           name="amount"
           inputMode="decimal"
           placeholder="0.00"
+          value={amount}
+          onChange={(e) => setAmount(e.target.value)}
           required
         />
       </Field>
@@ -327,6 +414,8 @@ function TransferForm({
             name="name"
             maxLength={240}
             placeholder="Monthly credit card payment"
+            value={note}
+            onChange={(e) => setNote(e.target.value)}
           />
         </Field>
       </div>
