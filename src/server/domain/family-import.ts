@@ -69,6 +69,14 @@ import { isValidCurrency } from "@/lib/money";
  *   still import: transfers are rebuilt from the transferId carried on each
  *   entry, using the ledger sign convention (outflow positive, inflow
  *   negative, legs summing to zero).
+ * - Same-day valuation precedence survives a restore when the export
+ *   carries the per-account `writeOrder` key (see exports.ts): entries are
+ *   inserted in that order and stamped with monotonically increasing
+ *   destination-local created_at values, so the destination balance engine
+ *   picks the same winning valuation as the source. Exports without the
+ *   key restore through the previous backwards walk instead, whose
+ *   same-date winner is the first entry in the array — order-dependent,
+ *   not source-correct, and kept only as the legacy fallback.
  */
 
 const SOURCE = "meridian_export";
@@ -131,6 +139,13 @@ type ParsedEntry = {
   transferId: string | null;
   valuationKind: string | null;
   tagIds: string[];
+  /**
+   * Per-account rank in source write order (exports.ts), or null for
+   * exports written before the key existed. It is an ordering key only:
+   * the destination never copies the source's created_at — the importer
+   * re-derives destination-local stamps in this order instead.
+   */
+  writeOrder: number | null;
 };
 type ParsedTransfer = {
   id: string;
@@ -432,60 +447,116 @@ async function importRecords(
   const entryMap = new Map<string, string>();
   const transactionIdByEntry = new Map<string, string>();
   let valuationCount = 0;
-  const pendingEntries = [...data.entries];
   const deferredTagLinks: { entryId: string; tagIds: string[] }[] = [];
-  while (pendingEntries.length > 0) {
-    const before = pendingEntries.length;
-    for (let i = pendingEntries.length - 1; i >= 0; i--) {
-      const record = pendingEntries[i]!;
-      if (record.parentEntryId && !entryMap.has(record.parentEntryId)) continue;
-      const accountId = mappedId(record.accountId, accountMap, "account");
-      const [entry] = await exec
-        .insert(entries)
+
+  // Insert one entry (and its transaction/valuation row). `stamp` is a
+  // destination-local write-order stamp; without it the column defaults
+  // apply (one shared transaction timestamp on PostgreSQL).
+  const insertEntry = async (record: ParsedEntry, stamp?: Date): Promise<void> => {
+    const accountId = mappedId(record.accountId, accountMap, "account");
+    const [entry] = await exec
+      .insert(entries)
+      .values({
+        accountId,
+        parentEntryId: record.parentEntryId
+          ? mappedId(record.parentEntryId, entryMap, "parent entry")
+          : null,
+        recurringSeriesId: record.recurringSeriesId
+          ? mappedId(record.recurringSeriesId, seriesMap, "recurring series")
+          : null,
+        date: record.date,
+        amountMinor: record.amountMinor,
+        currency: record.currency,
+        name: record.name,
+        notes: record.notes,
+        externalSource: record.externalSource,
+        externalId: record.externalId,
+        entryableType: record.kind,
+        ...(stamp ? { createdAt: stamp, updatedAt: stamp } : {})
+      })
+      .returning({ id: entries.id });
+    if (!entry) throw errors.conflict("Could not restore an entry.");
+    entryMap.set(record.id, entry.id);
+    if (record.kind === "transaction") {
+      const [transaction] = await exec
+        .insert(transactions)
         .values({
-          accountId,
-          parentEntryId: record.parentEntryId
-            ? mappedId(record.parentEntryId, entryMap, "parent entry")
-            : null,
-          recurringSeriesId: record.recurringSeriesId
-            ? mappedId(record.recurringSeriesId, seriesMap, "recurring series")
-            : null,
-          date: record.date,
-          amountMinor: record.amountMinor,
-          currency: record.currency,
-          name: record.name,
-          notes: record.notes,
-          externalSource: record.externalSource,
-          externalId: record.externalId,
-          entryableType: record.kind
-        })
-        .returning({ id: entries.id });
-      if (!entry) throw errors.conflict("Could not restore an entry.");
-      entryMap.set(record.id, entry.id);
-      if (record.kind === "transaction") {
-        const [transaction] = await exec
-          .insert(transactions)
-          .values({
-            entryId: entry.id,
-            categoryId: mappedOptionalId(record.categoryId, categoryMap, "category"),
-            merchant: record.merchant
-          })
-          .returning({ id: transactions.id });
-        if (!transaction) throw errors.conflict("Could not restore a transaction.");
-        transactionIdByEntry.set(record.id, transaction.id);
-        if (record.tagIds.length > 0)
-          deferredTagLinks.push({ entryId: record.id, tagIds: record.tagIds });
-      } else {
-        await exec.insert(valuations).values({
           entryId: entry.id,
-          kind: record.valuationKind ?? "current"
-        });
-        valuationCount++;
-      }
-      pendingEntries.splice(i, 1);
+          categoryId: mappedOptionalId(record.categoryId, categoryMap, "category"),
+          merchant: record.merchant
+        })
+        .returning({ id: transactions.id });
+      if (!transaction) throw errors.conflict("Could not restore a transaction.");
+      transactionIdByEntry.set(record.id, transaction.id);
+      if (record.tagIds.length > 0)
+        deferredTagLinks.push({ entryId: record.id, tagIds: record.tagIds });
+    } else {
+      await exec.insert(valuations).values({
+        entryId: entry.id,
+        kind: record.valuationKind ?? "current"
+      });
+      valuationCount++;
     }
-    if (pendingEntries.length === before) {
-      throw errors.validation("The export contains entries with a missing parent entry.");
+  };
+
+  // Same-day valuation precedence must survive the restore: the balance
+  // engine picks the last valuation for a date by (date, created_at,
+  // write_seq/rowid), so the destination must reproduce the source's write
+  // order. Exports carrying the per-account `writeOrder` key are inserted
+  // in that order — entries without a rank (a partially keyed export)
+  // sort after the ranked ones within their account, array order kept —
+  // and stamped with monotonically increasing destination-local timestamps
+  // (one millisecond apart from the import's start), so the created_at
+  // tiebreak resolves identically to the source. Insertion order carries
+  // the same sequence into write_seq (PostgreSQL) and rowid (cloud).
+  // A split child is still deferred until its parent lands; valuations
+  // never have parents, so their order is never disturbed by that.
+  //
+  // Exports WITHOUT the key (v1, v2, early v3) take the previous path
+  // unchanged: the backwards walk and column defaults, which resolve
+  // same-date ties by reverse array order (the first entry for a date
+  // wins). That behavior is preserved as the legacy fallback — it is
+  // order-dependent, not source-correct, and is documented as such rather
+  // than silently changed.
+  if (data.entries.some((e) => e.writeOrder !== null)) {
+    const orderedEntries = [...data.entries].sort((a, b) => {
+      if (a.accountId !== b.accountId) return a.accountId < b.accountId ? -1 : 1;
+      const ao = a.writeOrder ?? Number.MAX_SAFE_INTEGER;
+      const bo = b.writeOrder ?? Number.MAX_SAFE_INTEGER;
+      return ao - bo;
+    });
+    const stampBase = Date.now();
+    let stampSeq = 0;
+    let pendingEntries = orderedEntries;
+    while (pendingEntries.length > 0) {
+      const next: ParsedEntry[] = [];
+      let inserted = 0;
+      for (const record of pendingEntries) {
+        if (record.parentEntryId && !entryMap.has(record.parentEntryId)) {
+          next.push(record);
+          continue;
+        }
+        await insertEntry(record, new Date(stampBase + stampSeq++));
+        inserted++;
+      }
+      if (inserted === 0) {
+        throw errors.validation("The export contains entries with a missing parent entry.");
+      }
+      pendingEntries = next;
+    }
+  } else {
+    const pendingEntries = [...data.entries];
+    while (pendingEntries.length > 0) {
+      const before = pendingEntries.length;
+      for (let i = pendingEntries.length - 1; i >= 0; i--) {
+        const record = pendingEntries[i]!;
+        if (record.parentEntryId && !entryMap.has(record.parentEntryId)) continue;
+        await insertEntry(record);
+        pendingEntries.splice(i, 1);
+      }
+      if (pendingEntries.length === before) {
+        throw errors.validation("The export contains entries with a missing parent entry.");
+      }
     }
   }
 
@@ -927,6 +998,7 @@ function parseEntry(raw: unknown): ParsedEntry {
     throw errors.validation(
       `The export contains an unsupported valuation kind "${valuationKind}".`
     );
+  const writeOrder = optWriteOrder(r.writeOrder);
   const tagIdsRaw = r.tagIds ?? [];
   if (!Array.isArray(tagIdsRaw))
     throw errors.validation("An entry in the export has invalid tag references.");
@@ -947,7 +1019,8 @@ function parseEntry(raw: unknown): ParsedEntry {
     merchant: optText(r.merchant, 240),
     transferId: optId(r.transferId),
     valuationKind,
-    tagIds: tagIdsRaw.map((t) => reqId(t, "tag"))
+    tagIds: tagIdsRaw.map((t) => reqId(t, "tag")),
+    writeOrder
   };
 }
 
@@ -1188,6 +1261,20 @@ function optMinor(value: unknown, what: string): number | null {
   const minor = reqMinor(value, what);
   if (minor < 0) throw errors.validation(`The export has a negative ${what}.`);
   return minor;
+}
+
+/**
+ * The per-account write-order rank (exports.ts). Absent on exports written
+ * before the key existed — those restore through the legacy path instead.
+ * A present value must be a non-negative integer; anything else is a
+ * tampered export. Duplicate ranks within an account are tolerated
+ * deterministically (stable array order breaks the tie), never rejected.
+ */
+function optWriteOrder(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0)
+    throw errors.validation("An entry in the export has an invalid write order.");
+  return value;
 }
 
 function reqDate(value: unknown, what: string): string {

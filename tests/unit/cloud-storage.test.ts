@@ -76,6 +76,17 @@ describe("Cloudflare SQLite storage", () => {
       unpriceableRejected: true
     });
   });
+  it("preserves same-day valuation precedence across export and restore in cloud DO", async () => {
+    const result = await probe("export-restore-precedence");
+    expect(result.sourceBalance).toBe(1000);
+    expect(result.restoredBalance).toBe(1000);
+    // The export carries the per-account write order and the manual
+    // valuation (written first) ranks below the holdings valuation.
+    expect(result.todaysValuations).toEqual([
+      { amountMinor: 5000, writeOrder: 0 },
+      { amountMinor: 1000, writeOrder: 1 }
+    ]);
+  });
   it("does not expose uncommitted writes to concurrent readers", async () => {
     expect(await probe("concurrency")).toEqual({ observed: "original" });
   });

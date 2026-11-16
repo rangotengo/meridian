@@ -1,6 +1,7 @@
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import type { Executor } from "../db/client";
 import { chunkParams } from "../db/params";
+import { usesCloudStorage } from "../db/dialect";
 import {
   accountShares,
   accounts,
@@ -33,6 +34,15 @@ import { listAccountsForActor } from "./accounts";
  *     they migrate with the household — unlike MeroShare sync state
  *     (connections, synced accounts/holdings/transactions), which is
  *     deliberately NOT exported: it is recreated by re-syncing.
+ *     Entries also carry a per-account `writeOrder`: the entry's rank among
+ *     its account's entries in source write order (date, created_at,
+ *     insertion sequence). It exists so a restore can reproduce same-day
+ *     valuation precedence exactly — balances resolve competing valuations
+ *     for one date by write order, and without the key the destination
+ *     tiebreak would pick whichever row happened to be imported last.
+ *     Exports written before the key existed (v1, v2, and early v3) carry
+ *     no `writeOrder`; the importer still restores them, with the previous
+ *     fallback behavior (see family-import.ts).
  *
  * Also deliberately NOT exported: MCP OAuth state (oauth_clients,
  * oauth_grants, oauth_authorization_requests, oauth_authorization_codes,
@@ -61,6 +71,10 @@ export async function buildFamilyExport(exec: Executor, actor: Actor): Promise<F
   const tagRows = await exec.select().from(tags).where(eq(tags.familyId, familyId));
 
   // Chunk the IN(...) lists: cloud SQLite caps a statement at 100 parameters.
+  // Entries come back in source write order per account (date, created_at,
+  // insertion sequence — write_seq on PostgreSQL, rowid on cloud), which is
+  // the order the importer must reproduce for same-day valuation precedence.
+  const insertionOrder = usesCloudStorage ? sql`"entries"."rowid"` : sql`"entries"."write_seq"`;
   const entryRows = [];
   for (const chunk of chunkParams(visibleAccountIds)) {
     const rows = await exec
@@ -75,8 +89,18 @@ export async function buildFamilyExport(exec: Executor, actor: Actor): Promise<F
       .innerJoin(accounts, eq(accounts.id, entries.accountId))
       .leftJoin(transactions, eq(transactions.entryId, entries.id))
       .leftJoin(valuations, eq(valuations.entryId, entries.id))
-      .where(and(eq(accounts.familyId, familyId), inArray(accounts.id, chunk)));
+      .where(and(eq(accounts.familyId, familyId), inArray(accounts.id, chunk)))
+      .orderBy(entries.accountId, entries.date, entries.createdAt, insertionOrder);
     entryRows.push(...rows);
+  }
+  // Per-account rank in source write order. Chunks partition accounts, so
+  // each account's rows arrive contiguously and in order.
+  const writeOrderByAccount = new Map<string, number>();
+  const writeOrderByEntry = new Map<string, number>();
+  for (const { entry } of entryRows) {
+    const rank = writeOrderByAccount.get(entry.accountId) ?? 0;
+    writeOrderByAccount.set(entry.accountId, rank + 1);
+    writeOrderByEntry.set(entry.id, rank);
   }
 
   const tagLinks = [];
@@ -244,7 +268,13 @@ export async function buildFamilyExport(exec: Executor, actor: Actor): Promise<F
         merchant: txnMerchant ?? null,
         transferId: txnTransferId && completeTransferIds.has(txnTransferId) ? txnTransferId : null,
         valuationKind: valuationKind ?? null,
-        tagIds: tagsByEntry.get(entry.id) ?? []
+        tagIds: tagsByEntry.get(entry.id) ?? [],
+        // Per-account rank in source write order (see the header comment):
+        // the importer inserts in this order and stamps created_at
+        // monotonically, so the destination balance engine picks the same
+        // winning valuation as the source. Destination timestamps stay
+        // destination-local — this is an ordering key, not a copied clock.
+        writeOrder: writeOrderByEntry.get(entry.id) ?? 0
       })
     ),
     transfers: completeTransfers,
