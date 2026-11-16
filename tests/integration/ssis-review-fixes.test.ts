@@ -91,6 +91,101 @@ function holderPayload(first: string, last: string, requestNo: number): unknown 
   ];
 }
 
+/** A snapshot whose only holder identity lives in the statement dataset. */
+function statementOnlyPayload(name: string, transNo: string): unknown {
+  return [
+    {
+      unitPurchase: [],
+      statement: [
+        {
+          scheme_code: "001",
+          ccode: "1000",
+          SIP_Reg_No: "SIP0001",
+          trans_no: transNo,
+          installmentDate: "2024-01-15",
+          dueDate: null,
+          actionDate: "2024-01-16",
+          Amount_cr: "100.00",
+          Amount_dr: "-",
+          unit: "10",
+          appnav: "10.00",
+          payment: "E-Sewa",
+          otherCharges: "0",
+          sebon_fee: "0",
+          Name: name
+        }
+      ],
+      navData: {
+        IsSucess: true,
+        ResponseData: [{ Scheme_code: "001", nav_date: "2024-03-20", nav_value: 11.5 }]
+      },
+      overallNav: [{ eng_date: "2024-01-31", nep_date: "2080-10-17", nav: "10.10" }]
+    }
+  ];
+}
+
+/** A snapshot carrying no holder identity in any dataset. */
+function anonymousPayload(requestNo: number): unknown {
+  return [
+    {
+      unitPurchase: [
+        {
+          REQUEST_NO: requestNo,
+          APPLY_DT: "2024-01-15",
+          APPLY_UNIT: "10",
+          AMOUNT: "100.00",
+          APPSTATUS: "VERIFIED",
+          current_nav: 10,
+          nav_date: "2024-01-15",
+          SchemeName: "Siddhartha Systematic Investment Scheme",
+          Is_SIP: true
+        }
+      ],
+      statement: [],
+      navData: {},
+      overallNav: []
+    }
+  ];
+}
+
+function bigPurchasePayload(options: {
+  requestNo: number;
+  amount: string;
+  units: string;
+  navValue?: string;
+}): unknown {
+  return [
+    {
+      unitPurchase: [
+        {
+          REQUEST_NO: options.requestNo,
+          FName: "Test",
+          LName: "Holder",
+          APPLY_DT: "2024-01-15",
+          APPLY_UNIT: options.units,
+          AMOUNT: options.amount,
+          APPSTATUS: "VERIFIED",
+          current_nav: 10,
+          nav_date: "2024-01-15",
+          SchemeName: "Siddhartha Systematic Investment Scheme",
+          Is_SIP: true
+        }
+      ],
+      statement: [],
+      navData:
+        options.navValue === undefined
+          ? {}
+          : {
+              IsSucess: true,
+              ResponseData: [
+                { Scheme_code: "001", nav_date: "2024-03-20", nav_value: options.navValue }
+              ]
+            },
+      overallNav: []
+    }
+  ];
+}
+
 describe("SSIS review fixes — holder binding (Postgres)", () => {
   beforeEach(async () => {
     await truncateAll();
@@ -406,5 +501,296 @@ describe("SSIS review fixes — representation bounds (Postgres)", () => {
     await expect(importSsisSnapshot(db(), actor, payload, "import")).rejects.toThrow(/too large/);
     expect(await db().select().from(ssisPurchases)).toHaveLength(0);
     expect(await db().select().from(ssisStatementEntries)).toHaveLength(0);
+  });
+});
+
+describe("SSIS review round 2 — holder binding bypasses (Postgres)", () => {
+  beforeEach(async () => {
+    await truncateAll();
+  });
+
+  it("honors an explicit reset when the first BO is set over snapshot-imported data", async () => {
+    const user = await makeUser();
+    const actor = actorOf(user);
+    // The advertised snapshot-first workflow: import before any BO exists.
+    await importSsisSnapshot(db(), actor, buildSsisPayload(), "import");
+    let insight = await getSsisInsight(db(), actor);
+    expect(insight.hasBoAccount).toBe(false);
+    expect(insight.purchases).toHaveLength(3);
+    expect(insight.holderName).toBe("Test Holder");
+
+    // The admin explicitly confirms the data belongs to a different holder:
+    // the reset must actually happen, not be silently ignored just because
+    // no BO was configured before.
+    const result = await setSsisBoAccountNo(db(), actor, BO_B, { resetExistingData: true });
+    expect(result.dataReset).toBe(true);
+    insight = await getSsisInsight(db(), actor);
+    expect(insight.boAccountMasked).toBe("••••4444");
+    expect(insight.purchases).toHaveLength(0);
+    expect(insight.statement).toHaveLength(0);
+    expect(insight.holderName).toBeNull();
+    expect(insight.lastSource).toBeNull();
+    const [state] = await db().select().from(ssisInsightState);
+    expect(state!.boAccountNo).toBe(BO_B);
+    const configureAudits = await db()
+      .select()
+      .from(auditEvents)
+      .where(eq(auditEvents.action, "ssis.bo_account_configured"));
+    expect(JSON.stringify(configureAudits)).toContain('"dataReset":true');
+  });
+
+  it("binds the first BO to imported data when no reset is requested", async () => {
+    const user = await makeUser();
+    const actor = actorOf(user);
+    await importSsisSnapshot(db(), actor, buildSsisPayload(), "import");
+    const result = await setSsisBoAccountNo(db(), actor, BO_A);
+    expect(result.dataReset).toBe(false);
+    const insight = await getSsisInsight(db(), actor);
+    expect(insight.boAccountMasked).toBe("••••2222");
+    expect(insight.purchases).toHaveLength(3);
+    expect(insight.statement).toHaveLength(2);
+    expect(insight.holderName).toBe("Test Holder");
+    const [state] = await db().select().from(ssisInsightState);
+    expect(state!.boAccountNo).toBe(BO_A);
+  });
+
+  it("rejects a statement-only snapshot that names a different holder", async () => {
+    const user = await makeUser();
+    const actor = actorOf(user);
+    await importSsisSnapshot(db(), actor, buildSsisPayload(), "import");
+    // Identity lives only in the statement dataset here: unitPurchase is
+    // empty, so a purchases-only name check sees no identity at all.
+    await expect(
+      importSsisSnapshot(db(), actor, statementOnlyPayload("Other Person", "T9"), "import")
+    ).rejects.toThrow(/different holder/);
+    const insight = await getSsisInsight(db(), actor);
+    expect(insight.purchases).toHaveLength(3);
+    expect(insight.statement).toHaveLength(2);
+    expect(insight.holderName).toBe("Test Holder");
+    const importAudits = await db()
+      .select()
+      .from(auditEvents)
+      .where(eq(auditEvents.action, "ssis.imported"));
+    expect(importAudits).toHaveLength(1);
+  });
+
+  it("derives holder identity from the statement dataset when purchases carry none", async () => {
+    const user = await makeUser();
+    const actor = actorOf(user);
+    const counts = await importSsisSnapshot(
+      db(),
+      actor,
+      statementOnlyPayload("Statement Holder", "T1"),
+      "import"
+    );
+    expect(counts.statement).toBe(1);
+    let insight = await getSsisInsight(db(), actor);
+    expect(insight.holderName).toBe("Statement Holder");
+    // Purchases naming that same holder now import; another holder's do not.
+    const ok = await importSsisSnapshot(
+      db(),
+      actor,
+      holderPayload("Statement", "Holder", 8301),
+      "import"
+    );
+    expect(ok.purchases).toBe(1);
+    await expect(
+      importSsisSnapshot(db(), actor, holderPayload("Other", "Person", 8302), "import")
+    ).rejects.toThrow(/different holder/);
+    insight = await getSsisInsight(db(), actor);
+    expect(insight.purchases).toHaveLength(1);
+  });
+
+  it("rejects an anonymous snapshot once the insight holds holder data", async () => {
+    const user = await makeUser();
+    const actor = actorOf(user);
+    await importSsisSnapshot(db(), actor, buildSsisPayload(), "import");
+    await expect(importSsisSnapshot(db(), actor, anonymousPayload(8201), "import")).rejects.toThrow(
+      /does not identify/
+    );
+    const insight = await getSsisInsight(db(), actor);
+    expect(insight.purchases).toHaveLength(3);
+    expect(insight.holderName).toBe("Test Holder");
+    const importAudits = await db()
+      .select()
+      .from(auditEvents)
+      .where(eq(auditEvents.action, "ssis.imported"));
+    expect(importAudits).toHaveLength(1);
+  });
+
+  it("still imports an anonymous snapshot into an empty insight", async () => {
+    const user = await makeUser();
+    const actor = actorOf(user);
+    const counts = await importSsisSnapshot(db(), actor, anonymousPayload(8201), "import");
+    expect(counts.purchases).toBe(1);
+    const insight = await getSsisInsight(db(), actor);
+    expect(insight.purchases).toHaveLength(1);
+    expect(insight.holderName).toBeNull();
+  });
+
+  it("rejects a snapshot whose own datasets name two different holders", async () => {
+    const user = await makeUser();
+    const actor = actorOf(user);
+    const payload = statementOnlyPayload("Other Person", "T1") as [
+      { unitPurchase: unknown[]; statement: unknown[] }
+    ];
+    payload[0].unitPurchase = [
+      {
+        REQUEST_NO: 8401,
+        FName: "Test",
+        LName: "Holder",
+        APPLY_DT: "2024-01-15",
+        APPLY_UNIT: "10",
+        AMOUNT: "100.00",
+        APPSTATUS: "VERIFIED"
+      }
+    ];
+    await expect(importSsisSnapshot(db(), actor, payload, "import")).rejects.toThrow(
+      /more than one holder/
+    );
+    expect(await db().select().from(ssisPurchases)).toHaveLength(0);
+    expect(await db().select().from(ssisStatementEntries)).toHaveLength(0);
+    expect(await db().select().from(ssisInsightState)).toHaveLength(0);
+  });
+});
+
+describe("SSIS review round 2 — effective-dataset bounds (Postgres)", () => {
+  beforeEach(async () => {
+    await truncateAll();
+  });
+
+  it("rejects a second fragment whose combined invested total cannot be represented", async () => {
+    const user = await makeUser();
+    const actor = actorOf(user);
+    // Each fragment is individually safe (5e15 minor units); together they
+    // total 1e16, past exact representation.
+    const first = await importSsisSnapshot(
+      db(),
+      actor,
+      bigPurchasePayload({ requestNo: 1, amount: "50000000000000.00", units: "10" }),
+      "import"
+    );
+    expect(first.purchases).toBe(1);
+    await expect(
+      importSsisSnapshot(
+        db(),
+        actor,
+        bigPurchasePayload({ requestNo: 2, amount: "50000000000000.00", units: "10" }),
+        "import"
+      )
+    ).rejects.toThrow(/too large/);
+    // The rejected fragment rolled back: only the first purchase persists.
+    const rows = await db().select().from(ssisPurchases);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.requestNo).toBe("1");
+    const insight = await getSsisInsight(db(), actor);
+    expect(insight.summary.totalInvestedMinor).toBe(5000000000000000);
+    const importAudits = await db()
+      .select()
+      .from(auditEvents)
+      .where(eq(auditEvents.action, "ssis.imported"));
+    expect(importAudits).toHaveLength(1);
+  });
+
+  it("rejects a second fragment whose combined unit total cannot be represented", async () => {
+    const user = await makeUser();
+    const actor = actorOf(user);
+    const first = await importSsisSnapshot(
+      db(),
+      actor,
+      bigPurchasePayload({ requestNo: 1, amount: "100.00", units: "500000000000" }),
+      "import"
+    );
+    expect(first.purchases).toBe(1);
+    await expect(
+      importSsisSnapshot(
+        db(),
+        actor,
+        bigPurchasePayload({ requestNo: 2, amount: "100.00", units: "500000000000" }),
+        "import"
+      )
+    ).rejects.toThrow(/too large/);
+    expect(await db().select().from(ssisPurchases)).toHaveLength(1);
+  });
+
+  it("rejects an import whose new NAV makes the stored position's value unrepresentable", async () => {
+    const user = await makeUser();
+    const actor = actorOf(user);
+    // A large position with no NAV anywhere yet: nothing to value against.
+    await importSsisSnapshot(
+      db(),
+      actor,
+      bigPurchasePayload({ requestNo: 1, amount: "100.00", units: "500000000000" }),
+      "import"
+    );
+    // A small second purchase carrying a huge current NAV. The incoming
+    // fragment alone values safely; applied to the stored position it
+    // overflows, so the whole import — purchase included — rolls back.
+    await expect(
+      importSsisSnapshot(
+        db(),
+        actor,
+        bigPurchasePayload({
+          requestNo: 2,
+          amount: "10.00",
+          units: "1",
+          navValue: "1000000.00"
+        }),
+        "import"
+      )
+    ).rejects.toThrow(/too large/);
+    expect(await db().select().from(ssisPurchases)).toHaveLength(1);
+    const [state] = await db().select().from(ssisInsightState);
+    expect(state!.latestNavMinor).toBeNull();
+    const importAudits = await db()
+      .select()
+      .from(auditEvents)
+      .where(eq(auditEvents.action, "ssis.imported"));
+    expect(importAudits).toHaveLength(1);
+  });
+
+  it("rejects a NAV-only refresh that would overflow the stored position, leaving state untouched", async () => {
+    const user = await makeUser();
+    const actor = actorOf(user);
+    await setSsisBoAccountNo(db(), actor, BO_A);
+    // 5e11 units valued at NAV 1.00: value 5e13 minor units, safely inside.
+    await importSsisSnapshot(
+      db(),
+      actor,
+      bigPurchasePayload({
+        requestNo: 1,
+        amount: "100.00",
+        units: "500000000000",
+        navValue: "1.00"
+      }),
+      "import"
+    );
+    const [before] = await db().select().from(ssisInsightState);
+    expect(before!.latestNavMinor).toBe(100);
+
+    // Partial refresh: purchases, statement and history all fail upstream;
+    // only the current NAV arrives, at 1,000,000.00. Applied to the stored
+    // position the value cannot be represented, so the commit rolls back.
+    const navOnlyFetch: typeof fetch = async (input) => {
+      const url = String(input);
+      if (url.includes("GetNAV")) {
+        return jsonResponse({
+          ResponseData: [{ Scheme_code: "001", nav_date: "2024-03-21", nav_value: "1000000.00" }]
+        });
+      }
+      return jsonResponse(
+        url.includes("admin-ajax.php") ? { success: false, data: [] } : APP_ERROR_BODY
+      );
+    };
+    await expect(refreshSsis(db(), actor, navOnlyFetch)).rejects.toThrow(/too large/);
+    const [after] = await db().select().from(ssisInsightState);
+    expect(after!.latestNavMinor).toBe(100);
+    expect(after!.lastSource).toBe("import");
+    expect(await db().select().from(ssisPurchases)).toHaveLength(1);
+    const refreshAudits = await db()
+      .select()
+      .from(auditEvents)
+      .where(eq(auditEvents.action, "ssis.refreshed"));
+    expect(refreshAudits).toHaveLength(0);
   });
 });

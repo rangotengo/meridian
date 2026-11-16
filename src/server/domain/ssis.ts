@@ -37,8 +37,11 @@ import { fetchSsisSnapshot } from "./ssis-fetch";
  * config_generation, and a refresh re-checks the generation it fetched for
  * inside its commit transaction — a refresh started for the old holder
  * therefore cannot write after a switch. Snapshot imports are bound by
- * holder name: a snapshot naming a different holder than the stored data
- * is rejected instead of merged.
+ * holder identity, derived from every holder-bearing dataset (purchase
+ * FName/LName and statement Name alike): a snapshot naming a different
+ * holder than the stored data is rejected instead of merged, and a file
+ * import carrying no identity at all is rejected once the insight holds
+ * holder data — missing identity is not permission to merge.
  */
 
 export const SSIS_SCHEME_NAME = "Siddhartha Systematic Investment Scheme";
@@ -220,6 +223,8 @@ export type SsisExtractedSnapshot = {
   statement: SsisStatementRow[];
   navHistory: SsisNavPoint[];
   holderName: string | null;
+  /** Every distinct holder name asserted by any dataset (0 or 1 entries). */
+  holderNames: string[];
   navDataNav: { navMinor: number; navDate: string } | null;
   skipped: number;
 };
@@ -305,15 +310,33 @@ function extractNavDataNav(navData: unknown): { navMinor: number; navDate: strin
   return { navMinor, navDate };
 }
 
-function holderNameOf(rows: unknown[]): string | null {
+/**
+ * Holder identity can appear in either holder-bearing dataset: purchase
+ * rows carry FName/LName, statement rows carry a single Name. Identity is
+ * derived from ALL of them — a name that only appears in the statement
+ * must still bind (and still be checked), or a statement-only snapshot
+ * could merge another holder's rows under the stored holder.
+ */
+function rowHolderName(row: unknown): string | null {
+  if (!isRecord(row)) return null;
+  const full = textValue(row.Name, 240);
+  if (full) return full;
+  const first = textValue(row.FName, 120);
+  const last = textValue(row.LName, 120);
+  const name = [first, last].filter(Boolean).join(" ").trim();
+  return name === "" ? null : name;
+}
+
+/** Distinct holder names across rows, compared case/whitespace-insensitively. */
+function distinctHolderNames(rows: unknown[]): string[] {
+  const byNormalized = new Map<string, string>();
   for (const row of rows) {
-    if (!isRecord(row)) continue;
-    const first = textValue(row.FName, 120);
-    const last = textValue(row.LName, 120);
-    const name = [first, last].filter(Boolean).join(" ").trim();
-    if (name !== "") return name;
+    const name = rowHolderName(row);
+    if (name && !byNormalized.has(normalizeHolderName(name))) {
+      byNormalized.set(normalizeHolderName(name), name);
+    }
   }
-  return null;
+  return [...byNormalized.values()];
 }
 
 /**
@@ -384,11 +407,23 @@ export function extractSsisSnapshot(payload: unknown): SsisExtractedSnapshot {
     );
   }
 
+  // Holder identity is asserted by every holder-bearing dataset, not just
+  // purchases. A snapshot whose own datasets disagree about the holder is
+  // not a reliable binding and is rejected outright — it can never be
+  // merged safely under any single-holder policy.
+  const holderNames = distinctHolderNames([...unitPurchase, ...statement]);
+  if (holderNames.length > 1) {
+    throw errors.validation(
+      "That snapshot names more than one holder across its datasets, so nothing was imported. Export a single holder's snapshot and try again."
+    );
+  }
+
   return {
     purchases: purchaseList,
     statement: statementList,
     navHistory: navList,
-    holderName: holderNameOf(unitPurchase),
+    holderName: holderNames[0] ?? null,
+    holderNames,
     navDataNav: extractNavDataNav(navData),
     skipped
   };
@@ -642,14 +677,38 @@ export async function importSsisSnapshot(
         );
       }
     }
-    if (
-      state?.holderName &&
-      data.holderName &&
-      normalizeHolderName(state.holderName) !== normalizeHolderName(data.holderName)
-    ) {
-      throw errors.validation(
-        `This insight already holds data for ${state.holderName}, and this data names a different holder. Nothing was imported — to switch holders, change the BO account number and confirm the switch, which clears the previous holder's data.`
-      );
+    // Holder binding. Every name the incoming snapshot asserts — from any
+    // dataset — must match the stored holder. Missing identity is not
+    // permission to merge: a file import into an insight that already
+    // holds holder data must identify the holder it belongs to. Live
+    // refreshes are exempt from the identity requirement (they are bound
+    // by the expectedConfig generation check above and may legitimately
+    // arrive with some datasets missing), but a refresh whose data names
+    // a different holder is still rejected.
+    if (state?.holderName) {
+      const storedNormalized = normalizeHolderName(state.holderName);
+      if (data.holderNames.some((name) => normalizeHolderName(name) !== storedNormalized)) {
+        throw errors.validation(
+          `This insight already holds data for ${state.holderName}, and this data names a different holder. Nothing was imported — to switch holders, change the BO account number and confirm the switch, which clears the previous holder's data.`
+        );
+      }
+    }
+    if (!options.expectedConfig && data.holderNames.length === 0) {
+      const [storedPurchase] = await tx
+        .select({ id: ssisPurchases.id })
+        .from(ssisPurchases)
+        .where(eq(ssisPurchases.familyId, familyId))
+        .limit(1);
+      const [storedStatement] = await tx
+        .select({ id: ssisStatementEntries.id })
+        .from(ssisStatementEntries)
+        .where(eq(ssisStatementEntries.familyId, familyId))
+        .limit(1);
+      if (storedPurchase || storedStatement || state?.holderName) {
+        throw errors.validation(
+          "This snapshot does not identify which holder it belongs to, and this insight already holds holder data — nothing was imported. Import the holder's own snapshot export, or switch holders from the BO account settings to start fresh."
+        );
+      }
     }
     for (const purchase of data.purchases) {
       await tx
@@ -723,6 +782,61 @@ export async function importSsisSnapshot(
           updatedAt: new Date()
         }
       });
+    // Effective-dataset bounds. The checks on the incoming fragment (in
+    // extraction and above) are a fast path only: what must stay exactly
+    // representable is the dataset that remains stored AFTER the upserts.
+    // Two individually-safe fragments can combine past the safe range, and
+    // a NAV-only update can overflow a stored position it never mentions.
+    // Validate the post-upsert totals and the value at the resolved
+    // current NAV (stored history/state merged with this commit) inside
+    // the same family-locked transaction; throwing here rolls the whole
+    // commit back — for file imports and refreshes alike — so an
+    // unrepresentable result is never persisted. (Read-side nulls remain
+    // the defensive fallback for any legacy rows.)
+    const storedPurchases = await tx
+      .select({ units: ssisPurchases.units, amountMinor: ssisPurchases.amountMinor })
+      .from(ssisPurchases)
+      .where(eq(ssisPurchases.familyId, familyId));
+    let effectiveUnitsScaled = 0n;
+    let effectiveInvested = 0n;
+    for (const row of storedPurchases) {
+      effectiveUnitsScaled += parseDecimalScaled(row.units, UNITS_SCALE) ?? 0n;
+      effectiveInvested += BigInt(row.amountMinor);
+    }
+    if (effectiveUnitsScaled > MAX_SAFE || effectiveInvested > MAX_SAFE) {
+      throw errors.validation(
+        "The combined SSIS data for this insight is too large for Meridian to represent exactly, so nothing was imported. The previously stored data is unchanged."
+      );
+    }
+    const storedNavHistory = await tx
+      .select({
+        engDate: ssisNavHistory.engDate,
+        nepDate: ssisNavHistory.nepDate,
+        navMinor: ssisNavHistory.navMinor
+      })
+      .from(ssisNavHistory)
+      .where(eq(ssisNavHistory.familyId, familyId));
+    const [effectiveState] = await tx
+      .select()
+      .from(ssisInsightState)
+      .where(eq(ssisInsightState.familyId, familyId))
+      .limit(1);
+    const effectiveStateNav =
+      effectiveState?.latestNavMinor != null && effectiveState?.latestNavDate
+        ? { navMinor: effectiveState.latestNavMinor, navDate: effectiveState.latestNavDate }
+        : null;
+    const resolvedNav = resolveCurrentNav(storedNavHistory, effectiveStateNav, today);
+    if (resolvedNav) {
+      const value = roundHalfUpDiv(
+        effectiveUnitsScaled * BigInt(resolvedNav.navMinor),
+        UNITS_FACTOR
+      );
+      if (toSafeNumber(value) === null) {
+        throw errors.validation(
+          "The stored position's value at the current NAV is too large for Meridian to represent exactly, so nothing was imported. The previously stored data is unchanged."
+        );
+      }
+    }
     await recordAudit(tx, {
       familyId,
       actorUserId: actor.userId,
@@ -761,8 +875,12 @@ export type SsisBoConfigResult = { dataReset: boolean };
  * purchases or statement, changing the number is rejected unless the
  * caller explicitly confirms the switch (`resetExistingData`), in which
  * case the previous holder's datasets are cleared in the same transaction
- * (scheme-level NAV history is kept — it is not holder data). Every actual
- * change bumps config_generation so an in-flight refresh for the old
+ * (scheme-level NAV history is kept — it is not holder data). The same
+ * rule applies to the FIRST binding when snapshot data was imported
+ * before any number was configured: an explicit reset clears the imported
+ * data and reports `dataReset`, while without a reset the number simply
+ * binds to the imported data and keeps it (the snapshot-first workflow).
+ * Every actual change bumps config_generation so an in-flight refresh for the old
  * holder fails its commit check instead of writing under the new holder.
  *
  * Error hygiene: the upsert binds the BO number as a parameter, and ORM /
@@ -791,9 +909,9 @@ export async function setSsisBoAccountNo(
         .where(eq(ssisInsightState.familyId, actor.familyId))
         .limit(1);
       const previousBo = state?.boAccountNo ?? null;
-      const switching = previousBo !== null && previousBo !== normalized;
+      const changed = previousBo !== normalized;
       let dataReset = false;
-      if (switching) {
+      if (changed) {
         const purchaseRows = await tx
           .select({ id: ssisPurchases.id })
           .from(ssisPurchases)
@@ -804,20 +922,25 @@ export async function setSsisBoAccountNo(
           .where(eq(ssisStatementEntries.familyId, actor.familyId));
         const hasHolderData =
           purchaseRows.length > 0 || statementRows.length > 0 || !!state?.holderName;
-        if (hasHolderData && !options.resetExistingData) {
-          throw errors.validation(
-            "This insight already holds purchases and statement data for the current BO account. Changing the number would mix two holders' data — confirm the switch to clear the existing holder data and start fresh for the new holder."
-          );
-        }
-        if (hasHolderData) {
+        if (hasHolderData && options.resetExistingData) {
+          // A confirmed switch — including the FIRST binding over
+          // snapshot-imported data, where no previous BO exists. An
+          // explicit reset is always honored, never silently ignored
+          // just because there was no earlier number to switch from.
           await tx.delete(ssisPurchases).where(eq(ssisPurchases.familyId, actor.familyId));
           await tx
             .delete(ssisStatementEntries)
             .where(eq(ssisStatementEntries.familyId, actor.familyId));
           dataReset = true;
+        } else if (hasHolderData && previousBo !== null) {
+          throw errors.validation(
+            "This insight already holds purchases and statement data for the current BO account. Changing the number would mix two holders' data — confirm the switch to clear the existing holder data and start fresh for the new holder."
+          );
         }
+        // Remaining case: the first BO binding over snapshot-imported
+        // data with no reset requested — bind the number to the imported
+        // data and keep it (the snapshot-first workflow).
       }
-      const changed = previousBo !== normalized;
       const configGeneration =
         (state?.configGeneration ?? 0) + (changed && previousBo !== null ? 1 : 0);
       const resetFields = dataReset

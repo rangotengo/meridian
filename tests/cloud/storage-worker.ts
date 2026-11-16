@@ -101,6 +101,7 @@ export class StorageProbe {
       operation === "/valuation-edit" ||
       operation === "/ssis" ||
       operation === "/ssis-fixes" ||
+      operation === "/ssis-round2" ||
       operation === "/holdings" ||
       operation === "/export-restore-precedence"
     ) {
@@ -613,6 +614,177 @@ export class StorageProbe {
           oversizedRejected,
           faultMessage,
           faultChainHasBo: faultMessage.includes(FAULT_BO)
+        });
+      }
+      if (operation === "/ssis-round2") {
+        const BO1 = "1301000011112222";
+        const BO2 = "1301000033334444";
+        const cleanSlate = async () => {
+          await db.execute(sql`DELETE FROM ssis_purchases WHERE family_id = ${actor.familyId}`);
+          await db.execute(
+            sql`DELETE FROM ssis_statement_entries WHERE family_id = ${actor.familyId}`
+          );
+          await db.execute(sql`DELETE FROM ssis_nav_history WHERE family_id = ${actor.familyId}`);
+          await db.execute(sql`DELETE FROM ssis_insight_state WHERE family_id = ${actor.familyId}`);
+        };
+        const purchase = (overrides: Record<string, unknown>) => ({
+          REQUEST_NO: 5001,
+          FName: "Cloud",
+          LName: "Holder",
+          APPLY_DT: "2024-01-15",
+          APPLY_UNIT: 100,
+          AMOUNT: "1000.00",
+          APPSTATUS: "VERIFIED",
+          current_nav: 10,
+          nav_date: "2024-01-15",
+          SchemeName: "Siddhartha Systematic Investment Scheme",
+          Is_SIP: true,
+          ...overrides
+        });
+        const envelope = (parts: Record<string, unknown>) => [
+          { unitPurchase: [], statement: [], navData: {}, overallNav: [], ...parts }
+        ];
+
+        // Finding A(1): the first BO set without a reset binds to
+        // snapshot-imported data and keeps it.
+        await cleanSlate();
+        await importSsisSnapshot(exec, actor, envelope({ unitPurchase: [purchase({})] }), "import");
+        const bindKept = await setSsisBoAccountNo(exec, actor, BO1);
+        const afterBindKept = await getSsisInsight(exec, actor);
+
+        // Finding A(1): the first BO set WITH an explicit reset clears the
+        // imported data even though no BO was configured before.
+        await cleanSlate();
+        await importSsisSnapshot(exec, actor, envelope({ unitPurchase: [purchase({})] }), "import");
+        const bindReset = await setSsisBoAccountNo(exec, actor, BO2, { resetExistingData: true });
+        const afterBindReset = await getSsisInsight(exec, actor);
+
+        // Finding A(2): identity asserted only by the statement dataset is
+        // enforced, and an anonymous snapshot cannot merge into stored data.
+        await importSsisSnapshot(exec, actor, envelope({ unitPurchase: [purchase({})] }), "import");
+        const statementRow = (name: string) => ({
+          trans_no: "CT9",
+          installmentDate: "2024-01-15",
+          dueDate: null,
+          actionDate: "2024-01-16",
+          Amount_cr: "100.00",
+          Amount_dr: "-",
+          unit: "10",
+          appnav: "10.00",
+          payment: "E-Sewa",
+          otherCharges: "0",
+          sebon_fee: "0",
+          SIP_Reg_No: "SIP0001",
+          Name: name
+        });
+        const otherHolderRejected = await importSsisSnapshot(
+          exec,
+          actor,
+          envelope({ statement: [statementRow("Other Person")] }),
+          "import"
+        ).then(
+          () => false,
+          () => true
+        );
+        const anonymousRejected = await importSsisSnapshot(
+          exec,
+          actor,
+          envelope({
+            unitPurchase: [
+              {
+                REQUEST_NO: 5002,
+                APPLY_DT: "2024-01-15",
+                APPLY_UNIT: 10,
+                AMOUNT: "100.00",
+                APPSTATUS: "VERIFIED"
+              }
+            ]
+          }),
+          "import"
+        ).then(
+          () => false,
+          () => true
+        );
+        const afterAnonymous = await getSsisInsight(exec, actor);
+
+        // Finding B(1): two individually-safe fragments whose combined
+        // invested total is unrepresentable — the second is rejected and
+        // the first fragment's row remains the only one stored.
+        await cleanSlate();
+        const bigFragment = (requestNo: number) =>
+          envelope({
+            unitPurchase: [
+              purchase({ REQUEST_NO: requestNo, APPLY_UNIT: "10", AMOUNT: "50000000000000.00" })
+            ]
+          });
+        await importSsisSnapshot(exec, actor, bigFragment(6001), "import");
+        const combinedRejected = await importSsisSnapshot(
+          exec,
+          actor,
+          bigFragment(6002),
+          "import"
+        ).then(
+          () => false,
+          () => true
+        );
+        const afterCombined = await getSsisInsight(exec, actor);
+
+        // Finding B(2): a NAV-only refresh that would overflow the stored
+        // position is rejected; the stored NAV is untouched.
+        await cleanSlate();
+        await setSsisBoAccountNo(exec, actor, BO1);
+        await importSsisSnapshot(
+          exec,
+          actor,
+          envelope({
+            unitPurchase: [
+              purchase({ REQUEST_NO: 6003, APPLY_UNIT: "500000000000", AMOUNT: "100.00" })
+            ],
+            navData: {
+              ResponseData: [{ Scheme_code: "001", nav_date: "2024-03-20", nav_value: "1.00" }]
+            }
+          }),
+          "import"
+        );
+        const navOnlyFetch = async (input: unknown) => {
+          const url = String(input);
+          const body = url.includes("GetNAV")
+            ? {
+                ResponseData: [
+                  { Scheme_code: "001", nav_date: "2024-03-21", nav_value: "1000000.00" }
+                ]
+              }
+            : url.includes("admin-ajax.php")
+              ? { success: false, data: [] }
+              : { IsSucess: false, ResponseData: null, success: false, data: [] };
+          return new Response(JSON.stringify(body), {
+            status: 200,
+            headers: { "Content-Type": "application/json" }
+          });
+        };
+        const navOverflowRejected = await refreshSsis(
+          exec,
+          actor,
+          navOnlyFetch as typeof fetch
+        ).then(
+          () => false,
+          () => true
+        );
+        const afterNavOverflow = await getSsisInsight(exec, actor);
+
+        return Response.json({
+          bindKeptDataReset: bindKept.dataReset,
+          purchasesAfterBindKept: afterBindKept.purchases.length,
+          bindResetDataReset: bindReset.dataReset,
+          purchasesAfterBindReset: afterBindReset.purchases.length,
+          otherHolderRejected,
+          anonymousRejected,
+          purchasesAfterAnonymous: afterAnonymous.purchases.length,
+          combinedRejected,
+          purchasesAfterCombined: afterCombined.purchases.length,
+          totalInvestedAfterCombined: afterCombined.summary.totalInvestedMinor,
+          navOverflowRejected,
+          navAfterNavOverflow: afterNavOverflow.summary.currentNavMinor
         });
       }
       const account = await createAccount(exec, actor, {
