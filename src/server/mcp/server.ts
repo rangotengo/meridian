@@ -53,11 +53,13 @@ import {
 } from "../domain/reports";
 import { accessibleAccountIds } from "../authorization/access";
 import {
+  getSsisCoverage,
   getSsisInsight,
   resolveCurrentNav,
   toSsisNavPoint,
   toSsisPurchaseRow,
-  toSsisStatementRow
+  toSsisStatementRow,
+  type SsisDatasetCoverage
 } from "../domain/ssis";
 import { recordAudit } from "../observability/audit";
 import type { McpAccess } from "../domain/oauth";
@@ -147,6 +149,28 @@ function ssisPage(limit: number, offset: number, returned: number, totalMatching
     totalMatching,
     hasMore: offset + returned < totalMatching
   };
+}
+
+/**
+ * Caveat lines for one SSIS dataset's persisted coverage, shared by the
+ * SSIS tools. An "ok" dataset needs no caveat; anything else is spelled
+ * out so stored rows are never mistaken for a complete, fresh dataset —
+ * a failed holder fetch must not read as a genuinely empty position.
+ */
+function ssisCoverageLimitations(label: string, coverage: SsisDatasetCoverage): string[] {
+  if (coverage.status === "ok") return [];
+  if (coverage.status === "failed") {
+    return [
+      `${label} data may be incomplete: the most recent refresh could not retrieve it from Siddhartha Capital${
+        coverage.fetchedAt
+          ? `; the rows shown date from the last successful fetch at ${coverage.fetchedAt}`
+          : "; it has never been fetched successfully"
+      }.`
+    ];
+  }
+  return [
+    `${label} coverage is unknown: Meridian has no recorded successful fetch of this dataset, so the rows shown cannot be confirmed complete.`
+  ];
 }
 
 const dateString = z
@@ -896,7 +920,7 @@ export function createMeridianMcpServer(ctx: McpRequestContext): McpServer {
     {
       title: "Get SSIS summary",
       description:
-        "Read-only summary of the household's SSIS insight (Siddhartha Systematic Investment Scheme): totals invested, units held, current NAV and value, profit and return, plus dataset counts and freshness. Requires the finance:read scope AND this connection's explicit SSIS permission (the owner enables it in Settings → Connected AI agents); SSIS is household-wide data separate from accounts, so account restrictions on the connection do not apply to it. Amounts are integer minor units as strings in NPR. A figure that cannot be represented exactly is null, never approximated. SSIS figures are NOT part of account balances or net worth, and this tool never imports or refreshes data — dataAsOf is the last import/refresh Meridian recorded.",
+        "Read-only summary of the household's SSIS insight (Siddhartha Systematic Investment Scheme): totals invested, units held, current NAV and value, profit and return, plus dataset counts and per-dataset coverage. Requires the finance:read scope AND this connection's explicit SSIS permission (the owner enables it in Settings → Connected AI agents); SSIS is household-wide data separate from accounts, so account restrictions on the connection do not apply to it. Amounts are integer minor units as strings in NPR. A figure that cannot be represented exactly is null, never approximated. SSIS figures are NOT part of account balances or net worth, and this tool never imports or refreshes data. coverage reports, per dataset (purchases, statement, nav), the last known fetch outcome and the last successful fetch time; totals.complete is true only when purchase coverage is established — otherwise the totals are subtotals of the rows currently stored and may understate the position (e.g. after a partially failed refresh), never a confirmed complete zero.",
       inputSchema: z.object({}),
       annotations: READ_ONLY_ANNOTATIONS
     },
@@ -912,11 +936,19 @@ export function createMeridianMcpServer(ctx: McpRequestContext): McpServer {
       const limitations = [SSIS_SEPARATE_NOTE];
       if (insight.lastFetchedAt) {
         limitations.push(
-          "Figures reflect the last SSIS import or refresh recorded by Meridian (dataAsOf); MCP reads never fetch live data, so freshness beyond that timestamp is unknown."
+          "dataAsOf is the most recent import or refresh of ANY SSIS dataset; it does not imply every dataset was refreshed then. Per-dataset freshness is reported under coverage, and MCP reads never fetch live data."
         );
       } else {
         limitations.push(
           "Freshness is unknown: no SSIS import or refresh timestamp is recorded for this household."
+        );
+      }
+      limitations.push(...ssisCoverageLimitations("Purchase", insight.coverage.purchases));
+      limitations.push(...ssisCoverageLimitations("Statement", insight.coverage.statement));
+      limitations.push(...ssisCoverageLimitations("NAV", insight.coverage.nav));
+      if (insight.coverage.purchases.status !== "ok") {
+        limitations.push(
+          "Totals are computed from the purchase rows currently stored and are observed subtotals, not a confirmed complete position (see totals.complete)."
         );
       }
       if (!insight.hasData) {
@@ -941,12 +973,14 @@ export function createMeridianMcpServer(ctx: McpRequestContext): McpServer {
           hasData: insight.hasData,
           dataAsOf: insight.lastFetchedAt,
           lastSource: insight.lastSource,
+          coverage: insight.coverage,
           counts: {
             purchases: s.purchaseCount,
             statementEntries: insight.statement.length,
             navPoints: insight.navSeries.length
           },
           totals: {
+            complete: insight.coverage.purchases.status === "ok",
             purchaseCount: s.purchaseCount,
             totalUnits: s.totalUnits,
             totalInvested: ssisMoney(s.totalInvestedMinor),
@@ -978,7 +1012,7 @@ export function createMeridianMcpServer(ctx: McpRequestContext): McpServer {
     {
       title: "List SSIS purchases",
       description:
-        "Read-only, paginated list of the household's SSIS purchases (oldest first), with optional from/to filters on the apply date (YYYY-MM-DD). Requires the finance:read scope AND this connection's explicit SSIS permission. Amounts are integer minor units as strings in NPR; unit quantities are decimal strings. Returns page.totalMatching so a page is never mistaken for the full history.",
+        "Read-only, paginated list of the household's SSIS purchases (oldest first), with optional from/to filters on the apply date (YYYY-MM-DD). Requires the finance:read scope AND this connection's explicit SSIS permission. Amounts are integer minor units as strings in NPR; unit quantities are decimal strings. Returns page.totalMatching so a page is never mistaken for the full history — note totalMatching counts only the rows currently stored; coverage reports whether the purchase dataset was fetched successfully and when, so an incomplete or stale list is distinguishable from a complete one.",
       inputSchema: z.object({
         from: dateString.optional(),
         to: dateString.optional(),
@@ -1017,9 +1051,16 @@ export function createMeridianMcpServer(ctx: McpRequestContext): McpServer {
         isSip: p.isSip
       }));
 
+      const coverage = await getSsisCoverage(exec, family.id);
       const result = {
         ...envelope(),
         note: SSIS_SEPARATE_NOTE,
+        dataAsOf: coverage.purchases.fetchedAt,
+        coverage,
+        limitations: [
+          "page.totalMatching counts only the purchase rows currently stored in Meridian.",
+          ...ssisCoverageLimitations("Purchase", coverage.purchases)
+        ],
         period: { from: args.from ?? null, to: args.to ?? null },
         purchases,
         page: ssisPage(args.limit, args.offset, purchases.length, countRow?.total ?? 0)
@@ -1035,7 +1076,7 @@ export function createMeridianMcpServer(ctx: McpRequestContext): McpServer {
     {
       title: "List SSIS statement entries",
       description:
-        "Read-only, paginated list of the household's SSIS statement entries (oldest first), with optional from/to filters on the installment date (YYYY-MM-DD). Requires the finance:read scope AND this connection's explicit SSIS permission. Amounts are integer minor units as strings in NPR (amountCr = credited, amountDr = debited); unit quantities are decimal strings. Returns page.totalMatching so a page is never mistaken for the full statement.",
+        "Read-only, paginated list of the household's SSIS statement entries (oldest first), with optional from/to filters on the installment date (YYYY-MM-DD). Requires the finance:read scope AND this connection's explicit SSIS permission. Amounts are integer minor units as strings in NPR (amountCr = credited, amountDr = debited); unit quantities are decimal strings. Returns page.totalMatching so a page is never mistaken for the full statement — note totalMatching counts only the rows currently stored; coverage reports whether the statement dataset was fetched successfully and when, so an incomplete or stale list is distinguishable from a complete one.",
       inputSchema: z.object({
         from: dateString.optional(),
         to: dateString.optional(),
@@ -1081,9 +1122,16 @@ export function createMeridianMcpServer(ctx: McpRequestContext): McpServer {
         sebonFee: money(r.sebonFeeMinor, SSIS_CURRENCY)
       }));
 
+      const coverage = await getSsisCoverage(exec, family.id);
       const result = {
         ...envelope(),
         note: SSIS_SEPARATE_NOTE,
+        dataAsOf: coverage.statement.fetchedAt,
+        coverage,
+        limitations: [
+          "page.totalMatching counts only the statement rows currently stored in Meridian.",
+          ...ssisCoverageLimitations("Statement", coverage.statement)
+        ],
         period: { from: args.from ?? null, to: args.to ?? null },
         statement,
         page: ssisPage(args.limit, args.offset, statement.length, countRow?.total ?? 0)
@@ -1099,7 +1147,7 @@ export function createMeridianMcpServer(ctx: McpRequestContext): McpServer {
     {
       title: "Get SSIS NAV history",
       description:
-        "Read-only, paginated NAV history for the household's SSIS scheme (oldest first), with optional from/to filters on the NAV date (YYYY-MM-DD). Requires the finance:read scope AND this connection's explicit SSIS permission. NAV values are integer minor units as strings in NPR. currentNav is the value in effect today under the domain's selection rules (latest recorded NAV not in the future, falling back to the last fetched quote); it is null when no NAV is known.",
+        "Read-only, paginated NAV history for the household's SSIS scheme (oldest first), with optional from/to filters on the NAV date (YYYY-MM-DD). Requires the finance:read scope AND this connection's explicit SSIS permission. NAV values are integer minor units as strings in NPR. currentNav is the value in effect today under the domain's selection rules (latest recorded NAV not in the future, falling back to the last fetched quote); it is null when no NAV is known. coverage reports whether the NAV dataset was fetched successfully and when (dataAsOf alone is the most recent fetch of ANY SSIS dataset).",
       inputSchema: z.object({
         from: dateString.optional(),
         to: dateString.optional(),
@@ -1158,10 +1206,13 @@ export function createMeridianMcpServer(ctx: McpRequestContext): McpServer {
         nav: money(p.navMinor, SSIS_CURRENCY)
       }));
 
+      const coverage = await getSsisCoverage(exec, family.id);
       const result = {
         ...envelope(),
         note: SSIS_SEPARATE_NOTE,
         dataAsOf: state?.lastFetchedAt ? new Date(state.lastFetchedAt).toISOString() : null,
+        coverage,
+        limitations: ssisCoverageLimitations("NAV", coverage.nav),
         period: { from: args.from ?? null, to: args.to ?? null },
         currentNav: current
           ? { ...money(current.navMinor, SSIS_CURRENCY), date: current.navDate }

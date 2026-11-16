@@ -81,11 +81,13 @@ const READ_SERVICE_ALLOWLIST = new Set([
   "recordAudit",
   // SSIS read model (domain/ssis): calculations and row projections
   // only — the mutators above stay banned.
+  "getSsisCoverage",
   "getSsisInsight",
   "resolveCurrentNav",
   "toSsisNavPoint",
   "toSsisPurchaseRow",
   "toSsisStatementRow",
+  "SsisDatasetCoverage",
   // types
   "DashboardSummary",
   "FxCompleteness",

@@ -661,7 +661,66 @@ export type SsisImportOptions = {
    * insight with the previous holder's rows.
    */
   expectedConfig?: { boAccountNo: string; configGeneration: number };
+  /**
+   * Refresh commits also carry the fetcher's per-dataset outcomes so the
+   * commit can persist dataset coverage alongside the rows (see
+   * SsisCoverage). Snapshot imports omit this: the import envelope
+   * structurally carries every dataset, so an import establishes full
+   * coverage by construction.
+   */
+  datasetOutcomes?: SsisDatasetOutcomes;
 };
+
+export type SsisDatasetOutcomes = { purchases: boolean; statement: boolean; nav: boolean };
+
+// ---------------------------------------------------------------------------
+// Dataset coverage
+// ---------------------------------------------------------------------------
+
+export type SsisDatasetStatus = "ok" | "failed" | "unknown";
+export type SsisDatasetCoverage = { status: SsisDatasetStatus; fetchedAt: string | null };
+export type SsisCoverage = {
+  purchases: SsisDatasetCoverage;
+  statement: SsisDatasetCoverage;
+  nav: SsisDatasetCoverage;
+};
+
+type SsisStateRow = typeof ssisInsightState.$inferSelect;
+
+function datasetCoverage(
+  coverage: string | null | undefined,
+  fetchedAt: Date | string | null | undefined
+): SsisDatasetCoverage {
+  return {
+    status: coverage === "ok" ? "ok" : coverage === "failed" ? "failed" : "unknown",
+    fetchedAt: fetchedAt ? new Date(fetchedAt).toISOString() : null
+  };
+}
+
+/**
+ * The persisted per-dataset coverage contract: each dataset's last known
+ * fetch outcome and when it last fetched SUCCESSFULLY. "unknown" means
+ * coverage was never established — no refresh outcome and no snapshot
+ * import has recorded one — so stored rows alone prove nothing about
+ * completeness. This is what lets a reader distinguish a holder dataset
+ * that failed to refresh from a genuinely empty position.
+ */
+export function ssisCoverageFromState(state: SsisStateRow | null | undefined): SsisCoverage {
+  return {
+    purchases: datasetCoverage(state?.purchasesCoverage, state?.purchasesFetchedAt),
+    statement: datasetCoverage(state?.statementCoverage, state?.statementFetchedAt),
+    nav: datasetCoverage(state?.navCoverage, state?.navFetchedAt)
+  };
+}
+
+export async function getSsisCoverage(exec: Executor, familyId: string): Promise<SsisCoverage> {
+  const [state] = await exec
+    .select()
+    .from(ssisInsightState)
+    .where(eq(ssisInsightState.familyId, familyId))
+    .limit(1);
+  return ssisCoverageFromState(state ?? null);
+}
 
 /**
  * Serialize SSIS writes per family (the family-import pattern). On the
@@ -832,6 +891,38 @@ export async function importSsisSnapshot(
           set: { nepDate: point.nepDate, navMinor: point.navMinor, updatedAt: new Date() }
         });
     }
+    // Persist per-dataset coverage in the same commit as the rows it
+    // describes, so a later read can never see rows without the outcome
+    // that produced them. A successful dataset records 'ok' and moves
+    // its last-success timestamp; a failed one records 'failed' and
+    // NEVER moves the timestamp, so rows from an older success stay
+    // visibly stale instead of looking fresh. When no outcomes are
+    // known (a refresh-shaped commit without fetcher outcomes), the
+    // stored coverage is left untouched rather than guessed.
+    const outcomes =
+      options.datasetOutcomes ??
+      (source === "import" ? { purchases: true, statement: true, nav: true } : null);
+    const fetchedNow = new Date();
+    const coverageInsert = outcomes
+      ? {
+          purchasesCoverage: outcomes.purchases ? "ok" : "failed",
+          purchasesFetchedAt: outcomes.purchases ? fetchedNow : null,
+          statementCoverage: outcomes.statement ? "ok" : "failed",
+          statementFetchedAt: outcomes.statement ? fetchedNow : null,
+          navCoverage: outcomes.nav ? "ok" : "failed",
+          navFetchedAt: outcomes.nav ? fetchedNow : null
+        }
+      : {};
+    const coverageUpdate = outcomes
+      ? {
+          purchasesCoverage: outcomes.purchases ? "ok" : "failed",
+          ...(outcomes.purchases ? { purchasesFetchedAt: fetchedNow } : {}),
+          statementCoverage: outcomes.statement ? "ok" : "failed",
+          ...(outcomes.statement ? { statementFetchedAt: fetchedNow } : {}),
+          navCoverage: outcomes.nav ? "ok" : "failed",
+          ...(outcomes.nav ? { navFetchedAt: fetchedNow } : {})
+        }
+      : {};
     await tx
       .insert(ssisInsightState)
       .values({
@@ -840,7 +931,8 @@ export async function importSsisSnapshot(
         latestNavMinor: stateNav?.navMinor ?? null,
         latestNavDate: stateNav?.navDate ?? null,
         lastFetchedAt: new Date(),
-        lastSource: source
+        lastSource: source,
+        ...coverageInsert
       })
       .onConflictDoUpdate({
         target: ssisInsightState.familyId,
@@ -851,6 +943,7 @@ export async function importSsisSnapshot(
             : {}),
           lastFetchedAt: new Date(),
           lastSource: source,
+          ...coverageUpdate,
           updatedAt: new Date()
         }
       });
@@ -1016,7 +1109,17 @@ export async function setSsisBoAccountNo(
       const configGeneration =
         (state?.configGeneration ?? 0) + (changed && previousBo !== null ? 1 : 0);
       const resetFields = dataReset
-        ? { holderName: null, lastFetchedAt: null, lastSource: null }
+        ? {
+            holderName: null,
+            lastFetchedAt: null,
+            lastSource: null,
+            // The cleared holder datasets have no coverage anymore; NAV
+            // history is scheme-level and kept, so its coverage stays.
+            purchasesCoverage: null,
+            purchasesFetchedAt: null,
+            statementCoverage: null,
+            statementFetchedAt: null
+          }
         : {};
       await tx
         .insert(ssisInsightState)
@@ -1079,7 +1182,8 @@ export async function refreshSsis(
     );
   }
   const counts = await importSsisSnapshot(exec, actor, snapshot.payload, "refresh", {
-    expectedConfig: { boAccountNo, configGeneration }
+    expectedConfig: { boAccountNo, configGeneration },
+    datasetOutcomes: snapshot.datasets
   });
   return { ...counts, warnings: snapshot.warnings };
 }
@@ -1094,6 +1198,7 @@ export type SsisInsightData = {
   schemeName: string;
   lastFetchedAt: string | null;
   lastSource: string | null;
+  coverage: SsisCoverage;
   hasBoAccount: boolean;
   boAccountMasked: string | null;
   canManage: boolean;
@@ -1154,6 +1259,7 @@ export async function getSsisInsight(exec: Executor, actor: Actor): Promise<Ssis
     schemeName,
     lastFetchedAt: state?.lastFetchedAt ? new Date(state.lastFetchedAt).toISOString() : null,
     lastSource: state?.lastSource ?? null,
+    coverage: ssisCoverageFromState(state),
     hasBoAccount: !!state?.boAccountNo,
     boAccountMasked: maskBoAccountNo(state?.boAccountNo ?? null),
     canManage: actor.familyRole === "admin",

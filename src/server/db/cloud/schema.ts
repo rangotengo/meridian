@@ -1094,6 +1094,15 @@ export const ssisInsightState = sqliteTable("ssis_insight_state", {
   latestNavDate: text("latest_nav_date"),
   lastFetchedAt: isoTimestamp("last_fetched_at"),
   lastSource: text("last_source"),
+  // Per-dataset fetch coverage (migration 0019): last known outcome per
+  // dataset ('ok' | 'failed'; NULL = never established) and the last
+  // SUCCESSFUL fetch time; failures never move the timestamp.
+  purchasesCoverage: text("purchases_coverage"),
+  purchasesFetchedAt: isoTimestamp("purchases_fetched_at"),
+  statementCoverage: text("statement_coverage"),
+  statementFetchedAt: isoTimestamp("statement_fetched_at"),
+  navCoverage: text("nav_coverage"),
+  navFetchedAt: isoTimestamp("nav_fetched_at"),
   updatedAt: isoTimestamp("updated_at")
     .notNull()
     .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`)

@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { createHash } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { actorOf, db, makeUser, truncateAll, type TestUser } from "../helpers";
-import { auditEvents, ssisNavHistory, ssisPurchases } from "@/server/db/schema";
+import { auditEvents, ssisInsightState, ssisNavHistory, ssisPurchases } from "@/server/db/schema";
 import type { McpConfig } from "@/lib/env";
 import { randomToken } from "@/lib/crypto";
 import {
@@ -20,7 +20,12 @@ import {
   type OAuthGrantRow,
   type TokenSuccess
 } from "@/server/domain/oauth";
-import { getSsisInsight, importSsisSnapshot, setSsisBoAccountNo } from "@/server/domain/ssis";
+import {
+  getSsisInsight,
+  importSsisSnapshot,
+  refreshSsis,
+  setSsisBoAccountNo
+} from "@/server/domain/ssis";
 import { POST as mcpPost } from "@/app/mcp/route";
 import { buildSsisPayload, SSIS_PII } from "../fixtures/ssis-snapshot";
 
@@ -431,6 +436,201 @@ describe("SSIS tool payloads", () => {
       // Metadata is the tool name only — no financial results.
       expect(Object.keys((audit.metadata ?? {}) as Record<string, unknown>)).toEqual(["tool"]);
     }
+  });
+});
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" }
+  });
+}
+
+type CoverageStubOptions = {
+  failPurchases?: boolean;
+  failStatement?: boolean;
+  emptyHolder?: boolean;
+};
+
+/** Upstream stub in the shape of tests/integration/ssis.test.ts, with
+ * per-dataset failure switches for the coverage regressions. */
+function stubCoverageUpstream(options: CoverageStubOptions = {}): typeof fetch {
+  return async (input) => {
+    const url = String(input);
+    const payload = buildSsisPayload() as [{ unitPurchase: unknown[]; statement: unknown[] }];
+    if (url.includes("PurchaseRequesthandler")) {
+      if (options.failPurchases) return jsonResponse({ message: "boom" }, 500);
+      return jsonResponse({ ResponseData: options.emptyHolder ? [] : payload[0].unitPurchase });
+    }
+    if (url.includes("HolderStatement")) {
+      if (options.failStatement) return jsonResponse({ message: "boom" }, 500);
+      return jsonResponse({ ResponseData: options.emptyHolder ? [] : payload[0].statement });
+    }
+    if (url.includes("GetNAV")) {
+      return jsonResponse({
+        ResponseData: [{ Scheme_code: "001", nav_date: "2024-03-20", nav_value: 11.5 }]
+      });
+    }
+    if (url.includes("admin-ajax.php")) {
+      return jsonResponse({
+        data: [
+          { eng_date: "2024-01-31", nep_date: "2080-10-17", nav: "10.10" },
+          { eng_date: "2024-03-31", nep_date: "2080-12-17", nav: "11.00" }
+        ]
+      });
+    }
+    return jsonResponse({}, 404);
+  };
+}
+
+describe("SSIS coverage reporting", () => {
+  it("snapshot import establishes full coverage and complete totals", async () => {
+    const user = await makeUser({ timezone: "UTC" });
+    await seedSsis(user);
+    const flow = await connectFlow(user, { ssisAccess: true });
+
+    const summary = await callTool(flow.tokens.accessToken, "get_ssis_summary");
+    const ssis = summary.data.ssis;
+    expect(ssis.coverage.purchases.status).toBe("ok");
+    expect(ssis.coverage.statement.status).toBe("ok");
+    expect(ssis.coverage.nav.status).toBe("ok");
+    expect(ssis.coverage.purchases.fetchedAt).not.toBeNull();
+    expect(ssis.totals.complete).toBe(true);
+    expect(ssis.limitations.join(" ")).not.toMatch(/incomplete|coverage is unknown/);
+  });
+
+  it("NAV-only refresh: failed holder datasets are not presented as a known zero position", async () => {
+    const user = await makeUser({ timezone: "UTC" });
+    const actor = actorOf(user);
+    await setSsisBoAccountNo(db(), actor, ENTERED_BO);
+    const result = await refreshSsis(
+      db(),
+      actor,
+      stubCoverageUpstream({ failPurchases: true, failStatement: true })
+    );
+    expect(result.warnings).toHaveLength(2);
+
+    const flow = await connectFlow(user, { ssisAccess: true });
+    const summary = await callTool(flow.tokens.accessToken, "get_ssis_summary");
+    const ssis = summary.data.ssis;
+    // NAV arrived, so the insight has data and a fresh overall dataAsOf…
+    expect(ssis.hasData).toBe(true);
+    expect(ssis.dataAsOf).not.toBeNull();
+    // …but purchase coverage is failed, never established, and the zero
+    // totals are flagged as observed subtotals rather than a position.
+    expect(ssis.coverage.purchases).toEqual({ status: "failed", fetchedAt: null });
+    expect(ssis.coverage.statement.status).toBe("failed");
+    expect(ssis.coverage.nav.status).toBe("ok");
+    expect(ssis.coverage.nav.fetchedAt).not.toBeNull();
+    expect(ssis.totals.complete).toBe(false);
+    expect(ssis.totals.totalInvested.amountMinor).toBe("0");
+    expect(ssis.totals.totalUnits).toBe("0");
+    const limitations = ssis.limitations.join(" ");
+    expect(limitations).toMatch(/Purchase data may be incomplete/);
+    expect(limitations).toMatch(/observed subtotals/);
+    expect(limitations).toMatch(/does not imply every dataset was refreshed/);
+
+    const purchases = await callTool(flow.tokens.accessToken, "list_ssis_purchases");
+    expect(purchases.data.coverage.purchases.status).toBe("failed");
+    expect(purchases.data.dataAsOf).toBeNull();
+    expect(purchases.data.page.totalMatching).toBe(0);
+    expect(purchases.data.limitations.join(" ")).toMatch(/only the purchase rows currently stored/);
+    expect(purchases.data.limitations.join(" ")).toMatch(/could not retrieve/);
+
+    const statement = await callTool(flow.tokens.accessToken, "list_ssis_statement");
+    expect(statement.data.coverage.statement.status).toBe("failed");
+    expect(statement.data.limitations.join(" ")).toMatch(/could not retrieve/);
+
+    const nav = await callTool(flow.tokens.accessToken, "get_ssis_nav_history");
+    expect(nav.data.coverage.nav.status).toBe("ok");
+    expect(nav.data.limitations).toEqual([]);
+  });
+
+  it("partial refresh over older rows: holder data stays visibly stale, success timestamps unmoved", async () => {
+    const user = await makeUser({ timezone: "UTC" });
+    const actor = actorOf(user);
+    await setSsisBoAccountNo(db(), actor, ENTERED_BO);
+    const first = await refreshSsis(db(), actor, stubCoverageUpstream());
+    expect(first.warnings).toEqual([]);
+    const [afterFirst] = await db()
+      .select()
+      .from(ssisInsightState)
+      .where(eq(ssisInsightState.familyId, user.familyId));
+    expect(afterFirst!.purchasesCoverage).toBe("ok");
+    expect(afterFirst!.purchasesFetchedAt).not.toBeNull();
+
+    const second = await refreshSsis(
+      db(),
+      actor,
+      stubCoverageUpstream({ failPurchases: true, failStatement: true })
+    );
+    expect(second.warnings).toHaveLength(2);
+    const [afterSecond] = await db()
+      .select()
+      .from(ssisInsightState)
+      .where(eq(ssisInsightState.familyId, user.familyId));
+    expect(afterSecond!.purchasesCoverage).toBe("failed");
+    expect(afterSecond!.statementCoverage).toBe("failed");
+    // The failure must not move the last-success timestamps.
+    expect(afterSecond!.purchasesFetchedAt).toEqual(afterFirst!.purchasesFetchedAt);
+    expect(afterSecond!.statementFetchedAt).toEqual(afterFirst!.statementFetchedAt);
+    expect(afterSecond!.navCoverage).toBe("ok");
+
+    const flow = await connectFlow(user, { ssisAccess: true });
+    const summary = await callTool(flow.tokens.accessToken, "get_ssis_summary");
+    const ssis = summary.data.ssis;
+    // The stored rows still drive the totals — labelled as subtotals.
+    expect(ssis.totals.totalInvested.amountMinor).toBe("177260");
+    expect(ssis.totals.complete).toBe(false);
+    expect(ssis.coverage.purchases.status).toBe("failed");
+    expect(ssis.coverage.purchases.fetchedAt).toBe(
+      new Date(afterFirst!.purchasesFetchedAt!).toISOString()
+    );
+    expect(ssis.coverage.nav.status).toBe("ok");
+    expect(ssis.limitations.join(" ")).toMatch(/last successful fetch/);
+  });
+
+  it("complete refresh: full coverage, totals complete, no incompleteness caveats", async () => {
+    const user = await makeUser({ timezone: "UTC" });
+    const actor = actorOf(user);
+    await setSsisBoAccountNo(db(), actor, ENTERED_BO);
+    const result = await refreshSsis(db(), actor, stubCoverageUpstream());
+    expect(result.warnings).toEqual([]);
+
+    const flow = await connectFlow(user, { ssisAccess: true });
+    const summary = await callTool(flow.tokens.accessToken, "get_ssis_summary");
+    const ssis = summary.data.ssis;
+    expect(ssis.coverage.purchases.status).toBe("ok");
+    expect(ssis.coverage.statement.status).toBe("ok");
+    expect(ssis.coverage.nav.status).toBe("ok");
+    expect(ssis.totals.complete).toBe(true);
+    expect(ssis.totals.totalInvested.amountMinor).toBe("177260");
+    expect(ssis.limitations.join(" ")).not.toMatch(/incomplete|coverage is unknown/);
+
+    const purchases = await callTool(flow.tokens.accessToken, "list_ssis_purchases");
+    expect(purchases.data.coverage.purchases.status).toBe("ok");
+    expect(purchases.data.dataAsOf).not.toBeNull();
+    expect(purchases.data.limitations.join(" ")).not.toMatch(/incomplete|coverage is unknown/);
+  });
+
+  it("genuinely empty position: holder endpoints succeed with no rows — zero totals are complete", async () => {
+    const user = await makeUser({ timezone: "UTC" });
+    const actor = actorOf(user);
+    await setSsisBoAccountNo(db(), actor, ENTERED_BO);
+    const result = await refreshSsis(db(), actor, stubCoverageUpstream({ emptyHolder: true }));
+    expect(result.warnings).toEqual([]);
+    expect(result.purchases).toBe(0);
+    expect(result.statement).toBe(0);
+
+    const flow = await connectFlow(user, { ssisAccess: true });
+    const summary = await callTool(flow.tokens.accessToken, "get_ssis_summary");
+    const ssis = summary.data.ssis;
+    expect(ssis.coverage.purchases.status).toBe("ok");
+    expect(ssis.coverage.statement.status).toBe("ok");
+    expect(ssis.totals.complete).toBe(true);
+    expect(ssis.totals.totalInvested.amountMinor).toBe("0");
+    expect(ssis.totals.totalUnits).toBe("0");
+    expect(ssis.limitations.join(" ")).not.toMatch(/incomplete|coverage is unknown/);
   });
 });
 

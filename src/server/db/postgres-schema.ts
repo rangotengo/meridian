@@ -957,5 +957,16 @@ export const ssisInsightState = pgTable("ssis_insight_state", {
   latestNavDate: date("latest_nav_date"),
   lastFetchedAt: timestamp("last_fetched_at", { withTimezone: true }),
   lastSource: text("last_source"),
+  // Per-dataset fetch coverage (migration 0019): the last known outcome
+  // of each independently-fetched dataset ('ok' | 'failed'; NULL = never
+  // established) and when that dataset last fetched SUCCESSFULLY. A
+  // failed refresh updates coverage but never the timestamp, so partial
+  // refreshes cannot make stale holder data look fresh.
+  purchasesCoverage: text("purchases_coverage"),
+  purchasesFetchedAt: timestamp("purchases_fetched_at", { withTimezone: true }),
+  statementCoverage: text("statement_coverage"),
+  statementFetchedAt: timestamp("statement_fetched_at", { withTimezone: true }),
+  navCoverage: text("nav_coverage"),
+  navFetchedAt: timestamp("nav_fetched_at", { withTimezone: true }),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow()
 });
