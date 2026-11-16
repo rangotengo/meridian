@@ -121,6 +121,7 @@ export function AppSidebar({
           label="Insights"
           items={[
             { title: "Reports", url: "/reports", icon: <ChartAreaIcon /> },
+            { title: "SSIS", url: "/insights/ssis", icon: <LandmarkIcon /> },
             { title: "Budgets", url: "/budgets", icon: <TargetIcon /> },
             { title: "Assistant", url: "/chat", icon: <MessageCircleIcon /> }
           ]}

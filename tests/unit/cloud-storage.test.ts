@@ -176,6 +176,17 @@ describe("Cloudflare SQLite storage", () => {
     expect(result.synced).toBe(1);
     expect(result.encrypted).toBe(true);
   });
+  it("imports an SSIS snapshot and reads the insight back inside the Durable Object", async () => {
+    const result = await probe("ssis");
+    expect(result.counts).toEqual({ purchases: 1, statement: 1, navPoints: 1, skipped: 0 });
+    expect(result.holderName).toBe("Cloud Holder");
+    expect(result.totalUnits).toBe("100");
+    expect(result.totalInvestedMinor).toBe(100000);
+    expect(result.currentNavMinor).toBe(1050);
+    expect(result.currentValueMinor).toBe(105000);
+    expect(result.purchases).toBe(1);
+    expect(result.statement).toBe(1);
+  });
   it("runs household, ledger, splits, transfers, reports and queue services", async () => {
     const result = await probe("ledger");
     expect(result.duplicate).toBe(true);

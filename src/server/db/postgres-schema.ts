@@ -813,3 +813,99 @@ export const oauthAuthorizationRequests = pgTable(
   },
   (t) => [index("oauth_authorization_requests_user_idx").on(t.userId)]
 );
+
+/**
+ * SSIS insight tables: a self-contained snapshot of the owner's Siddhartha
+ * Systematic Investment Scheme (Siddhartha Capital). Deliberately NOT linked
+ * to accounts/entries/balances — this is external reference data with its own
+ * lifecycle (import / refresh), shown on the Insights → SSIS page. Only
+ * whitelisted upstream fields are stored; the upstream payload's PII
+ * (citizenship, PAN, bank/BO identifiers, contacts, OTP) is discarded at
+ * import time and never persisted. The one exception is the BO account
+ * number in ssis_insight_state, which the user enters explicitly so the
+ * server can call the upstream holder endpoints during refresh.
+ */
+export const ssisPurchases = pgTable(
+  "ssis_purchases",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    familyId: uuid("family_id")
+      .notNull()
+      .references(() => families.id, { onDelete: "cascade" }),
+    requestNo: text("request_no").notNull(),
+    applyDate: date("apply_date").notNull(),
+    units: text("units").notNull(),
+    amountMinor: bigint("amount_minor", { mode: "number" }).notNull(),
+    status: text("status").notNull().default(""),
+    purchaseNavMinor: bigint("purchase_nav_minor", { mode: "number" }),
+    navDate: date("nav_date"),
+    schemeName: text("scheme_name"),
+    isSip: boolean("is_sip").notNull().default(false),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow()
+  },
+  (t) => [
+    uniqueIndex("ssis_purchases_family_request_unique").on(t.familyId, t.requestNo),
+    index("ssis_purchases_family_idx").on(t.familyId)
+  ]
+);
+
+export const ssisStatementEntries = pgTable(
+  "ssis_statement_entries",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    familyId: uuid("family_id")
+      .notNull()
+      .references(() => families.id, { onDelete: "cascade" }),
+    transNo: text("trans_no").notNull(),
+    installmentDate: date("installment_date").notNull(),
+    dueDate: date("due_date"),
+    actionDate: date("action_date"),
+    amountCrMinor: bigint("amount_cr_minor", { mode: "number" }).notNull().default(0),
+    amountDrMinor: bigint("amount_dr_minor", { mode: "number" }).notNull().default(0),
+    units: text("units"),
+    appliedNavMinor: bigint("applied_nav_minor", { mode: "number" }),
+    payment: text("payment"),
+    otherChargesMinor: bigint("other_charges_minor", { mode: "number" }).notNull().default(0),
+    sebonFeeMinor: bigint("sebon_fee_minor", { mode: "number" }).notNull().default(0),
+    sipRegNo: text("sip_reg_no"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow()
+  },
+  (t) => [
+    uniqueIndex("ssis_statement_family_trans_unique").on(t.familyId, t.transNo),
+    index("ssis_statement_family_idx").on(t.familyId)
+  ]
+);
+
+export const ssisNavHistory = pgTable(
+  "ssis_nav_history",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    familyId: uuid("family_id")
+      .notNull()
+      .references(() => families.id, { onDelete: "cascade" }),
+    engDate: date("eng_date").notNull(),
+    nepDate: text("nep_date").notNull(),
+    navMinor: bigint("nav_minor", { mode: "number" }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow()
+  },
+  (t) => [
+    uniqueIndex("ssis_nav_history_family_date_unique").on(t.familyId, t.engDate),
+    index("ssis_nav_history_family_idx").on(t.familyId)
+  ]
+);
+
+export const ssisInsightState = pgTable("ssis_insight_state", {
+  familyId: uuid("family_id")
+    .primaryKey()
+    .references(() => families.id, { onDelete: "cascade" }),
+  holderName: text("holder_name"),
+  boAccountNo: text("bo_account_no"),
+  latestNavMinor: bigint("latest_nav_minor", { mode: "number" }),
+  latestNavDate: date("latest_nav_date"),
+  lastFetchedAt: timestamp("last_fetched_at", { withTimezone: true }),
+  lastSource: text("last_source"),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow()
+});

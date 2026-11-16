@@ -944,3 +944,116 @@ export const oauthAuthorizationRequests = sqliteTable(
   },
   (t) => [index("oauth_authorization_requests_user_idx").on(t.userId)]
 );
+
+/**
+ * SSIS insight tables (SQLite mirror of the Postgres schema): a
+ * self-contained Siddhartha Systematic Investment Scheme snapshot, separate
+ * from accounts/entries/balances. Only whitelisted upstream fields are
+ * stored; upstream PII is discarded at import time. The BO account number
+ * in ssis_insight_state is user-entered and used only for server-side
+ * refresh calls.
+ */
+export const ssisPurchases = sqliteTable(
+  "ssis_purchases",
+  {
+    id: text("id")
+      .primaryKey()
+      .$defaultFn(() => crypto.randomUUID()),
+    familyId: text("family_id")
+      .notNull()
+      .references(() => families.id, { onDelete: "cascade" }),
+    requestNo: text("request_no").notNull(),
+    applyDate: text("apply_date").notNull(),
+    units: text("units").notNull(),
+    amountMinor: integer("amount_minor").notNull(),
+    status: text("status").notNull().default(""),
+    purchaseNavMinor: integer("purchase_nav_minor"),
+    navDate: text("nav_date"),
+    schemeName: text("scheme_name"),
+    isSip: integer("is_sip", { mode: "boolean" }).notNull().default(false),
+    createdAt: isoTimestamp("created_at")
+      .notNull()
+      .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`),
+    updatedAt: isoTimestamp("updated_at")
+      .notNull()
+      .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`)
+  },
+  (t) => [
+    uniqueIndex("ssis_purchases_family_request_unique").on(t.familyId, t.requestNo),
+    index("ssis_purchases_family_idx").on(t.familyId)
+  ]
+);
+
+export const ssisStatementEntries = sqliteTable(
+  "ssis_statement_entries",
+  {
+    id: text("id")
+      .primaryKey()
+      .$defaultFn(() => crypto.randomUUID()),
+    familyId: text("family_id")
+      .notNull()
+      .references(() => families.id, { onDelete: "cascade" }),
+    transNo: text("trans_no").notNull(),
+    installmentDate: text("installment_date").notNull(),
+    dueDate: text("due_date"),
+    actionDate: text("action_date"),
+    amountCrMinor: integer("amount_cr_minor").notNull().default(0),
+    amountDrMinor: integer("amount_dr_minor").notNull().default(0),
+    units: text("units"),
+    appliedNavMinor: integer("applied_nav_minor"),
+    payment: text("payment"),
+    otherChargesMinor: integer("other_charges_minor").notNull().default(0),
+    sebonFeeMinor: integer("sebon_fee_minor").notNull().default(0),
+    sipRegNo: text("sip_reg_no"),
+    createdAt: isoTimestamp("created_at")
+      .notNull()
+      .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`),
+    updatedAt: isoTimestamp("updated_at")
+      .notNull()
+      .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`)
+  },
+  (t) => [
+    uniqueIndex("ssis_statement_family_trans_unique").on(t.familyId, t.transNo),
+    index("ssis_statement_family_idx").on(t.familyId)
+  ]
+);
+
+export const ssisNavHistory = sqliteTable(
+  "ssis_nav_history",
+  {
+    id: text("id")
+      .primaryKey()
+      .$defaultFn(() => crypto.randomUUID()),
+    familyId: text("family_id")
+      .notNull()
+      .references(() => families.id, { onDelete: "cascade" }),
+    engDate: text("eng_date").notNull(),
+    nepDate: text("nep_date").notNull(),
+    navMinor: integer("nav_minor").notNull(),
+    createdAt: isoTimestamp("created_at")
+      .notNull()
+      .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`),
+    updatedAt: isoTimestamp("updated_at")
+      .notNull()
+      .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`)
+  },
+  (t) => [
+    uniqueIndex("ssis_nav_history_family_date_unique").on(t.familyId, t.engDate),
+    index("ssis_nav_history_family_idx").on(t.familyId)
+  ]
+);
+
+export const ssisInsightState = sqliteTable("ssis_insight_state", {
+  familyId: text("family_id")
+    .primaryKey()
+    .references(() => families.id, { onDelete: "cascade" }),
+  holderName: text("holder_name"),
+  boAccountNo: text("bo_account_no"),
+  latestNavMinor: integer("latest_nav_minor"),
+  latestNavDate: text("latest_nav_date"),
+  lastFetchedAt: isoTimestamp("last_fetched_at"),
+  lastSource: text("last_source"),
+  updatedAt: isoTimestamp("updated_at")
+    .notNull()
+    .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`)
+});

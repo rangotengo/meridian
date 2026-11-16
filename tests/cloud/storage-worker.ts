@@ -24,6 +24,7 @@ import { buildFamilyExport } from "../../src/server/domain/exports";
 import { ensureSchedules, runDueCrons } from "../../src/server/queue/worker-loop";
 import { importSureExport } from "../../src/server/domain/sure-import";
 import { connectMeroShare, syncMeroShareConnection } from "../../src/server/domain/meroshare";
+import { getSsisInsight, importSsisSnapshot } from "../../src/server/domain/ssis";
 import { mockMeroShareFetch } from "./meroshare-fixture";
 import { splitEntry } from "../../src/server/domain/splits";
 import { claimBatch, completeJob, enqueue } from "../../src/server/queue";
@@ -84,7 +85,8 @@ export class StorageProbe {
     if (
       operation === "/ledger" ||
       operation === "/import-meroshare" ||
-      operation === "/valuation-edit"
+      operation === "/valuation-edit" ||
+      operation === "/ssis"
     ) {
       const exec = db as unknown as Executor;
       const user = await registerAccessHousehold(
@@ -210,6 +212,60 @@ export class StorageProbe {
         } finally {
           globalThis.fetch = originalFetch;
         }
+      }
+      if (operation === "/ssis") {
+        const snapshot = [
+          {
+            unitPurchase: [
+              {
+                REQUEST_NO: 2001,
+                FName: "Cloud",
+                LName: "Holder",
+                Citizenship_No: "00-00-00-00000",
+                APPLY_DT: "2024-01-15",
+                APPLY_UNIT: 100,
+                AMOUNT: "1000.00",
+                APPSTATUS: "VERIFIED",
+                current_nav: 10,
+                nav_date: "2024-01-15",
+                SchemeName: "Siddhartha Systematic Investment Scheme",
+                Is_SIP: true
+              }
+            ],
+            statement: [
+              {
+                trans_no: "CT1",
+                installmentDate: "2024-01-15",
+                dueDate: null,
+                actionDate: "2024-01-16",
+                Amount_cr: "1000.00",
+                Amount_dr: "-",
+                unit: "100",
+                appnav: "10.00",
+                payment: "E-Sewa",
+                otherCharges: "0",
+                sebon_fee: "0",
+                SIP_Reg_No: "SIP0001"
+              }
+            ],
+            navData: {
+              ResponseData: [{ Scheme_code: "001", nav_date: "2024-01-20", nav_value: 10.5 }]
+            },
+            overallNav: [{ eng_date: "2024-01-31", nep_date: "2080-10-17", nav: "10.50" }]
+          }
+        ];
+        const counts = await importSsisSnapshot(exec, actor, snapshot, "import");
+        const insight = await getSsisInsight(exec, actor);
+        return Response.json({
+          counts,
+          holderName: insight.holderName,
+          totalUnits: insight.summary.totalUnits,
+          totalInvestedMinor: insight.summary.totalInvestedMinor,
+          currentNavMinor: insight.summary.currentNavMinor,
+          currentValueMinor: insight.summary.currentValueMinor,
+          purchases: insight.purchases.length,
+          statement: insight.statement.length
+        });
       }
       const account = await createAccount(exec, actor, {
         name: "Cash",

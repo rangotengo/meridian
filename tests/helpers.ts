@@ -12,6 +12,10 @@ void (0 as unknown as TransactionEntryInput);
 export const db = () => getDb();
 
 const TABLES = [
+  "ssis_statement_entries",
+  "ssis_purchases",
+  "ssis_nav_history",
+  "ssis_insight_state",
   "mero_share_transactions",
   "mero_share_holdings",
   "mero_share_accounts",
