@@ -198,3 +198,121 @@ describe("BO account masking", () => {
     expect(maskBoAccountNo(null)).toBeNull();
   });
 });
+
+describe("SSIS safe-representation bounds", () => {
+  const MAX = Number.MAX_SAFE_INTEGER;
+
+  it("bounds canonical unit quantities to a safe scaled integer", () => {
+    // 900719925474.0991 units scales to exactly MAX_SAFE_INTEGER: allowed.
+    expect(parseUnits("900719925474.0991")).not.toBeNull();
+    // One more scaled unit, and plainly absurd quantities: rejected.
+    expect(parseUnits("900719925474.0992")).toBeNull();
+    expect(parseUnits("99999999999999999999999999")).toBeNull();
+    expect(parseUnits("-99999999999999999999999999")).toBeNull();
+  });
+
+  it("rejects a snapshot whose individually-safe purchase amounts overflow the total", () => {
+    const row = (requestNo: number) => ({
+      REQUEST_NO: requestNo,
+      FName: "Test",
+      LName: "Holder",
+      APPLY_DT: "2024-01-15",
+      APPLY_UNIT: "10",
+      AMOUNT: "90071992547409.91", // exactly MAX_SAFE_INTEGER minor units
+      APPSTATUS: "VERIFIED",
+      current_nav: 10,
+      nav_date: "2024-01-15"
+    });
+    const payload = [
+      { unitPurchase: [row(1), row(2), row(3)], statement: [], navData: {}, overallNav: [] }
+    ];
+    expect(() => extractSsisSnapshot(payload)).toThrow(/too large/);
+  });
+
+  it("skips a purchase row whose unit quantity cannot be represented exactly", () => {
+    const payload = [
+      {
+        unitPurchase: [
+          {
+            REQUEST_NO: 1,
+            APPLY_DT: "2024-01-15",
+            APPLY_UNIT: "10",
+            AMOUNT: "100.00",
+            APPSTATUS: "VERIFIED"
+          },
+          {
+            REQUEST_NO: 2,
+            APPLY_DT: "2024-01-15",
+            APPLY_UNIT: "99999999999999999999999999",
+            AMOUNT: "100.00",
+            APPSTATUS: "VERIFIED"
+          }
+        ],
+        statement: [],
+        navData: {},
+        overallNav: []
+      }
+    ];
+    const extracted = extractSsisSnapshot(payload);
+    expect(extracted.purchases).toHaveLength(1);
+    expect(extracted.skipped).toBe(1);
+  });
+
+  it("returns null instead of a rounded total when the invested sum overflows", () => {
+    const summary = computeSsisSummary({
+      purchases: [
+        { units: "1", amountMinor: MAX },
+        { units: "1", amountMinor: MAX }
+      ],
+      navHistory: [],
+      stateNav: { navMinor: 1000, navDate: "2024-03-20" },
+      today: "2024-04-01"
+    });
+    expect(summary.totalInvestedMinor).toBeNull();
+    expect(summary.profitMinor).toBeNull();
+    expect(summary.returnPercent).toBeNull();
+  });
+
+  it("returns null instead of an infinite or rounded value when units × NAV overflows", () => {
+    const summary = computeSsisSummary({
+      purchases: [{ units: "900719925474.0991", amountMinor: 100 }],
+      navHistory: [],
+      stateNav: { navMinor: MAX, navDate: "2024-03-20" },
+      today: "2024-04-01"
+    });
+    expect(summary.currentValueMinor).toBeNull();
+    expect(summary.profitMinor).toBeNull();
+  });
+
+  it("marks only the overflowing cumulative series points as null", () => {
+    const { valueGrowth } = buildSsisSeries({
+      purchases: [
+        {
+          requestNo: "1",
+          applyDate: "2024-01-15",
+          units: "1",
+          amountMinor: MAX,
+          status: "",
+          purchaseNavMinor: null,
+          navDate: null,
+          schemeName: null,
+          isSip: false
+        },
+        {
+          requestNo: "2",
+          applyDate: "2024-02-15",
+          units: "1",
+          amountMinor: MAX,
+          status: "",
+          purchaseNavMinor: null,
+          navDate: null,
+          schemeName: null,
+          isSip: false
+        }
+      ],
+      currentNavMinor: null
+    });
+    expect(valueGrowth.map((p) => p.investedMinor)).toEqual([MAX, null]);
+    expect(valueGrowth.map((p) => p.valueMinor)).toEqual([null, null]);
+  });
+});

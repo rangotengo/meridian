@@ -1,4 +1,5 @@
 import { log } from "@/lib/logger";
+import { isIsoDate } from "@/lib/datetime";
 
 /**
  * Live fetcher for the SSIS insight, replicating the owner's standalone
@@ -98,9 +99,80 @@ async function fetchJson(
   }
 }
 
-function responseDataRows(body: unknown): unknown[] {
-  if (!isRecord(body) || !Array.isArray(body.ResponseData)) return [];
+/**
+ * Upstream envelope validation. The holder handlers answer HTTP 200 even
+ * for application-level failures (an envelope whose success flag is false
+ * and whose ResponseData is null), so a 200 alone proves nothing: each
+ * dataset is only counted as fetched after its envelope and data shape
+ * check out. A legitimately empty dataset (success envelope, empty
+ * ResponseData array) stays distinguishable from an error. Validation
+ * errors carry no response content — bodies are never logged or surfaced.
+ */
+const SUCCESS_FLAG_KEYS = ["IsSucess", "IsSuccess", "Success", "success"] as const;
+
+function assertEnvelopeOk(body: Record<string, unknown>): void {
+  for (const key of SUCCESS_FLAG_KEYS) {
+    const flag = body[key];
+    if (flag === false || (typeof flag === "string" && flag.trim().toLowerCase() === "false")) {
+      throw new Error("Upstream reported an application error.");
+    }
+  }
+}
+
+/** Holder datasets must carry a ResponseData array (possibly empty). */
+function holderDataRows(body: unknown): unknown[] {
+  if (!isRecord(body)) throw new Error("Upstream returned an unexpected response.");
+  assertEnvelopeOk(body);
+  if (!Array.isArray(body.ResponseData)) {
+    throw new Error("Upstream returned an unexpected response.");
+  }
   return body.ResponseData;
+}
+
+/** 2dp-scaled parse mirroring the domain's NAV extraction (minor units). */
+function navMinorOf(value: unknown): bigint | null {
+  let raw: string | null = null;
+  if (typeof value === "number") raw = Number.isFinite(value) ? String(value) : null;
+  else if (typeof value === "string") raw = value.trim().replace(/,/g, "") || null;
+  if (raw === null) return null;
+  const match = /^([+-]?)(\d*)(?:\.(\d*))?$/.exec(raw);
+  if (!match) return null;
+  const intPart = match[2] ?? "";
+  const frac = match[3] ?? "";
+  if (intPart === "" && frac === "") return null;
+  let scaled = BigInt(intPart === "" ? "0" : intPart) * 100n;
+  if (frac.length <= 2) {
+    scaled += BigInt(frac.padEnd(2, "0") || "0");
+  } else {
+    scaled += BigInt(frac.slice(0, 2) || "0");
+    if (frac[2]! >= "5") scaled += 1n;
+  }
+  return match[1] === "-" ? -scaled : scaled;
+}
+
+/**
+ * The current-NAV dataset only counts when a valid NAV value and date can
+ * actually be extracted from it — an arbitrary HTTP-200 object is not a NAV.
+ */
+function assertValidNavData(body: unknown): void {
+  if (!isRecord(body)) throw new Error("Upstream returned an unexpected response.");
+  assertEnvelopeOk(body);
+  const responseData = body.ResponseData;
+  const first = Array.isArray(responseData) ? responseData[0] : responseData;
+  if (!isRecord(first)) throw new Error("Upstream returned no valid NAV.");
+  const navMinor = navMinorOf(first.nav_value);
+  const navDate = typeof first.nav_date === "string" ? first.nav_date.trim().slice(0, 10) : "";
+  if (navMinor === null || navMinor < 0n || !isIsoDate(navDate)) {
+    throw new Error("Upstream returned no valid NAV.");
+  }
+}
+
+/** The WordPress monthly-history dataset must carry a data array. */
+function wpNavHistoryRows(body: unknown): unknown[] {
+  if (!isRecord(body)) throw new Error("Upstream returned an unexpected response.");
+  assertEnvelopeOk(body);
+  if (!Array.isArray(body.data)) throw new Error("Upstream returned an unexpected response.");
+  return body.data;
 }
 
 export async function fetchSsisSnapshot(
@@ -129,37 +201,41 @@ export async function fetchSsisSnapshot(
     }
   };
 
-  const purchasesBody = await attempt("purchases", "Unit purchases", () =>
-    fetchJson(
+  const purchasesRows = await attempt("purchases", "Unit purchases", async () => {
+    const body = await fetchJson(
       fetchFn,
       "purchases",
       `${MF_BASE}/Handler/RequestHandling/PurchaseRequesthandler.ashx?method=GetHolderUnitRpt&${holderQuery}`,
       { method: "POST", headers: { "Content-Type": "application/json" } },
       timeoutMs
-    )
-  );
+    );
+    return uniqueBy(holderDataRows(body), (row) => (isRecord(row) ? row.REQUEST_NO : undefined));
+  });
 
-  const statementBody = await attempt("statement", "SIP statement", () =>
-    fetchJson(
+  const statementRows = await attempt("statement", "SIP statement", async () => {
+    const body = await fetchJson(
       fetchFn,
       "statement",
       `${MF_BASE}/Handler/SIPHandling/HolderStatement.ashx?method=GetHolderStatement&${holderQuery}`,
       { method: "POST", headers: { "Content-Type": "application/json" } },
       timeoutMs
-    )
-  );
+    );
+    return uniqueBy(holderDataRows(body), (row) => (isRecord(row) ? row.trans_no : undefined));
+  });
 
-  const navBody = await attempt("nav", "Current NAV", () =>
-    fetchJson(
+  const navBody = await attempt("nav", "Current NAV", async () => {
+    const body = await fetchJson(
       fetchFn,
       "nav",
       `${MF_BASE}/Handler/SIPHandling/SIP_RegistrationHandler.ashx?method=GetNAV&Scheme_code=${SCHEME_CODE}&ApplyDate=${today}`,
       { method: "GET", headers: { "Content-Type": "application/json" } },
       timeoutMs
-    )
-  );
+    );
+    assertValidNavData(body);
+    return body;
+  });
 
-  const navHistory = await attempt("navHistory", "Monthly NAV history", async () => {
+  const navHistoryRows = await attempt("navHistory", "Monthly NAV history", async () => {
     const perYear = await Promise.all(
       WP_NAV_YEARS.map(async (year) => {
         const form = new FormData();
@@ -174,44 +250,35 @@ export async function fetchSsisSnapshot(
           { method: "POST", headers: { "X-WP-Nonce": WP_NONCE }, body: form },
           timeoutMs
         );
-        return isRecord(body) && Array.isArray(body.data) ? body.data : [];
+        return wpNavHistoryRows(body);
       })
     );
     return perYear.flat();
   });
 
-  const unitPurchase = purchasesBody
-    ? uniqueBy(responseDataRows(purchasesBody), (row) =>
-        isRecord(row) ? row.REQUEST_NO : undefined
-      )
-    : [];
-  const statement = statementBody
-    ? uniqueBy(responseDataRows(statementBody), (row) => (isRecord(row) ? row.trans_no : undefined))
-    : [];
-  const overallNav = navHistory ?? [];
-  const hasNavData = navBody !== null && isRecord(navBody);
-
   const fetched = {
-    purchases: unitPurchase.length,
-    statement: statement.length,
-    navPoints: overallNav.length,
-    hasNavData
+    purchases: purchasesRows?.length ?? 0,
+    statement: statementRows?.length ?? 0,
+    navPoints: navHistoryRows?.length ?? 0,
+    hasNavData: navBody !== null
   };
+  // Nothing validated at all: no dataset actually succeeded, so there is
+  // no snapshot to import and the caller must leave refresh state untouched.
   if (
-    fetched.purchases === 0 &&
-    fetched.statement === 0 &&
-    fetched.navPoints === 0 &&
-    !fetched.hasNavData
+    purchasesRows === null &&
+    statementRows === null &&
+    navBody === null &&
+    navHistoryRows === null
   ) {
     return { payload: null, warnings, fetched };
   }
   return {
     payload: [
       {
-        unitPurchase,
-        statement,
-        navData: hasNavData ? navBody : {},
-        overallNav
+        unitPurchase: purchasesRows ?? [],
+        statement: statementRows ?? [],
+        navData: navBody ?? {},
+        overallNav: navHistoryRows ?? []
       }
     ],
     warnings,

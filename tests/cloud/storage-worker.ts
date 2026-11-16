@@ -25,7 +25,13 @@ import { importFamilyExport, parseFamilyExport } from "../../src/server/domain/f
 import { ensureSchedules, runDueCrons } from "../../src/server/queue/worker-loop";
 import { importSureExport } from "../../src/server/domain/sure-import";
 import { connectMeroShare, syncMeroShareConnection } from "../../src/server/domain/meroshare";
-import { getSsisInsight, importSsisSnapshot } from "../../src/server/domain/ssis";
+import {
+  getSsisInsight,
+  importSsisSnapshot,
+  refreshSsis,
+  setSsisBoAccountNo
+} from "../../src/server/domain/ssis";
+import { fetchSsisSnapshot } from "../../src/server/domain/ssis-fetch";
 import {
   addHolding,
   adjustHolding,
@@ -94,6 +100,7 @@ export class StorageProbe {
       operation === "/import-meroshare" ||
       operation === "/valuation-edit" ||
       operation === "/ssis" ||
+      operation === "/ssis-fixes" ||
       operation === "/holdings" ||
       operation === "/export-restore-precedence"
     ) {
@@ -454,6 +461,158 @@ export class StorageProbe {
           currentValueMinor: insight.summary.currentValueMinor,
           purchases: insight.purchases.length,
           statement: insight.statement.length
+        });
+      }
+      if (operation === "/ssis-fixes") {
+        const BO1 = "1301000011112222";
+        const BO2 = "1301000033334444";
+        const FAULT_BO = "1301999888777666";
+        // Clean slate regardless of probe order.
+        await db.execute(sql`DELETE FROM ssis_purchases WHERE family_id = ${actor.familyId}`);
+        await db.execute(
+          sql`DELETE FROM ssis_statement_entries WHERE family_id = ${actor.familyId}`
+        );
+        await db.execute(sql`DELETE FROM ssis_nav_history WHERE family_id = ${actor.familyId}`);
+        await db.execute(sql`DELETE FROM ssis_insight_state WHERE family_id = ${actor.familyId}`);
+
+        const snapshotFor = (requestNo: number) => [
+          {
+            unitPurchase: [
+              {
+                REQUEST_NO: requestNo,
+                FName: "Cloud",
+                LName: "Holder",
+                APPLY_DT: "2024-01-15",
+                APPLY_UNIT: 100,
+                AMOUNT: "1000.00",
+                APPSTATUS: "VERIFIED",
+                current_nav: 10,
+                nav_date: "2024-01-15",
+                SchemeName: "Siddhartha Systematic Investment Scheme",
+                Is_SIP: true
+              }
+            ],
+            statement: [],
+            navData: {
+              ResponseData: [{ Scheme_code: "001", nav_date: "2024-01-20", nav_value: 10.5 }]
+            },
+            overallNav: [{ eng_date: "2024-01-31", nep_date: "2080-10-17", nav: "10.50" }]
+          }
+        ];
+        const json = (body: unknown) =>
+          new Response(JSON.stringify(body), {
+            status: 200,
+            headers: { "Content-Type": "application/json" }
+          });
+        const validBodies = (input: unknown) => {
+          const url = String(input);
+          if (url.includes("PurchaseRequesthandler")) {
+            return json({ ResponseData: snapshotFor(3001)[0]!.unitPurchase });
+          }
+          if (url.includes("HolderStatement")) return json({ ResponseData: [] });
+          if (url.includes("GetNAV")) {
+            return json({
+              ResponseData: [{ Scheme_code: "001", nav_date: "2024-01-20", nav_value: 10.5 }]
+            });
+          }
+          return json({ data: [{ eng_date: "2024-01-31", nep_date: "2080-10-17", nav: "10.50" }] });
+        };
+
+        // Finding 1: holder binding — unconfirmed switch rejected, confirmed
+        // switch clears the previous holder's datasets.
+        await setSsisBoAccountNo(exec, actor, BO1);
+        await importSsisSnapshot(exec, actor, snapshotFor(3001), "import");
+        const switchRejected = await setSsisBoAccountNo(exec, actor, BO2).then(
+          () => false,
+          () => true
+        );
+        const switched = await setSsisBoAccountNo(exec, actor, BO2, { resetExistingData: true });
+        const afterSwitch = await getSsisInsight(exec, actor);
+
+        // Finding 1: a refresh in flight across a configuration change
+        // cannot commit the old holder's rows.
+        let flipped = false;
+        const inflightFetch = async (input: unknown) => {
+          if (!flipped) {
+            flipped = true;
+            await setSsisBoAccountNo(exec, actor, BO1, { resetExistingData: true });
+          }
+          return validBodies(input);
+        };
+        const inflightRejected = await refreshSsis(exec, actor, inflightFetch as typeof fetch).then(
+          () => false,
+          () => true
+        );
+        const afterInflight = await getSsisInsight(exec, actor);
+
+        // Finding 2: an HTTP-200 application-error envelope fails every dataset.
+        const appError = { IsSucess: false, ResponseData: null, success: false, data: [] };
+        const allErr = await fetchSsisSnapshot(BO1, (async () => json(appError)) as typeof fetch);
+
+        // Finding 4: individually-safe rows whose total overflows are rejected.
+        const bigRow = (n: number) => ({
+          REQUEST_NO: 4000 + n,
+          FName: "Cloud",
+          LName: "Holder",
+          APPLY_DT: "2024-01-15",
+          APPLY_UNIT: "10",
+          AMOUNT: "90071992547409.91",
+          APPSTATUS: "VERIFIED"
+        });
+        const oversizedRejected = await importSsisSnapshot(
+          exec,
+          actor,
+          [
+            {
+              unitPurchase: [bigRow(1), bigRow(2), bigRow(3)],
+              statement: [],
+              navData: {},
+              overallNav: []
+            }
+          ],
+          "import"
+        ).then(
+          () => false,
+          () => true
+        );
+
+        // Finding 3: a database fault while saving the BO number surfaces
+        // only the sanitized error — never the number, in message or cause.
+        let faultMessage = "";
+        await db.execute(
+          sql`CREATE TRIGGER ssis_fault_insert BEFORE INSERT ON ssis_insight_state BEGIN SELECT RAISE(ABORT, 'ssis fault'); END`
+        );
+        await db.execute(
+          sql`CREATE TRIGGER ssis_fault_update BEFORE UPDATE ON ssis_insight_state BEGIN SELECT RAISE(ABORT, 'ssis fault'); END`
+        );
+        try {
+          await setSsisBoAccountNo(exec, actor, FAULT_BO);
+        } catch (e) {
+          const parts: string[] = [];
+          let cursor: unknown = e;
+          while (cursor instanceof Error) {
+            parts.push(cursor.message);
+            cursor = cursor.cause;
+          }
+          faultMessage = parts.join("\n");
+        } finally {
+          await db.execute(sql`DROP TRIGGER IF EXISTS ssis_fault_insert`);
+          await db.execute(sql`DROP TRIGGER IF EXISTS ssis_fault_update`);
+        }
+
+        return Response.json({
+          switchRejected,
+          dataReset: switched.dataReset,
+          purchasesAfterSwitch: afterSwitch.purchases.length,
+          holderAfterSwitch: afterSwitch.holderName,
+          inflightRejected,
+          purchasesAfterInflight: afterInflight.purchases.length,
+          boMaskedAfterInflight: afterInflight.boAccountMasked,
+          allErrorPayloadNull: allErr.payload === null,
+          allErrorWarnings: allErr.warnings.length,
+          oversizedRejected,
+          faultMessage,
+          faultChainHasBo: faultMessage.includes(FAULT_BO)
         });
       }
       const account = await createAccount(exec, actor, {

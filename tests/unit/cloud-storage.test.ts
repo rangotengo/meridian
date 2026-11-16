@@ -213,6 +213,21 @@ describe("Cloudflare SQLite storage", () => {
     expect(result.purchases).toBe(1);
     expect(result.statement).toBe(1);
   });
+  it("binds SSIS data to the configured holder and validates upstream data in the Durable Object", async () => {
+    const result = await probe("ssis-fixes");
+    expect(result.switchRejected).toBe(true);
+    expect(result.dataReset).toBe(true);
+    expect(result.purchasesAfterSwitch).toBe(0);
+    expect(result.holderAfterSwitch).toBeNull();
+    expect(result.inflightRejected).toBe(true);
+    expect(result.purchasesAfterInflight).toBe(0);
+    expect(result.boMaskedAfterInflight).toBe("••••2222");
+    expect(result.allErrorPayloadNull).toBe(true);
+    expect(result.allErrorWarnings).toBe(4);
+    expect(result.oversizedRejected).toBe(true);
+    expect(result.faultMessage).toContain("Could not save the SSIS BO account configuration.");
+    expect(result.faultChainHasBo).toBe(false);
+  });
   it("runs household, ledger, splits, transfers, reports and queue services", async () => {
     const result = await probe("ledger");
     expect(result.duplicate).toBe(true);

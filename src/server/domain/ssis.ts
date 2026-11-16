@@ -1,5 +1,6 @@
-import { asc, eq } from "drizzle-orm";
+import { asc, eq, sql } from "drizzle-orm";
 import type { Executor } from "../db/client";
+import { usesCloudStorage } from "../db/dialect";
 import {
   families,
   ssisInsightState,
@@ -9,7 +10,7 @@ import {
 } from "../db/schema";
 import type { Actor } from "../auth/context";
 import { recordAudit } from "../observability/audit";
-import { errors } from "@/lib/errors";
+import { errors, isDomainError } from "@/lib/errors";
 import { isIsoDate, todayIn } from "@/lib/datetime";
 import { fetchSsisSnapshot } from "./ssis-fetch";
 
@@ -26,6 +27,18 @@ import { fetchSsisSnapshot } from "./ssis-fetch";
  * This data never touches Meridian accounts/entries/balances — it has its
  * own tables and lifecycle (import / refresh), mirroring the standalone
  * SSIS dashboard's math.
+ *
+ * Single-holder policy: the insight holds ONE holder's datasets, bound to
+ * the configured BO account number. Changing the BO number while holder
+ * data exists requires an explicit confirmed switch, which clears the
+ * previous holder's purchases and statement (scheme-level NAV history is
+ * kept); an unconfirmed switch is rejected so two holders' rows can never
+ * merge under one configuration. Every BO change bumps the state's
+ * config_generation, and a refresh re-checks the generation it fetched for
+ * inside its commit transaction — a refresh started for the old holder
+ * therefore cannot write after a switch. Snapshot imports are bound by
+ * holder name: a snapshot naming a different holder than the stored data
+ * is rejected instead of merged.
  */
 
 export const SSIS_SCHEME_NAME = "Siddhartha Systematic Investment Scheme";
@@ -33,6 +46,14 @@ export const SSIS_SCHEME_CODE = "001";
 
 const UNITS_SCALE = 4; // units are decimal strings with up to 4dp
 const UNITS_FACTOR = 10_000n;
+
+/**
+ * Read-model values are JS numbers, so every quantity that can reach a
+ * Number conversion must stay within the exactly-representable range.
+ * Canonical unit quantities are bounded to a safe scaled integer at parse
+ * time, and snapshot aggregates are checked before anything is persisted.
+ */
+const MAX_SAFE = BigInt(Number.MAX_SAFE_INTEGER);
 
 /**
  * The repo's family-level write gate: family admins hold full control of
@@ -105,7 +126,7 @@ export function parseMinor(value: unknown): bigint | null {
 }
 
 function toSafeNumber(value: bigint): number | null {
-  if (value > BigInt(Number.MAX_SAFE_INTEGER) || value < -BigInt(Number.MAX_SAFE_INTEGER)) {
+  if (value > MAX_SAFE || value < -MAX_SAFE) {
     return null;
   }
   return Number(value);
@@ -139,6 +160,10 @@ export function unitsText(scaled: bigint): string {
 export function parseUnits(value: unknown): ParsedUnits | null {
   const scaled = parseDecimalScaled(value, UNITS_SCALE);
   if (scaled === null) return null;
+  // Arbitrarily large quantities are not data the read model can value
+  // exactly (units × NAV must stay a safe integer), so they are rejected
+  // here and the row is skipped like any other malformed row.
+  if (scaled > MAX_SAFE || scaled < -MAX_SAFE) return null;
   return { scaled, text: unitsText(scaled) };
 }
 
@@ -340,10 +365,29 @@ export function extractSsisSnapshot(payload: unknown): SsisExtractedSnapshot {
     navByDate.set(parsed.engDate, parsed);
   }
 
+  const purchaseList = [...purchaseByKey.values()];
+  const statementList = [...statementByKey.values()];
+  const navList = [...navByDate.values()].sort((a, b) => a.engDate.localeCompare(b.engDate));
+
+  // Individually-safe rows can still sum past exact representation (three
+  // purchases of 90,071,992,547,409.91 each are each safe alone). Never
+  // persist a snapshot whose totals the read model could only show rounded.
+  let totalUnitsScaled = 0n;
+  let totalInvested = 0n;
+  for (const purchase of purchaseList) {
+    totalUnitsScaled += parseDecimalScaled(purchase.units, UNITS_SCALE) ?? 0n;
+    totalInvested += BigInt(purchase.amountMinor);
+  }
+  if (totalUnitsScaled > MAX_SAFE || totalInvested > MAX_SAFE) {
+    throw errors.validation(
+      "That snapshot's totals are too large for Meridian to represent exactly, so nothing was imported. Check the file and try again."
+    );
+  }
+
   return {
-    purchases: [...purchaseByKey.values()],
-    statement: [...statementByKey.values()],
-    navHistory: [...navByDate.values()].sort((a, b) => a.engDate.localeCompare(b.engDate)),
+    purchases: purchaseList,
+    statement: statementList,
+    navHistory: navList,
     holderName: holderNameOf(unitPurchase),
     navDataNav: extractNavDataNav(navData),
     skipped
@@ -360,7 +404,7 @@ export function extractSsisSnapshot(payload: unknown): SsisExtractedSnapshot {
 export type SsisSummary = {
   purchaseCount: number;
   totalUnits: string;
-  totalInvestedMinor: number;
+  totalInvestedMinor: number | null;
   currentNavMinor: number | null;
   currentNavDate: string | null;
   currentValueMinor: number | null;
@@ -400,16 +444,23 @@ export function computeSsisSummary(input: {
     totalInvested += BigInt(purchase.amountMinor);
   }
   const currentNav = resolveCurrentNav(input.navHistory, input.stateNav, input.today);
-  const totalInvestedMinor = Number(totalInvested);
+  // Every BigInt → Number conversion is checked: an aggregate that leaves
+  // the exactly-representable range surfaces as null (the page shows "—")
+  // instead of a silently rounded amount or a non-finite chart value.
+  const totalInvestedMinor = toSafeNumber(totalInvested);
   let currentValueMinor: number | null = null;
   let profitMinor: number | null = null;
   let returnPercent: number | null = null;
   if (currentNav) {
     const value = roundHalfUpDiv(totalUnitsScaled * BigInt(currentNav.navMinor), UNITS_FACTOR);
-    currentValueMinor = Number(value);
-    profitMinor = currentValueMinor - totalInvestedMinor;
-    returnPercent =
-      totalInvestedMinor > 0 ? Math.round((profitMinor / totalInvestedMinor) * 10_000) / 100 : null;
+    currentValueMinor = toSafeNumber(value);
+    if (currentValueMinor !== null && totalInvestedMinor !== null) {
+      profitMinor = currentValueMinor - totalInvestedMinor;
+      returnPercent =
+        totalInvestedMinor > 0
+          ? Math.round((profitMinor / totalInvestedMinor) * 10_000) / 100
+          : null;
+    }
   }
   return {
     purchaseCount: input.purchases.length,
@@ -450,7 +501,9 @@ export function computeSsisNavStats(input: {
   }
   const min = Math.min(...navs);
   const max = Math.max(...navs);
-  const avg = Math.round(navs.reduce((a, b) => a + b, 0) / navs.length);
+  // Sum in BigInt so the average stays exact for any row count.
+  const navSum = navs.reduce((acc, v) => acc + BigInt(v), 0n);
+  const avg = Number(roundHalfUpDiv(navSum, BigInt(navs.length)));
   const changeFromMinPercent =
     input.currentNavMinor !== null && min > 0
       ? Math.round(((input.currentNavMinor - min) / min) * 10_000) / 100
@@ -472,7 +525,7 @@ export type SsisPurchaseSeriesPoint = {
 
 export type SsisValueGrowthPoint = {
   date: string;
-  investedMinor: number;
+  investedMinor: number | null;
   valueMinor: number | null;
 };
 
@@ -494,10 +547,10 @@ export function buildSsisSeries(input: {
     cumInvested += BigInt(p.amountMinor);
     return {
       date: p.applyDate,
-      investedMinor: Number(cumInvested),
+      investedMinor: toSafeNumber(cumInvested),
       valueMinor:
         input.currentNavMinor !== null
-          ? Number(roundHalfUpDiv(cumUnits * BigInt(input.currentNavMinor), UNITS_FACTOR))
+          ? toSafeNumber(roundHalfUpDiv(cumUnits * BigInt(input.currentNavMinor), UNITS_FACTOR))
           : null
     };
   });
@@ -517,11 +570,38 @@ export type SsisImportCounts = {
 
 export type SsisSource = "import" | "refresh";
 
+export type SsisImportOptions = {
+  /**
+   * Refresh commits carry the configuration they fetched for. The commit
+   * re-reads the state row inside its transaction and refuses to write
+   * when the BO number or config generation has moved on, so a refresh
+   * that was in flight across a holder switch cannot repopulate the
+   * insight with the previous holder's rows.
+   */
+  expectedConfig?: { boAccountNo: string; configGeneration: number };
+};
+
+/**
+ * Serialize SSIS writes per family (the family-import pattern). On the
+ * cloud backend the Durable Object already serializes access, so the
+ * advisory lock is Postgres-only.
+ */
+async function lockSsisFamily(tx: Executor, familyId: string): Promise<void> {
+  if (!usesCloudStorage) {
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${familyId}))`);
+  }
+}
+
+function normalizeHolderName(name: string): string {
+  return name.trim().replace(/\s+/g, " ").toLowerCase();
+}
+
 export async function importSsisSnapshot(
   exec: Executor,
   actor: Actor,
   payload: unknown,
-  source: SsisSource
+  source: SsisSource,
+  options: SsisImportOptions = {}
 ): Promise<SsisImportCounts> {
   assertSsisAdmin(actor);
   const data = extractSsisSnapshot(payload);
@@ -529,7 +609,48 @@ export async function importSsisSnapshot(
   const today = new Date().toISOString().slice(0, 10);
   const stateNav = data.navDataNav ?? resolveCurrentNav(data.navHistory, null, today);
 
+  // The value this snapshot implies at its own current NAV must also be
+  // exactly representable before anything is persisted.
+  if (stateNav) {
+    let totalUnitsScaled = 0n;
+    for (const purchase of data.purchases) {
+      totalUnitsScaled += parseDecimalScaled(purchase.units, UNITS_SCALE) ?? 0n;
+    }
+    const value = roundHalfUpDiv(totalUnitsScaled * BigInt(stateNav.navMinor), UNITS_FACTOR);
+    if (toSafeNumber(value) === null) {
+      throw errors.validation(
+        "That snapshot's current value is too large for Meridian to represent exactly, so nothing was imported. Check the file and try again."
+      );
+    }
+  }
+
   await exec.transaction(async (tx) => {
+    await lockSsisFamily(tx, familyId);
+    const [state] = await tx
+      .select()
+      .from(ssisInsightState)
+      .where(eq(ssisInsightState.familyId, familyId))
+      .limit(1);
+    if (options.expectedConfig) {
+      if (
+        !state ||
+        state.boAccountNo !== options.expectedConfig.boAccountNo ||
+        state.configGeneration !== options.expectedConfig.configGeneration
+      ) {
+        throw errors.validation(
+          "The SSIS configuration changed while this data was being fetched, so nothing was updated. Refresh again to load data for the current holder."
+        );
+      }
+    }
+    if (
+      state?.holderName &&
+      data.holderName &&
+      normalizeHolderName(state.holderName) !== normalizeHolderName(data.holderName)
+    ) {
+      throw errors.validation(
+        `This insight already holds data for ${state.holderName}, and this data names a different holder. Nothing was imported — to switch holders, change the BO account number and confirm the switch, which clears the previous holder's data.`
+      );
+    }
     for (const purchase of data.purchases) {
       await tx
         .insert(ssisPurchases)
@@ -631,31 +752,103 @@ export function maskBoAccountNo(boAccountNo: string | null): string | null {
   return `••••${boAccountNo.slice(-4)}`;
 }
 
+export type SsisBoConfigResult = { dataReset: boolean };
+
+/**
+ * Configure the BO account number the insight is bound to.
+ *
+ * Single-holder policy: while the insight holds a previous holder's
+ * purchases or statement, changing the number is rejected unless the
+ * caller explicitly confirms the switch (`resetExistingData`), in which
+ * case the previous holder's datasets are cleared in the same transaction
+ * (scheme-level NAV history is kept — it is not holder data). Every actual
+ * change bumps config_generation so an in-flight refresh for the old
+ * holder fails its commit check instead of writing under the new holder.
+ *
+ * Error hygiene: the upsert binds the BO number as a parameter, and ORM /
+ * driver errors embed SQL text and bound parameters in their messages.
+ * Any non-domain failure from this function is therefore replaced with a
+ * sanitized error carrying no cause chain before it can reach generic
+ * action logging.
+ */
 export async function setSsisBoAccountNo(
   exec: Executor,
   actor: Actor,
-  boAccountNo: string
-): Promise<void> {
+  boAccountNo: string,
+  options: { resetExistingData?: boolean } = {}
+): Promise<SsisBoConfigResult> {
   assertSsisAdmin(actor);
   const normalized = boAccountNo.trim();
   if (!/^[0-9]{8,24}$/.test(normalized)) {
     throw errors.validation("Enter the BO account number (digits only, 8–24 characters).");
   }
-  await exec
-    .insert(ssisInsightState)
-    .values({ familyId: actor.familyId, boAccountNo: normalized })
-    .onConflictDoUpdate({
-      target: ssisInsightState.familyId,
-      set: { boAccountNo: normalized, updatedAt: new Date() }
+  try {
+    return await exec.transaction(async (tx) => {
+      await lockSsisFamily(tx, actor.familyId);
+      const [state] = await tx
+        .select()
+        .from(ssisInsightState)
+        .where(eq(ssisInsightState.familyId, actor.familyId))
+        .limit(1);
+      const previousBo = state?.boAccountNo ?? null;
+      const switching = previousBo !== null && previousBo !== normalized;
+      let dataReset = false;
+      if (switching) {
+        const purchaseRows = await tx
+          .select({ id: ssisPurchases.id })
+          .from(ssisPurchases)
+          .where(eq(ssisPurchases.familyId, actor.familyId));
+        const statementRows = await tx
+          .select({ id: ssisStatementEntries.id })
+          .from(ssisStatementEntries)
+          .where(eq(ssisStatementEntries.familyId, actor.familyId));
+        const hasHolderData =
+          purchaseRows.length > 0 || statementRows.length > 0 || !!state?.holderName;
+        if (hasHolderData && !options.resetExistingData) {
+          throw errors.validation(
+            "This insight already holds purchases and statement data for the current BO account. Changing the number would mix two holders' data — confirm the switch to clear the existing holder data and start fresh for the new holder."
+          );
+        }
+        if (hasHolderData) {
+          await tx.delete(ssisPurchases).where(eq(ssisPurchases.familyId, actor.familyId));
+          await tx
+            .delete(ssisStatementEntries)
+            .where(eq(ssisStatementEntries.familyId, actor.familyId));
+          dataReset = true;
+        }
+      }
+      const changed = previousBo !== normalized;
+      const configGeneration =
+        (state?.configGeneration ?? 0) + (changed && previousBo !== null ? 1 : 0);
+      const resetFields = dataReset
+        ? { holderName: null, lastFetchedAt: null, lastSource: null }
+        : {};
+      await tx
+        .insert(ssisInsightState)
+        .values({
+          familyId: actor.familyId,
+          boAccountNo: normalized,
+          configGeneration,
+          ...resetFields
+        })
+        .onConflictDoUpdate({
+          target: ssisInsightState.familyId,
+          set: { boAccountNo: normalized, configGeneration, ...resetFields, updatedAt: new Date() }
+        });
+      await recordAudit(tx, {
+        familyId: actor.familyId,
+        actorUserId: actor.userId,
+        action: "ssis.bo_account_configured",
+        entityType: "ssis_insight",
+        entityId: actor.familyId,
+        metadata: { source: "settings", ...(dataReset ? { dataReset: true } : {}) }
+      });
+      return { dataReset };
     });
-  await recordAudit(exec, {
-    familyId: actor.familyId,
-    actorUserId: actor.userId,
-    action: "ssis.bo_account_configured",
-    entityType: "ssis_insight",
-    entityId: actor.familyId,
-    metadata: { source: "settings" }
-  });
+  } catch (e) {
+    if (isDomainError(e)) throw e;
+    throw new Error("Could not save the SSIS BO account configuration.");
+  }
 }
 
 export type SsisRefreshResult = SsisImportCounts & { warnings: string[] };
@@ -677,6 +870,7 @@ export async function refreshSsis(
       "Set your BO account number first — refresh needs it to query Siddhartha Capital."
     );
   }
+  const configGeneration = state?.configGeneration ?? 0;
   const snapshot = await fetchSsisSnapshot(boAccountNo, fetchFn);
   if (
     snapshot.payload === null ||
@@ -689,7 +883,9 @@ export async function refreshSsis(
       "Siddhartha Capital returned no SSIS data. Nothing was updated — try again later or import a snapshot file instead."
     );
   }
-  const counts = await importSsisSnapshot(exec, actor, snapshot.payload, "refresh");
+  const counts = await importSsisSnapshot(exec, actor, snapshot.payload, "refresh", {
+    expectedConfig: { boAccountNo, configGeneration }
+  });
   return { ...counts, warnings: snapshot.warnings };
 }
 

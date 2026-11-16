@@ -10,6 +10,7 @@ import {
   importSsisSnapshot,
   refreshSsis,
   setSsisBoAccountNo,
+  type SsisBoConfigResult,
   type SsisImportCounts
 } from "@/server/domain/ssis";
 import { errors } from "@/lib/errors";
@@ -66,14 +67,22 @@ const boAccountSchema = z.object({
 });
 
 export async function setSsisBoAccountAction(
-  _previous: ActionState | undefined,
+  _previous: ActionState<SsisBoConfigResult> | undefined,
   formData: FormData
-): Promise<ActionState> {
+): Promise<ActionState<SsisBoConfigResult>> {
   return runAction("ssis.configure_bo", async () => {
     const actor = await assertActor();
-    const input = boAccountSchema.parse(formValues(formData));
-    await setSsisBoAccountNo(getDb(), actor, input.boAccountNo);
+    const values = formValues(formData);
+    const input = boAccountSchema.parse(values);
+    // Changing the BO number while another holder's data is stored is a
+    // destructive switch: the domain rejects it unless the admin ticked
+    // the explicit confirmation in the form.
+    const resetExistingData =
+      values.resetExistingData === "on" || values.resetExistingData === "true";
+    const result = await setSsisBoAccountNo(getDb(), actor, input.boAccountNo, {
+      resetExistingData
+    });
     revalidatePath("/insights/ssis");
-    return undefined;
+    return result;
   });
 }

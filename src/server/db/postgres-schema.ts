@@ -943,6 +943,10 @@ export const ssisInsightState = pgTable("ssis_insight_state", {
     .references(() => families.id, { onDelete: "cascade" }),
   holderName: text("holder_name"),
   boAccountNo: text("bo_account_no"),
+  // Bumped on every BO-number change. A live refresh captures the value it
+  // fetched for and the commit re-checks it, so a refresh started for one
+  // holder can never write its rows under another holder's configuration.
+  configGeneration: integer("config_generation").notNull().default(0),
   latestNavMinor: bigint("latest_nav_minor", { mode: "number" }),
   latestNavDate: date("latest_nav_date"),
   lastFetchedAt: timestamp("last_fetched_at", { withTimezone: true }),

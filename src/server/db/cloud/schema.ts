@@ -1084,6 +1084,9 @@ export const ssisInsightState = sqliteTable("ssis_insight_state", {
     .references(() => families.id, { onDelete: "cascade" }),
   holderName: text("holder_name"),
   boAccountNo: text("bo_account_no"),
+  // Bumped on every BO-number change; refresh commits re-check it so an
+  // in-flight refresh for a previous holder cannot write under the new one.
+  configGeneration: integer("config_generation").notNull().default(0),
   latestNavMinor: integer("latest_nav_minor"),
   latestNavDate: text("latest_nav_date"),
   lastFetchedAt: isoTimestamp("last_fetched_at"),

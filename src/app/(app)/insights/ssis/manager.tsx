@@ -101,7 +101,7 @@ function Controls({ data }: { data: SsisInsightData }) {
         <h3 className="text-sm font-semibold">BO account number</h3>
         <p className="mt-1 text-sm text-muted-foreground">
           {data.hasBoAccount
-            ? `Currently set to ${data.boAccountMasked}. Enter a new number to replace it.`
+            ? `Currently set to ${data.boAccountMasked}. Enter a new number to replace it. This insight holds one holder's data: saving a different number requires confirming the switch below, which clears the current holder's purchases and statement.`
             : "Not set. Refresh stays disabled until it is configured."}
         </p>
         <form action={boAction} className="mt-3 flex flex-wrap items-end gap-3">
@@ -115,9 +115,24 @@ function Controls({ data }: { data: SsisInsightData }) {
             />
           </Field>
           <SubmitButton variant="secondary">Save</SubmitButton>
+          {data.hasBoAccount && (data.purchases.length > 0 || data.statement.length > 0) ? (
+            <label className="flex w-full items-start gap-2 text-sm text-muted-foreground">
+              <input type="checkbox" name="resetExistingData" className="mt-0.5" />
+              <span>
+                This is a different holder: clear the existing purchases and statement and switch.
+              </span>
+            </label>
+          ) : null}
         </form>
         <FormError message={boState?.ok === false ? boState.error : undefined} />
-        {boState?.ok ? <p className="mt-2 text-sm text-muted-foreground">Saved.</p> : null}
+        {boState?.ok ? (
+          <p className="mt-2 text-sm text-muted-foreground">
+            Saved.
+            {boState.data?.dataReset
+              ? " The previous holder's purchases and statement were cleared."
+              : ""}
+          </p>
+        ) : null}
       </div>
     </Card>
   );
@@ -135,7 +150,12 @@ function SummaryCards({ data }: { data: SsisInsightData }) {
     { title: "Total Units", value: summary.totalUnits },
     {
       title: "Total Invested",
-      value: <Amount minor={summary.totalInvestedMinor} currency={data.currency} />
+      value:
+        summary.totalInvestedMinor === null ? (
+          "—"
+        ) : (
+          <Amount minor={summary.totalInvestedMinor} currency={data.currency} />
+        )
     },
     {
       title: "Current Value",
@@ -452,7 +472,9 @@ export function SsisManager({ data }: { data: SsisInsightData }) {
                 {
                   label: "Invested",
                   color: "#2563eb",
-                  values: data.valueGrowth.map((p) => p.investedMinor / 100),
+                  values: data.valueGrowth.map((p) =>
+                    p.investedMinor === null ? null : p.investedMinor / 100
+                  ),
                   format: (v) => v.toLocaleString("en", { maximumFractionDigits: 0 })
                 },
                 {
