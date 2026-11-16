@@ -10,6 +10,7 @@ import {
   entries,
   exchangeRates,
   families,
+  portfolioHoldings,
   recurringSeries,
   savedFilters,
   tags,
@@ -72,7 +73,7 @@ import { isValidCurrency } from "@/lib/money";
 const SOURCE = "meridian_export";
 const MAX_EXPORT_BYTES = 25 * 1024 * 1024;
 const MAX_ROWS = 100_000;
-const SUPPORTED_VERSIONS = new Set([1, 2]);
+const SUPPORTED_VERSIONS = new Set([1, 2, 3]);
 const FREQUENCIES = new Set(["monthly", "weekly", "yearly"]);
 const VALUATION_KINDS = new Set(["opening", "reconciliation", "current"]);
 const ACCOUNT_STATUSES = new Set(["active", "draft", "disabled"]);
@@ -87,6 +88,7 @@ export type FamilyImportResult = {
   entries: number;
   transfers: number;
   valuations: number;
+  holdings: number;
   budgets: number;
   recurring: number;
   savedFilters: number;
@@ -156,6 +158,15 @@ type ParsedRecurring = {
   active: boolean;
   lastPostedEntryId: string | null;
 };
+type ParsedHolding = {
+  id: string;
+  accountId: string;
+  ticker: string;
+  companyName: string | null;
+  quantity: string;
+  averageCostMinor: number | null;
+  currentPriceMinor: number | null;
+};
 type ParsedSavedFilter = { id: string; userId: string; name: string; params: RecordData };
 type ParsedShare = { accountId: string; userId: string; permission: string };
 type ParsedRate = { base: string; quote: string; rate: string; quotedOn: string };
@@ -170,6 +181,7 @@ export type ParsedFamilyExport = {
   tags: ParsedTag[];
   entries: ParsedEntry[];
   transfers: ParsedTransfer[];
+  holdings: ParsedHolding[];
   budgets: ParsedBudget[];
   recurring: ParsedRecurring[];
   savedFilters: ParsedSavedFilter[];
@@ -218,7 +230,9 @@ export function parseFamilyExport(bytes: Uint8Array): ParsedFamilyExport {
   const categories = reqArray(raw.categories, "categories").map(parseCategory);
   const tags = reqArray(raw.tags, "tags").map(parseTag);
   const entries = reqArray(raw.entries, "entries").map(parseEntry);
-  const total = accounts.length + categories.length + tags.length + entries.length;
+  const holdings = optArray(raw.holdings, "holdings").map(parseHolding);
+  const total =
+    accounts.length + categories.length + tags.length + entries.length + holdings.length;
   if (total > MAX_ROWS)
     throw errors.validation(`The export exceeds ${MAX_ROWS.toLocaleString()} records.`);
 
@@ -231,6 +245,7 @@ export function parseFamilyExport(bytes: Uint8Array): ParsedFamilyExport {
     tags,
     entries,
     transfers: optArray(raw.transfers, "transfers").map(parseTransfer),
+    holdings,
     budgets: optArray(raw.budgets, "budgets").map(parseBudget),
     recurring: optArray(raw.recurring, "recurring series").map(parseRecurring),
     savedFilters: optArray(raw.savedFilters, "saved filters").map(parseSavedFilter),
@@ -506,6 +521,19 @@ async function importRecords(
     transferCount++;
   }
 
+  let holdingCount = 0;
+  for (const record of data.holdings) {
+    await exec.insert(portfolioHoldings).values({
+      accountId: mappedId(record.accountId, accountMap, "account"),
+      ticker: record.ticker,
+      companyName: record.companyName,
+      quantity: record.quantity,
+      averageCostMinor: record.averageCostMinor,
+      currentPriceMinor: record.currentPriceMinor
+    });
+    holdingCount++;
+  }
+
   let budgetCount = 0;
   for (const record of data.budgets) {
     await exec.insert(budgets).values({
@@ -588,6 +616,7 @@ async function importRecords(
       entries: entryMap.size,
       transfers: transferCount,
       valuations: valuationCount,
+      holdings: holdingCount,
       budgets: budgetCount,
       recurring: seriesMap.size,
       savedFilters: savedFilterCount,
@@ -603,6 +632,7 @@ async function importRecords(
     entries: entryMap.size,
     transfers: transferCount,
     valuations: valuationCount,
+    holdings: holdingCount,
     budgets: budgetCount,
     recurring: seriesMap.size,
     savedFilters: savedFilterCount,
@@ -785,6 +815,30 @@ function validateRestoredData(data: ParsedFamilyExport, pairs: ParsedTransfer[])
       throw errors.validation("An entry in the export claims a transfer it is not a leg of.");
     }
   }
+
+  // Holdings are user-entered positions the holdings domain only allows on
+  // other-asset accounts, unique per ticker; a tampered export must not
+  // restore states the domain forbids.
+  const holdingKeys = new Set<string>();
+  for (const holding of data.holdings) {
+    const account = accountById.get(holding.accountId);
+    if (!account)
+      throw errors.validation(
+        "A holding in the export references an account that is not part of the export."
+      );
+    if (account.type !== "other_asset") {
+      throw errors.validation(
+        "A holding in the export belongs to an account that is not an other-asset account."
+      );
+    }
+    const key = `${holding.accountId}:${holding.ticker}`;
+    if (holdingKeys.has(key)) {
+      throw errors.validation(
+        "The export contains two holdings for the same ticker on one account."
+      );
+    }
+    holdingKeys.add(key);
+  }
 }
 
 function rebuildTransferPairs(entries: ParsedEntry[]): ParsedTransfer[] {
@@ -901,6 +955,26 @@ function parseTransfer(raw: unknown): ParsedTransfer {
     outflowEntryId: reqId(r.outflowEntryId, "transfer outflow entry"),
     inflowEntryId: reqId(r.inflowEntryId, "transfer inflow entry"),
     status
+  };
+}
+
+function parseHolding(raw: unknown): ParsedHolding {
+  const r = reqRecord(raw, "holding");
+  const quantity = reqText(r.quantity, "holding quantity", 32);
+  // Quantities are decimal strings with at most 6 decimal places (the
+  // holdings domain's storage contract); anything else could not have been
+  // written by Meridian and would corrupt the portfolio math on restore.
+  if (!/^\d+(?:\.\d{1,6})?$/.test(quantity)) {
+    throw errors.validation("A holding in the export has an invalid quantity.");
+  }
+  return {
+    id: reqId(r.id, "holding"),
+    accountId: reqId(r.accountId, "holding account"),
+    ticker: reqText(r.ticker, "holding ticker", 32),
+    companyName: optText(r.companyName, 200),
+    quantity,
+    averageCostMinor: optMinor(r.averageCostMinor, "holding average cost"),
+    currentPriceMinor: optMinor(r.currentPriceMinor, "holding current price")
   };
 }
 
@@ -1053,6 +1127,13 @@ function reqMinor(value: unknown, what: string): number {
   if (typeof value !== "number" || !Number.isSafeInteger(value))
     throw errors.validation(`The export has an invalid ${what}.`);
   return value;
+}
+
+function optMinor(value: unknown, what: string): number | null {
+  if (value === null || value === undefined) return null;
+  const minor = reqMinor(value, what);
+  if (minor < 0) throw errors.validation(`The export has a negative ${what}.`);
+  return minor;
 }
 
 function reqDate(value: unknown, what: string): string {

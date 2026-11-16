@@ -7,6 +7,19 @@ import { errors } from "@/lib/errors";
 import { displayToLedgerBalance } from "@/lib/money";
 import { isIsoDate } from "@/lib/datetime";
 import { recordAudit } from "../observability/audit";
+import { accountHasHoldings } from "./holdings";
+
+/**
+ * While an account has manual portfolio holdings, its value is managed by
+ * them (the holdings domain writes the daily valuation), so manual
+ * valuation changes are rejected until the last holding is removed.
+ */
+async function assertNotHoldingsManaged(exec: Executor, account: AccountRow): Promise<void> {
+  if (account.type !== "other_asset") return;
+  if (await accountHasHoldings(exec, account.id)) {
+    throw errors.validation("This account's value is managed by its holdings.");
+  }
+}
 
 export const VALUATION_KINDS = ["opening", "reconciliation", "current"] as const;
 export type ValuationKind = (typeof VALUATION_KINDS)[number];
@@ -38,6 +51,7 @@ export async function recordValuation(
     .where(eq(accounts.id, input.accountId))
     .limit(1);
   if (!account) throw errors.notFound("Account");
+  await assertNotHoldingsManaged(exec, account);
 
   const name =
     input.name?.trim() ||
@@ -92,6 +106,7 @@ async function loadManagedValuation(
     throw errors.forbidden("Only full-control access can change valuations.");
   }
   const { account } = await assertAccountOpen(exec, actor, entry.accountId, "manage");
+  await assertNotHoldingsManaged(exec, account);
   return { entry, account };
 }
 

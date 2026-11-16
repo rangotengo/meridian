@@ -9,9 +9,16 @@ import { Badge, Card, PageHeader } from "@/components/ds/card";
 import { Amount, Sparkline } from "@/components/finance/amount";
 import { fmtDate } from "@/lib/format";
 import { ledgerToDisplayBalance, minorToDecimal } from "@/lib/money";
+import {
+  holdingValueMinor,
+  listHoldings,
+  parseQuantity,
+  summarizeHoldings
+} from "@/server/domain/holdings";
 import { AccountActions } from "./actions-panel";
 import { ValuationForm } from "./valuation-form";
 import { ValuationRowActions } from "./valuation-row-actions";
+import { HoldingsSection, type HoldingView } from "./holdings-section";
 
 export const metadata = { title: "Account" };
 
@@ -34,6 +41,33 @@ export default async function AccountDetailPage({
   const privacy = await getUserPrivacyMode(db, actor.userId);
   const { account, level, series, recentActivity, shares, valuationDriven, isJoint } = overview;
   const members = await familyMemberOptions(db, actor.familyId);
+
+  // Manual portfolio holdings exist only on other-asset accounts; while an
+  // account has any, its value is managed by them (no manual valuations).
+  const isPortfolioAccount = account.type === "other_asset";
+  const holdingRows = isPortfolioAccount ? await listHoldings(db, actor, accountId) : [];
+  const holdingsManaged = holdingRows.length > 0;
+  const holdingsSummary = summarizeHoldings(holdingRows);
+  const holdingViews: HoldingView[] = holdingRows.map((row) => {
+    const { scaled } = parseQuantity(row.quantity);
+    const valueMinor = holdingValueMinor(
+      scaled,
+      row.currentPriceMinor ?? row.averageCostMinor ?? 0
+    );
+    return {
+      id: row.id,
+      ticker: row.ticker,
+      companyName: row.companyName,
+      quantity: row.quantity,
+      averageCostMinor: row.averageCostMinor,
+      currentPriceMinor: row.currentPriceMinor,
+      valueMinor,
+      gainMinor:
+        row.averageCostMinor === null
+          ? null
+          : valueMinor - holdingValueMinor(scaled, row.averageCostMinor)
+    };
+  });
 
   return (
     <div className="space-y-6 pb-6 lg:pb-12">
@@ -90,7 +124,7 @@ export default async function AccountDetailPage({
           >
             + New transaction
           </Link>
-          {valuationDriven && level === "full_control" ? (
+          {valuationDriven && level === "full_control" && !holdingsManaged ? (
             <a
               href="#valuation"
               className="block rounded-lg border border-border px-3 py-2 text-sm transition-colors hover:bg-surface-hover"
@@ -135,11 +169,32 @@ export default async function AccountDetailPage({
         </Card>
       ) : null}
 
-      {valuationDriven && level === "full_control" ? (
+      {valuationDriven && level === "full_control" && !holdingsManaged ? (
         <ValuationForm
           accountId={account.id}
           currency={account.currency}
           today={todayIn(family.timezone)}
+        />
+      ) : null}
+
+      {valuationDriven && level === "full_control" && holdingsManaged ? (
+        <Card>
+          <h2 className="mb-2 text-base font-medium text-primary">Valuation</h2>
+          <p className="text-sm text-muted-foreground">
+            This account&apos;s value is managed by its holdings below. To record a manual valuation
+            again, remove all holdings first.
+          </p>
+        </Card>
+      ) : null}
+
+      {isPortfolioAccount ? (
+        <HoldingsSection
+          accountId={account.id}
+          currency={account.currency}
+          canManage={level === "full_control"}
+          holdings={holdingViews}
+          summary={holdingsSummary}
+          masked={privacy}
         />
       ) : null}
 

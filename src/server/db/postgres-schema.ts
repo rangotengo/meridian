@@ -650,6 +650,37 @@ export const meroShareTransactions = pgTable(
 );
 
 /**
+ * Manual portfolio holdings: user-entered stock positions on valuation-driven
+ * (other_asset) accounts, for portfolios that can never arrive via a
+ * MeroShare sync (e.g. a demat tracked on someone else's behalf). While an
+ * account has holdings, its balance is managed by them: the domain writes a
+ * "holdings" valuation entry for today after every mutation and manual
+ * valuations are rejected. Quantity is a decimal string (up to 6dp) so the
+ * Postgres and cloud SQLite shapes stay identical; per-share prices are
+ * minor units.
+ */
+export const portfolioHoldings = pgTable(
+  "portfolio_holdings",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    accountId: uuid("account_id")
+      .notNull()
+      .references(() => accounts.id, { onDelete: "cascade" }),
+    ticker: text("ticker").notNull(),
+    companyName: text("company_name"),
+    quantity: text("quantity").notNull(),
+    averageCostMinor: bigint("average_cost_minor", { mode: "number" }),
+    currentPriceMinor: bigint("current_price_minor", { mode: "number" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow()
+  },
+  (t) => [
+    index("portfolio_holdings_account_idx").on(t.accountId),
+    uniqueIndex("portfolio_holdings_account_ticker_unique").on(t.accountId, t.ticker)
+  ]
+);
+
+/**
  * MCP OAuth 2.1 authorization-server tables (read-only AI-agent access).
  * Clients registered via DCR live in oauth_clients; CIMD clients are not
  * stored (their metadata document is the record). oauth_grants is the

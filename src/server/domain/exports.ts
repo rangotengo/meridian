@@ -9,6 +9,7 @@ import {
   entries,
   exchangeRates,
   families,
+  portfolioHoldings,
   recurringSeries,
   savedFilters,
   tags,
@@ -28,15 +29,19 @@ import { listAccountsForActor } from "./accounts";
  * v1: family, shares, accounts, categories, tags, entries, exchange rates.
  * v2: adds budgets, recurring series, saved filters, an explicit transfers
  *     list, and `recurringSeriesId` on entries. The importer accepts both.
+ * v3: adds manual portfolio holdings. Holdings are user-entered data, so
+ *     they migrate with the household — unlike MeroShare sync state
+ *     (connections, synced accounts/holdings/transactions), which is
+ *     deliberately NOT exported: it is recreated by re-syncing.
  *
- * Deliberately NOT exported: MCP OAuth state (oauth_clients, oauth_grants,
- * oauth_authorization_requests, oauth_authorization_codes, oauth_tokens,
- * oauth_assertion_claims). AI-agent connections never migrate with a
- * household export — after a household restore, agents reconnect and
+ * Also deliberately NOT exported: MCP OAuth state (oauth_clients,
+ * oauth_grants, oauth_authorization_requests, oauth_authorization_codes,
+ * oauth_tokens, oauth_assertion_claims). AI-agent connections never migrate
+ * with a household export — after a household restore, agents reconnect and
  * re-consent from scratch. (Operator instance backups are the opposite
  * contract; see backups.ts.)
  */
-export const EXPORT_VERSION = 2;
+export const EXPORT_VERSION = 3;
 
 type FamilyRow = typeof families.$inferSelect;
 
@@ -148,6 +153,24 @@ export async function buildFamilyExport(exec: Executor, actor: Actor): Promise<F
     shareRows.push(...rows);
   }
 
+  const holdingRows = [];
+  for (const chunk of chunkParams(visibleAccountIds)) {
+    const rows = await exec
+      .select({
+        id: portfolioHoldings.id,
+        accountId: portfolioHoldings.accountId,
+        ticker: portfolioHoldings.ticker,
+        companyName: portfolioHoldings.companyName,
+        quantity: portfolioHoldings.quantity,
+        averageCostMinor: portfolioHoldings.averageCostMinor,
+        currentPriceMinor: portfolioHoldings.currentPriceMinor
+      })
+      .from(portfolioHoldings)
+      .innerJoin(accounts, eq(accounts.id, portfolioHoldings.accountId))
+      .where(and(eq(accounts.familyId, familyId), inArray(accounts.id, chunk)));
+    holdingRows.push(...rows);
+  }
+
   const rateRows = await exec.select().from(exchangeRates);
 
   const tagsByEntry = new Map<string, string[]>();
@@ -224,6 +247,7 @@ export async function buildFamilyExport(exec: Executor, actor: Actor): Promise<F
       })
     ),
     transfers: completeTransfers,
+    holdings: holdingRows,
     budgets: budgetRows.map((b) => ({
       id: b.id,
       categoryId: b.categoryId,
@@ -282,6 +306,16 @@ export type ExportedTransfer = {
   status: string;
 };
 
+export type ExportedHolding = {
+  id: string;
+  accountId: string;
+  ticker: string;
+  companyName: string | null;
+  quantity: string;
+  averageCostMinor: number | null;
+  currentPriceMinor: number | null;
+};
+
 export type ExportedBudget = {
   id: string;
   categoryId: string | null;
@@ -322,6 +356,7 @@ export type FamilyExport = {
   tags: unknown[];
   entries: unknown[];
   transfers: ExportedTransfer[];
+  holdings: ExportedHolding[];
   budgets: ExportedBudget[];
   recurring: ExportedRecurringSeries[];
   savedFilters: ExportedSavedFilter[];

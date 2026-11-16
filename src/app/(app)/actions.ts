@@ -10,6 +10,8 @@ import { parseAmountToMinor } from "@/lib/money";
 import { errors } from "@/lib/errors";
 import { runAction, formValues, optionalString, type ActionState } from "@/server/actions/runner";
 import * as valuationsSvc from "@/server/domain/valuations";
+import * as holdingsSvc from "@/server/domain/holdings";
+import { importHoldingsCsv, type HoldingsImportResult } from "@/server/domain/holdings-import";
 import * as orchestrate from "@/server/domain/orchestrate";
 import { parseTagIds } from "@/components/ds/tag-picker";
 
@@ -336,4 +338,151 @@ export async function deleteValuationAction(formData: FormData): Promise<void> {
     revalidatePath(`/accounts/${accountId}`);
     revalidatePath("/");
   }
+}
+
+// --- Manual portfolio holdings -------------------------------------------------
+// The holdings domain keeps the account balance in sync itself (it upserts
+// today's portfolio valuation and recalculates), so these actions only map
+// form fields — prices arrive in major units and convert with the account
+// currency, exactly like the valuation actions above.
+
+function optionalPriceMinor(value: string | undefined, currency: string): number | null {
+  if (value === undefined || value.trim() === "") return null;
+  return parseAmountToMinor(value, currency);
+}
+
+const addHoldingSchema = z.object({
+  accountId: z.string().uuid(),
+  ticker: z.string().min(1).max(64),
+  companyName: z.string().optional(),
+  quantity: z.string().min(1),
+  averageCost: z.string().optional(),
+  currentPrice: z.string().optional()
+});
+
+export async function addHoldingAction(
+  _prev: ActionState | undefined,
+  formData: FormData
+): Promise<ActionState> {
+  const parsed = addHoldingSchema.safeParse(formValues(formData));
+  if (!parsed.success)
+    return { ok: false, error: "Check the highlighted fields.", code: "validation.failed" };
+  const input = parsed.data;
+  return runAction("holding.add", async () => {
+    const actor = await assertActor();
+    const currency = await currencyFor(input.accountId);
+    await withTransaction((tx) =>
+      holdingsSvc.addHolding(tx, actor, {
+        accountId: input.accountId,
+        ticker: input.ticker,
+        companyName: optionalString(input.companyName),
+        quantity: input.quantity,
+        averageCostMinor: optionalPriceMinor(input.averageCost, currency),
+        currentPriceMinor: optionalPriceMinor(input.currentPrice, currency)
+      })
+    );
+    revalidatePath(`/accounts/${input.accountId}`);
+    revalidatePath("/");
+    return undefined;
+  });
+}
+
+const updateHoldingSchema = z.object({
+  accountId: z.string().uuid(),
+  holdingId: z.string().uuid(),
+  companyName: z.string().optional(),
+  quantity: z.string().min(1),
+  averageCost: z.string().optional(),
+  currentPrice: z.string().optional()
+});
+
+export async function updateHoldingAction(
+  _prev: ActionState | undefined,
+  formData: FormData
+): Promise<ActionState> {
+  const parsed = updateHoldingSchema.safeParse(formValues(formData));
+  if (!parsed.success)
+    return { ok: false, error: "Check the highlighted fields.", code: "validation.failed" };
+  const input = parsed.data;
+  return runAction("holding.update", async () => {
+    const actor = await assertActor();
+    const currency = await currencyFor(input.accountId);
+    await withTransaction((tx) =>
+      holdingsSvc.updateHolding(tx, actor, {
+        accountId: input.accountId,
+        holdingId: input.holdingId,
+        companyName: optionalString(input.companyName),
+        quantity: input.quantity,
+        averageCostMinor: optionalPriceMinor(input.averageCost, currency),
+        currentPriceMinor: optionalPriceMinor(input.currentPrice, currency)
+      })
+    );
+    revalidatePath(`/accounts/${input.accountId}`);
+    revalidatePath("/");
+    return undefined;
+  });
+}
+
+export async function deleteHoldingAction(formData: FormData): Promise<void> {
+  const accountId = String(formData.get("accountId") ?? "");
+  const holdingId = String(formData.get("holdingId") ?? "");
+  if (!accountId || !holdingId) return;
+  const actor = await assertActor();
+  await withTransaction((tx) => holdingsSvc.deleteHolding(tx, actor, { accountId, holdingId }));
+  revalidatePath(`/accounts/${accountId}`);
+  revalidatePath("/");
+}
+
+const adjustHoldingSchema = z.object({
+  accountId: z.string().uuid(),
+  ticker: z.string().min(1).max(64),
+  side: z.enum(["buy", "sell"]),
+  quantity: z.string().min(1),
+  price: z.string().min(1)
+});
+
+export async function adjustHoldingAction(
+  _prev: ActionState | undefined,
+  formData: FormData
+): Promise<ActionState> {
+  const parsed = adjustHoldingSchema.safeParse(formValues(formData));
+  if (!parsed.success)
+    return { ok: false, error: "Check the highlighted fields.", code: "validation.failed" };
+  const input = parsed.data;
+  return runAction("holding.adjust", async () => {
+    const actor = await assertActor();
+    const currency = await currencyFor(input.accountId);
+    await withTransaction((tx) =>
+      holdingsSvc.adjustHolding(tx, actor, {
+        accountId: input.accountId,
+        ticker: input.ticker,
+        side: input.side,
+        quantity: input.quantity,
+        priceMinor: parseAmountToMinor(input.price, currency)
+      })
+    );
+    revalidatePath(`/accounts/${input.accountId}`);
+    revalidatePath("/");
+    return undefined;
+  });
+}
+
+export async function importHoldingsCsvAction(
+  _prev: ActionState<HoldingsImportResult> | undefined,
+  formData: FormData
+): Promise<ActionState<HoldingsImportResult>> {
+  const accountId = String(formData.get("accountId") ?? "");
+  const file = formData.get("csv");
+  return runAction<HoldingsImportResult>("holding.import_csv", async () => {
+    const actor = await assertActor();
+    if (!accountId) throw errors.validation("Choose an account.");
+    if (!(file instanceof File) || file.size === 0) {
+      throw errors.validation("Choose a CSV file to import.");
+    }
+    const text = await file.text();
+    const result = await withTransaction((tx) => importHoldingsCsv(tx, actor, accountId, text));
+    revalidatePath(`/accounts/${accountId}`);
+    revalidatePath("/");
+    return result;
+  });
 }
