@@ -335,6 +335,72 @@ test("dashboard: Quick add opens in a dialog and saves without leaving the dashb
   await expect(page.getByText("Quick Dialog Snack").first()).toBeVisible();
 });
 
+test("dashboard: Quick add validation error preserves the whole draft", async ({ page }) => {
+  const { accountB } = getData();
+  await createCategoryViaUi(page, "Quick Draft Category");
+  await createTagViaUi(page, "quickdrafttag");
+
+  await page.goto("/");
+  await page.getByRole("button", { name: /Quick add/ }).click();
+  const dialog = page.locator("dialog[open]");
+  await expect(dialog).toBeVisible();
+
+  await dialog.getByLabel("Account").selectOption(accountB.id);
+  // Over-precise for USD: passes HTML validation, the server rejects it.
+  await dialog.getByLabel("Amount").fill("123.456");
+  await dialog.getByLabel("Description").fill("Quick Draft Keeper");
+  await dialog.getByLabel(/Category/).selectOption({ label: "Quick Draft Category" });
+  const categoryValue = await dialog.getByLabel(/Category/).inputValue();
+  expect(categoryValue).not.toBe("");
+  await dialog.getByRole("checkbox", { name: "quickdrafttag" }).check();
+
+  await dialog.getByRole("button", { name: "Save transaction" }).click();
+
+  // The server's refusal is shown and the dialog stays open…
+  await expect(dialog.getByRole("alert")).toContainText(/precision/);
+  await expect(dialog).toBeVisible();
+  // …with EVERY entered field exactly as typed (the form is controlled;
+  // an uncontrolled form would be reset by React when the action
+  // resolves — account back to A, amount/name/category/tags cleared).
+  await expect(dialog.getByLabel("Account")).toHaveValue(accountB.id);
+  await expect(dialog.getByLabel("Amount")).toHaveValue("123.456");
+  await expect(dialog.getByLabel("Description")).toHaveValue("Quick Draft Keeper");
+  await expect(dialog.getByLabel(/Category/)).toHaveValue(categoryValue);
+  await expect(dialog.getByRole("checkbox", { name: "quickdrafttag" })).toBeChecked();
+
+  // Nothing was recorded.
+  await page.keyboard.press("Escape");
+  await expect(page.getByText("Quick Draft Keeper")).toHaveCount(0);
+});
+
+test("standalone Quick add: refusal preserves the draft, success resets for rapid entry", async ({
+  page
+}) => {
+  const { accountB } = getData();
+  await page.goto("/quick-add");
+
+  await page.getByLabel("Account").selectOption(accountB.id);
+  await page.getByLabel("Amount").fill("123.456");
+  await page.getByLabel("Description").fill("Standalone Draft Keeper");
+  await page.getByRole("button", { name: "Save transaction" }).click();
+
+  // Scoped to the form's error paragraph: an unscoped getByRole("alert")
+  // also matches Next's route announcer.
+  await expect(page.locator("p[role='alert']")).toContainText(/precision/);
+  await expect(page.getByLabel("Account")).toHaveValue(accountB.id);
+  await expect(page.getByLabel("Amount")).toHaveValue("123.456");
+  await expect(page.getByLabel("Description")).toHaveValue("Standalone Draft Keeper");
+
+  // Correcting the amount and saving succeeds — and the rapid-entry
+  // reset still clears the draft for the next entry.
+  await page.getByLabel("Amount").fill("12.34");
+  await page.getByRole("button", { name: "Save transaction" }).click();
+  await expect(page.getByText("Saved", { exact: true })).toBeVisible();
+  await expect(page.getByLabel("Amount")).toHaveValue("");
+  await expect(page.getByLabel("Description")).toHaveValue("");
+  await expect(page).toHaveURL(/\/quick-add$/);
+});
+
 test("dashboard: cancelling Quick add writes nothing; the sidebar still opens the standalone page", async ({
   page
 }) => {

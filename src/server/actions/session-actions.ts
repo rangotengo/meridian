@@ -8,6 +8,7 @@ import { loadActor, SESSION_COOKIE } from "@/server/auth/context";
 import { revokeSession } from "@/server/security/session";
 import { getUserPrivacyMode, setUserPreference } from "@/server/domain/users";
 import { usesCloudflareAccess } from "@/server/auth/access";
+import { isThemePreference, THEME_COOKIE_MAX_AGE_SECONDS, THEME_COOKIE_NAME } from "@/lib/theme";
 
 export async function signOutAction(): Promise<void> {
   if (usesCloudflareAccess()) {
@@ -34,9 +35,13 @@ export async function togglePrivacyAction(): Promise<void> {
 }
 
 export async function setThemePreferenceAction(theme: "light" | "dark" | "system"): Promise<void> {
-  if (theme !== "light" && theme !== "dark" && theme !== "system") return;
+  if (!isThemePreference(theme)) return;
   const store = await cookies();
-  store.set("theme", theme, { path: "/", maxAge: 60 * 60 * 24 * 365, sameSite: "lax" });
+  store.set(THEME_COOKIE_NAME, theme, {
+    path: "/",
+    maxAge: THEME_COOKIE_MAX_AGE_SECONDS,
+    sameSite: "lax"
+  });
   const actor = await loadActor();
   if (actor) {
     await setUserPreference(getDb(), actor.userId, "theme", theme);
