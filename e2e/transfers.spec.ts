@@ -7,10 +7,10 @@ test("create a transfer between two accounts and see both legs linked", async ({
   await page.goto("/transactions/new");
 
   await page.getByRole("tab", { name: "transfer" }).click();
-  await page.locator("#fromAccountId").selectOption(getData().accountA.id);
-  await page.locator("#toAccountId").selectOption(getData().accountB.id);
-  await page.locator("#t-amount").fill("25.00");
-  await page.locator("#t-name").fill("E2E Transfer");
+  await page.locator("#new-txn-transfer-from").selectOption(getData().accountA.id);
+  await page.locator("#new-txn-transfer-to").selectOption(getData().accountB.id);
+  await page.locator("#new-txn-transfer-amount").fill("25.00");
+  await page.locator("#new-txn-transfer-name").fill("E2E Transfer");
   await page.getByRole("button", { name: "Move money" }).click();
 
   await expect(page).toHaveURL(/\/transactions$/);

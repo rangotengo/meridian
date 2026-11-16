@@ -2,16 +2,26 @@ export function TagPicker({
   tags,
   name = "tagIds",
   selected = [],
+  onSelectedChange,
   legend = "Tags",
   disabled = false
 }: {
   tags: { id: string; name: string }[];
   name?: string;
   selected?: string[];
+  /**
+   * When provided, the picker is controlled: checkbox state lives in the
+   * caller's `selected` state instead of the DOM. Forms whose inputs must
+   * survive a failed server action (React resets uncontrolled fields when
+   * a form action resolves) pass this; other callers keep the uncontrolled
+   * `defaultChecked` behavior with `selected` as the initial value.
+   */
+  onSelectedChange?: (next: string[]) => void;
   legend?: string;
   disabled?: boolean;
 }) {
   if (tags.length === 0) return null;
+  const controlled = onSelectedChange !== undefined;
   return (
     <fieldset disabled={disabled} className={disabled ? "opacity-60" : undefined}>
       <legend className="mb-1.5 block text-xs font-medium text-muted-foreground">{legend}</legend>
@@ -25,7 +35,17 @@ export function TagPicker({
               type="checkbox"
               name={name}
               value={tag.id}
-              defaultChecked={selected.includes(tag.id)}
+              {...(controlled
+                ? {
+                    checked: selected.includes(tag.id),
+                    onChange: (event: React.ChangeEvent<HTMLInputElement>) =>
+                      onSelectedChange(
+                        event.target.checked
+                          ? [...selected, tag.id]
+                          : selected.filter((id) => id !== tag.id)
+                      )
+                  }
+                : { defaultChecked: selected.includes(tag.id) })}
               className="h-3.5 w-3.5"
             />
             {tag.name}

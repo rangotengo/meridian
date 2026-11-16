@@ -12,6 +12,7 @@ import {
   shareAccountAction,
   switchBalanceTrackingAction
 } from "@/app/(app)/accounts/actions";
+import { ACCOUNT_SHARING_UI_ENABLED } from "@/lib/features";
 
 type Member = { id: string; name: string; email: string };
 
@@ -89,16 +90,18 @@ export function AccountActions({
         </Dialog>
       ) : null}
 
-      <Dialog
-        trigger={
-          <span className="rounded-lg border border-border bg-surface px-3 py-2 text-sm font-medium">
-            Share
-          </span>
-        }
-        title="Share with family members"
-      >
-        <SharePanel accountId={accountId} members={members} />
-      </Dialog>
+      {ACCOUNT_SHARING_UI_ENABLED ? (
+        <Dialog
+          trigger={
+            <span className="rounded-lg border border-border bg-surface px-3 py-2 text-sm font-medium">
+              Share
+            </span>
+          }
+          title="Share with family members"
+        >
+          <SharePanel accountId={accountId} members={members} />
+        </Dialog>
+      ) : null}
 
       {status === "active" ? (
         <ConfirmDialog

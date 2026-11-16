@@ -23,6 +23,11 @@ import { AccountActions } from "./actions-panel";
 import { ValuationForm } from "./valuation-form";
 import { ValuationRowActions } from "./valuation-row-actions";
 import { HoldingsSection, type HoldingView } from "./holdings-section";
+import { listAccountsForActor } from "@/server/domain/accounts";
+import { listCategories } from "@/server/domain/categories";
+import { listTags } from "@/server/domain/tags";
+import { TransactionComposerDialog } from "@/components/finance/transaction-composer";
+import { ACCOUNT_SHARING_UI_ENABLED } from "@/lib/features";
 
 export const metadata = { title: "Account" };
 
@@ -45,6 +50,33 @@ export default async function AccountDetailPage({
   const privacy = await getUserPrivacyMode(db, actor.userId);
   const { account, level, series, recentActivity, shares, valuationDriven, isJoint } = overview;
   const members = await familyMemberOptions(db, actor.familyId);
+
+  // Creation shortcuts open the shared composer in a dialog on this page.
+  // They are offered only when the actor can actually create entries here:
+  // full control on an active account. The composer receives every account
+  // the actor controls so transfers can pick compatible destinations.
+  const canCreate = level === "full_control" && account.status === "active";
+  let composerData: {
+    accounts: { id: string; name: string; currency: string }[];
+    categories: { id: string; name: string }[];
+    tags: { id: string; name: string }[];
+    today: string;
+  } | null = null;
+  if (canCreate) {
+    const [allAccounts, categories, tags] = await Promise.all([
+      listAccountsForActor(db, actor),
+      listCategories(db, actor.familyId),
+      listTags(db, actor.familyId)
+    ]);
+    composerData = {
+      accounts: allAccounts
+        .filter((a) => a.status === "active" && a.level === "full_control")
+        .map((a) => ({ id: a.id, name: a.name, currency: a.currency })),
+      categories: categories.map((c) => ({ id: c.id, name: c.name })),
+      tags: tags.map((t) => ({ id: t.id, name: t.name })),
+      today: todayIn(family.timezone)
+    };
+  }
 
   // The balance-tracking switch is offered only to full-control users on
   // the types that have a choice; the preview shows the exact outcome.
@@ -143,12 +175,40 @@ export default async function AccountDetailPage({
 
         <Card className="space-y-3">
           <h2 className="text-base font-medium text-primary">Shortcuts</h2>
-          <Link
-            href={`/transactions/new?account=${account.id}`}
-            className="block rounded-lg border border-border px-3 py-2 text-sm transition-colors hover:bg-surface-hover"
-          >
-            + New transaction
-          </Link>
+          {canCreate && composerData ? (
+            <>
+              <TransactionComposerDialog
+                trigger={
+                  <span className="block w-full rounded-lg border border-border px-3 py-2 text-left text-sm transition-colors hover:bg-surface-hover">
+                    + New transaction
+                  </span>
+                }
+                title="New transaction"
+                accounts={composerData.accounts}
+                categories={composerData.categories}
+                tags={composerData.tags}
+                today={composerData.today}
+                initialAccountId={account.id}
+                initialMode="expense"
+                idPrefix="account-txn"
+              />
+              <TransactionComposerDialog
+                trigger={
+                  <span className="block w-full rounded-lg border border-border px-3 py-2 text-left text-sm transition-colors hover:bg-surface-hover">
+                    Move money
+                  </span>
+                }
+                title="Move money"
+                accounts={composerData.accounts}
+                categories={composerData.categories}
+                tags={composerData.tags}
+                today={composerData.today}
+                initialAccountId={account.id}
+                initialMode="transfer"
+                idPrefix="account-transfer"
+              />
+            </>
+          ) : null}
           {valuationDriven && level === "full_control" && !holdingsManaged ? (
             <a
               href="#valuation"
@@ -157,12 +217,6 @@ export default async function AccountDetailPage({
               Update valuation
             </a>
           ) : null}
-          <Link
-            href="/transactions?kind=transfer"
-            className="block rounded-lg border border-border px-3 py-2 text-sm transition-colors hover:bg-surface-hover"
-          >
-            Move money (transfers)
-          </Link>
           <p className="text-xs text-muted-foreground">
             {level === "full_control"
               ? "You have full control of this account."
@@ -173,7 +227,7 @@ export default async function AccountDetailPage({
         </Card>
       </div>
 
-      {level === "full_control" ? (
+      {ACCOUNT_SHARING_UI_ENABLED && level === "full_control" ? (
         <Card>
           <h2 className="mb-2 text-base font-medium text-primary">Sharing</h2>
           {shares.length === 0 ? (
