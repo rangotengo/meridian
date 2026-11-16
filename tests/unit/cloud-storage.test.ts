@@ -83,6 +83,16 @@ describe("Cloudflare SQLite storage", () => {
       earlierAdjustmentSource: "balance_tracking"
     });
   });
+  it("rejects a backdated conversion that would restate a transfer leg in cloud DO", async () => {
+    expect(await probe("balance-tracking-transfer-leg")).toEqual({
+      previewRejected: true,
+      switchRejected: true,
+      adjustmentAmount: -100000,
+      modeAfter: "valuation",
+      legsSum: 0,
+      balanceToday: 100000
+    });
+  });
   it("edits and deletes loan valuations with atomic balance repair in cloud DO", async () => {
     expect(await probe("valuation-edit")).toEqual({
       editedBalance: -22500,

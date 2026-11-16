@@ -15,6 +15,7 @@ import * as accountsSvc from "@/server/domain/accounts";
 import * as valuationsSvc from "@/server/domain/valuations";
 import * as balancesSvc from "@/server/domain/balances";
 import * as trackingSvc from "@/server/domain/balance-tracking";
+import * as transfersSvc from "@/server/domain/transfers";
 import * as holdingsSvc from "@/server/domain/holdings";
 import * as orchestrate from "@/server/domain/orchestrate";
 import * as exportsSvc from "@/server/domain/exports";
@@ -30,7 +31,8 @@ import {
   entries as entriesTable,
   families as familiesTable,
   meroShareAccounts,
-  meroShareConnections
+  meroShareConnections,
+  transfers as transfersTable
 } from "@/server/db/schema";
 
 beforeAll(async () => {
@@ -1444,4 +1446,278 @@ describe("balance tracking: scheduled pre-anchor activity", () => {
       }
     }
   );
+});
+
+describe("balance tracking: restatement must never unbalance a transfer (review round 3)", () => {
+  /** Both legs of a transfer, read back from the entries table. */
+  async function transferLegAmounts(transferId: string) {
+    const [transfer] = await db()
+      .select()
+      .from(transfersTable)
+      .where(eq(transfersTable.id, transferId));
+    expect(transfer).toBeDefined();
+    const [out] = await db()
+      .select()
+      .from(entriesTable)
+      .where(eq(entriesTable.id, transfer!.outflowEntryId));
+    const [inn] = await db()
+      .select()
+      .from(entriesTable)
+      .where(eq(entriesTable.id, transfer!.inflowEntryId));
+    return { out: out!, inn: inn!, transfer: transfer! };
+  }
+
+  /**
+   * The reviewer's probe shape: an account whose converted opening
+   * adjustment (dated yesterday) is one leg of a confirmed transfer of
+   * 100,000, with the counterpart leg in a second account. Returns the
+   * ids a backdated re-conversion would put at risk.
+   */
+  async function makeTransferLeggedAdjustment(
+    user: Awaited<ReturnType<typeof makeUser>>,
+    opts: { type: "other_asset" | "other_liability"; counterpartType: "depository" | "other_asset" }
+  ) {
+    const actor = actorOf(user);
+    const accountId = await makeAccount(user, {
+      type: opts.type,
+      name: "Transfer-legged loan",
+      currency: "USD",
+      openedOn: daysAgo(5),
+      openingBalanceDisplayMinor: 0
+    });
+    await valuationsSvc.recordValuation(db(), actor, {
+      accountId,
+      date: daysAgo(1),
+      amountDisplayMinor: 100_000,
+      kind: "current",
+      name: "Principal"
+    });
+    const first = await trackingSvc.switchBalanceTracking(db(), actor, {
+      accountId,
+      to: "transactions"
+    });
+    const adjustment = (await entriesOf(accountId)).find((r) => r.name === "Principal")!;
+    // Asset conversions store −100,000 (an inflow-shaped leg); liability
+    // conversions store +100,000 (an outflow-shaped leg).
+    expect(adjustment.amountMinor).toBe(opts.type === "other_asset" ? -100_000 : 100_000);
+    expect(first.openingTransactionAmountMinor).toBe(adjustment.amountMinor);
+
+    const counterpartId = await makeAccount(user, {
+      type: opts.counterpartType,
+      name: "Counterpart",
+      currency: "USD",
+      openedOn: daysAgo(5),
+      openingBalanceDisplayMinor: 0
+    });
+    const counterpartEntryId = await addTxn(user, counterpartId, {
+      date: daysAgo(1),
+      name: "Counterpart leg",
+      amountLedgerMinor: opts.type === "other_asset" ? 100_000 : -100_000
+    });
+    const { transferId } = await transfersSvc.createTransferFromTransactions(
+      db(),
+      actor,
+      opts.type === "other_asset" ? counterpartEntryId : adjustment.id,
+      opts.type === "other_asset" ? adjustment.id : counterpartEntryId
+    );
+    const legs = await transferLegAmounts(transferId);
+    expect(legs.out.amountMinor + legs.inn.amountMinor).toBe(0);
+    return {
+      accountId,
+      counterpartId,
+      counterpartEntryId,
+      adjustmentId: adjustment.id,
+      transferId
+    };
+  }
+
+  /** Round trip back to valuations and restate the balance at an earlier date. */
+  async function backdateAnchor(
+    user: Awaited<ReturnType<typeof makeUser>>,
+    accountId: string,
+    type: "other_asset" | "other_liability"
+  ) {
+    const actor = actorOf(user);
+    await trackingSvc.switchBalanceTracking(db(), actor, { accountId, to: "valuation" });
+    await valuationsSvc.recordValuation(db(), actor, {
+      accountId,
+      date: daysAgo(3),
+      amountDisplayMinor: 100_000,
+      kind: "current",
+      name: "Principal restated"
+    });
+    await balancesSvc.recalculateAccount(db(), accountId);
+    const direction = type === "other_asset" ? 1 : -1;
+    expect(await balanceOn(accountId, daysAgo(3))).toBe(100_000 * direction);
+    expect(await balanceOn(accountId, daysAgo(0))).toBe(100_000 * direction);
+  }
+
+  it.each(["other_asset", "other_liability"] as const)(
+    "%s: a backdated switch that would restate a transfer leg is rejected before changing any rows",
+    async (type) => {
+      const user = await makeUser();
+      const actor = actorOf(user);
+      const { accountId, counterpartId, adjustmentId, transferId } =
+        await makeTransferLeggedAdjustment(user, { type, counterpartType: "depository" });
+      await backdateAnchor(user, accountId, type);
+
+      // Both the preview and the switch refuse: restating the adjustment
+      // to zero would leave the transfer's legs summing to ±100,000.
+      await expect(
+        trackingSvc.previewBalanceTracking(db(), actor, accountId, "transactions")
+      ).rejects.toThrow(/transfer/i);
+      await expect(
+        trackingSvc.switchBalanceTracking(db(), actor, { accountId, to: "transactions" })
+      ).rejects.toThrow(/transfer/i);
+
+      // Nothing changed: the account is still valuation-tracked, both
+      // legs keep their amounts, the transfer is intact, and the
+      // materialized series is exactly the pre-attempt one.
+      const [account] = await db()
+        .select()
+        .from(accountsTable)
+        .where(eq(accountsTable.id, accountId));
+      expect(account?.balanceTracking).toBe("valuation");
+      const legs = await transferLegAmounts(transferId);
+      expect(legs.out.amountMinor + legs.inn.amountMinor).toBe(0);
+      expect(Math.abs(legs.out.amountMinor)).toBe(100_000);
+      const adjustment = (await entriesOf(accountId)).find((r) => r.id === adjustmentId)!;
+      expect(adjustment.amountMinor).toBe(type === "other_asset" ? -100_000 : 100_000);
+      expect(adjustment.externalSource).toBe("balance_tracking");
+      const direction = type === "other_asset" ? 1 : -1;
+      expect(await balanceOn(accountId, daysAgo(3))).toBe(100_000 * direction);
+      expect(await balanceOn(accountId, daysAgo(1))).toBe(100_000 * direction);
+      expect(await balanceOn(accountId, daysAgo(0))).toBe(100_000 * direction);
+      expect(await balanceOn(counterpartId, daysAgo(0))).toBe(-100_000 * direction);
+
+      // The rejection is recoverable: unlink the transfer and the same
+      // switch goes through with the restatement, exactly as round 2
+      // specified for non-transfer adjustments.
+      await transfersSvc.removeTransfer(db(), actor, transferId);
+      const result = await trackingSvc.switchBalanceTracking(db(), actor, {
+        accountId,
+        to: "transactions"
+      });
+      expect(result.restatedOpeningAdjustments).toBe(1);
+      expect(result.resultingBalanceMinor).toBe(100_000 * direction);
+      const restated = (await entriesOf(accountId)).find((r) => r.id === adjustmentId)!;
+      expect(restated.amountMinor).toBe(0);
+      expect(restated.externalSource).toBe("balance_tracking");
+      expect(await balanceOn(accountId, daysAgo(3))).toBe(100_000 * direction);
+      expect(await balanceOn(accountId, daysAgo(1))).toBe(100_000 * direction);
+      expect(await balanceOn(accountId, daysAgo(0))).toBe(100_000 * direction);
+    }
+  );
+
+  it("switching the OTHER account leaves a transfer-legged adjustment and its pair untouched", async () => {
+    const user = await makeUser();
+    const actor = actorOf(user);
+    const { accountId, counterpartId, adjustmentId, transferId } =
+      await makeTransferLeggedAdjustment(user, {
+        type: "other_asset",
+        counterpartType: "other_asset"
+      });
+
+    // The counterpart account does its own conversion, anchored three
+    // days ago — before the transfer leg's date. Its leg is a genuine
+    // transaction, not an opening adjustment, so nothing is restated
+    // and the switch succeeds.
+    await valuationsSvc.recordValuation(db(), actor, {
+      accountId: counterpartId,
+      date: daysAgo(3),
+      amountDisplayMinor: 50_000,
+      kind: "current",
+      name: "Counterpart value"
+    });
+    const result = await trackingSvc.switchBalanceTracking(db(), actor, {
+      accountId: counterpartId,
+      to: "transactions"
+    });
+    expect(result.restatedOpeningAdjustments).toBe(0);
+    // 50,000 anchor, then the 100,000 outflow leg on its own date.
+    expect(await balanceOn(counterpartId, daysAgo(3))).toBe(50_000);
+    expect(await balanceOn(counterpartId, daysAgo(1))).toBe(-50_000);
+    expect(result.resultingBalanceMinor).toBe(-50_000);
+
+    // The first account is completely unaffected: still transaction
+    // tracked, its adjustment keeps its amount, and the transfer's
+    // legs still balance exactly.
+    const [account] = await db()
+      .select()
+      .from(accountsTable)
+      .where(eq(accountsTable.id, accountId));
+    expect(account?.balanceTracking).toBe("transactions");
+    const adjustment = (await entriesOf(accountId)).find((r) => r.id === adjustmentId)!;
+    expect(adjustment.amountMinor).toBe(-100_000);
+    const legs = await transferLegAmounts(transferId);
+    expect(legs.out.amountMinor).toBe(100_000);
+    expect(legs.inn.amountMinor).toBe(-100_000);
+    expect(await balanceOn(accountId, daysAgo(0))).toBe(100_000);
+  });
+
+  it("a transfer-legged adjustment dated ON OR BEFORE the new anchor is absorbed, never rewritten", async () => {
+    const user = await makeUser();
+    const actor = actorOf(user);
+    const accountId = await makeAccount(user, {
+      type: "other_asset",
+      name: "Absorbed leg loan",
+      currency: "USD",
+      openedOn: daysAgo(5),
+      openingBalanceDisplayMinor: 0
+    });
+    await valuationsSvc.recordValuation(db(), actor, {
+      accountId,
+      date: daysAgo(3),
+      amountDisplayMinor: 100_000,
+      kind: "current",
+      name: "Principal"
+    });
+    await trackingSvc.switchBalanceTracking(db(), actor, { accountId, to: "transactions" });
+    const adjustment = (await entriesOf(accountId)).find((r) => r.name === "Principal")!;
+    expect(adjustment.amountMinor).toBe(-100_000);
+
+    const bankId = await makeAccount(user, {
+      type: "depository",
+      name: "Bank",
+      currency: "USD",
+      openedOn: daysAgo(5),
+      openingBalanceDisplayMinor: 0
+    });
+    const bankEntryId = await addTxn(user, bankId, {
+      date: daysAgo(3),
+      name: "Counterpart leg",
+      amountLedgerMinor: 100_000
+    });
+    const { transferId } = await transfersSvc.createTransferFromTransactions(
+      db(),
+      actor,
+      bankEntryId,
+      adjustment.id
+    );
+
+    // A later anchor: the leg is in-window, so the plug absorbs it —
+    // the switch succeeds and the entry itself is never modified.
+    await trackingSvc.switchBalanceTracking(db(), actor, { accountId, to: "valuation" });
+    await valuationsSvc.recordValuation(db(), actor, {
+      accountId,
+      date: daysAgo(1),
+      amountDisplayMinor: 100_000,
+      kind: "current",
+      name: "Principal restated"
+    });
+    const result = await trackingSvc.switchBalanceTracking(db(), actor, {
+      accountId,
+      to: "transactions"
+    });
+    expect(result.restatedOpeningAdjustments).toBe(0);
+    expect(result.openingTransactionAmountMinor).toBe(0);
+    expect(result.resultingBalanceMinor).toBe(100_000);
+    const legAfter = (await entriesOf(accountId)).find((r) => r.id === adjustment.id)!;
+    expect(legAfter.amountMinor).toBe(-100_000);
+    const legs = await transferLegAmounts(transferId);
+    expect(legs.out.amountMinor + legs.inn.amountMinor).toBe(0);
+    expect(await balanceOn(accountId, daysAgo(3))).toBe(100_000);
+    expect(await balanceOn(accountId, daysAgo(1))).toBe(100_000);
+    expect(await balanceOn(accountId, daysAgo(0))).toBe(100_000);
+  });
 });

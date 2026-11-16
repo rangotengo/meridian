@@ -54,6 +54,21 @@ import { accountHasHoldings, lockHoldingsAccount } from "./holdings";
  * exactly the anchor valuation, and every later date keeps exactly the
  * genuine post-anchor activity on top of it.
  *
+ * One exception, and it is a hard rejection, not a restatement: an
+ * earlier opening adjustment that is a leg of a confirmed transfer can
+ * never be restated. A transfer's two legs must keep matching amounts,
+ * and this leg's pair lives in another account, so zeroing this leg
+ * alone would leave the transfer unbalanced. No plug can compensate
+ * either — the plug is pinned by the anchor-date equation, so keeping
+ * the leg's amount would shift every balance from the leg's date
+ * onward by that amount, and offsetting it in the plug would shift the
+ * anchor date itself by the same amount. When a restatement candidate
+ * is a transfer leg the plan throws before any row changes; the user
+ * unlinks the transfer first and then switches. A transfer-leg
+ * adjustment dated on or before the anchor needs no exception: the
+ * plug absorbs it like any in-window transaction and its entry is
+ * never modified.
+ *
  * Concurrency: the switch takes the SAME per-account advisory lock as
  * the holdings and valuation writers (holdings-account:<id>, see
  * holdings.ts), and resolves every guard — access, open state, mode,
@@ -257,7 +272,11 @@ export type ConversionPlan = {
  * onward. The plan therefore restates it to zero — the new anchor,
  * dated earlier, now carries the balance it represented — which keeps
  * both the anchor date and every later date exact. Genuine transactions
- * are never restated, wherever they are dated.
+ * are never restated, wherever they are dated. And an opening
+ * adjustment that is a leg of a confirmed transfer is never restated
+ * either: the plan rejects the switch outright in that case, because
+ * zeroing one leg would unbalance the transfer and no plug value
+ * satisfies the anchor date and the later dates at once.
  */
 async function planConversionToTransactions(
   exec: Executor,
@@ -275,9 +294,17 @@ async function planConversionToTransactions(
     date: string;
     amount_minor: string;
     external_source: string | null;
+    is_transfer_leg: number | string;
   }>(sql`
     SELECT CAST(id AS TEXT) AS id, CAST(date AS TEXT) AS date,
-           CAST(amount_minor AS TEXT) AS amount_minor, external_source
+           CAST(amount_minor AS TEXT) AS amount_minor, external_source,
+           CASE WHEN EXISTS (
+             SELECT 1 FROM transfers tf
+             WHERE tf.outflow_entry_id = entries.id OR tf.inflow_entry_id = entries.id
+           ) OR EXISTS (
+             SELECT 1 FROM transactions t
+             WHERE t.entry_id = entries.id AND t.transfer_id IS NOT NULL
+           ) THEN 1 ELSE 0 END AS is_transfer_leg
     FROM entries
     WHERE account_id = ${account.id}
       AND entryable_type = 'transaction'
@@ -290,7 +317,8 @@ async function planConversionToTransactions(
     id: r.id,
     date: r.date.slice(0, 10),
     amountMinor: safeParseMinor(r.amount_minor),
-    openingAdjustment: r.external_source === BALANCE_TRACKING_OPENING_SOURCE
+    openingAdjustment: r.external_source === BALANCE_TRACKING_OPENING_SOURCE,
+    transferLeg: Number(r.is_transfer_leg) === 1
   }));
   // The engine's window: only rows dated on or before today move the
   // materialized balances the plan predicts.
@@ -315,6 +343,24 @@ async function planConversionToTransactions(
     .filter((row) => row.openingAdjustment && row.date > anchor.date && row.amountMinor !== 0)
     .map((row) => ({ entryId: row.id, date: row.date, previousAmountMinor: row.amountMinor }));
   const restatedIds = new Set(restatements.map((r) => r.entryId));
+
+  // A restatement candidate that is a transfer leg can never be
+  // restated: zeroing it would unbalance the confirmed transfer whose
+  // other leg lives in another account, and no plug can keep both the
+  // anchor date and every later date exact while the leg's amount
+  // stands (see the module comment). Reject before any row changes —
+  // the preview and the switch share this plan, so both refuse, and
+  // the user can unlink the transfer and retry.
+  if (
+    txRows.some(
+      (row) =>
+        row.openingAdjustment && row.transferLeg && row.date > anchor.date && row.amountMinor !== 0
+    )
+  ) {
+    throw errors.conflict(
+      "This switch would rewrite an earlier opening adjustment that is one leg of a confirmed transfer, which would leave the transfer unbalanced. Unlink the transfer first, then switch this account to transaction tracking."
+    );
+  }
 
   let represented = 0;
   // The anchor can itself be future-dated: scheduled activity before
