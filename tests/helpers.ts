@@ -12,6 +12,7 @@ void (0 as unknown as TransactionEntryInput);
 export const db = () => getDb();
 
 const TABLES = [
+  "portfolio_holdings",
   "mero_share_transactions",
   "mero_share_holdings",
   "mero_share_accounts",

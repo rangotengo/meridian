@@ -21,9 +21,16 @@ import {
 import { createInvitation, acceptInvitationWithAccess } from "../../src/server/domain/invitations";
 import { setBudget } from "../../src/server/domain/budgets";
 import { buildFamilyExport } from "../../src/server/domain/exports";
+import { importFamilyExport, parseFamilyExport } from "../../src/server/domain/family-import";
 import { ensureSchedules, runDueCrons } from "../../src/server/queue/worker-loop";
 import { importSureExport } from "../../src/server/domain/sure-import";
 import { connectMeroShare, syncMeroShareConnection } from "../../src/server/domain/meroshare";
+import {
+  addHolding,
+  adjustHolding,
+  listHoldings,
+  summarizeHoldings
+} from "../../src/server/domain/holdings";
 import { mockMeroShareFetch } from "./meroshare-fixture";
 import { splitEntry } from "../../src/server/domain/splits";
 import { claimBatch, completeJob, enqueue } from "../../src/server/queue";
@@ -84,7 +91,9 @@ export class StorageProbe {
     if (
       operation === "/ledger" ||
       operation === "/import-meroshare" ||
-      operation === "/valuation-edit"
+      operation === "/valuation-edit" ||
+      operation === "/holdings" ||
+      operation === "/export-restore-precedence"
     ) {
       const exec = db as unknown as Executor;
       const user = await registerAccessHousehold(
@@ -144,6 +153,186 @@ export class StorageProbe {
           editedKind: edited.recentActivity.find((e) => e.id === entryId)?.valuationKind,
           deletedBalance: deleted.displayBalanceMinor,
           deletedEntryAbsent: !deleted.recentActivity.some((e) => e.id === entryId)
+        });
+      }
+      if (operation === "/holdings") {
+        const { accountId } = await createAccount(exec, actor, {
+          name: "Cloud brokerage",
+          type: "other_asset",
+          currency: "NPR",
+          openedOn: today,
+          openingBalanceDisplayMinor: 0,
+          includedInReports: true,
+          joint: false
+        });
+        await addHolding(exec, actor, {
+          accountId,
+          ticker: "NABIL",
+          quantity: "100",
+          averageCostMinor: null,
+          currentPriceMinor: 500
+        });
+        // A buy into the unknown-cost position tracks only its own share
+        // as known cost; two further concurrent buys serialize behind the
+        // Durable Object mutex and both land.
+        await adjustHolding(exec, actor, {
+          accountId,
+          ticker: "NABIL",
+          side: "buy",
+          quantity: "1",
+          priceMinor: 200
+        });
+        await Promise.all([
+          adjustHolding(exec, actor, {
+            accountId,
+            ticker: "NABIL",
+            side: "buy",
+            quantity: "1",
+            priceMinor: 200
+          }),
+          adjustHolding(exec, actor, {
+            accountId,
+            ticker: "NABIL",
+            side: "buy",
+            quantity: "1",
+            priceMinor: 200
+          })
+        ]);
+        const rows = await listHoldings(exec, actor, accountId);
+        const summary = summarizeHoldings(rows);
+        let valuationRejected = false;
+        try {
+          await recordValuation(exec, actor, {
+            accountId,
+            date: today,
+            amountDisplayMinor: 1,
+            kind: "current"
+          });
+        } catch {
+          valuationRejected = true;
+        }
+        let unpriceableRejected = false;
+        try {
+          await addHolding(exec, actor, {
+            accountId,
+            ticker: "ZZZ",
+            quantity: "1",
+            averageCostMinor: null,
+            currentPriceMinor: null
+          });
+        } catch {
+          unpriceableRejected = true;
+        }
+        const overview = await getAccountOverview(exec, actor, accountId);
+        return Response.json({
+          quantity: rows[0]!.quantity,
+          averageCostMinor: rows[0]!.averageCostMinor,
+          averageCostQuantity: rows[0]!.averageCostQuantity,
+          partialCost: summary.partialCost,
+          totalCostMinor: summary.totalCostMinor,
+          balance: overview.displayBalanceMinor,
+          valuationRejected,
+          unpriceableRejected
+        });
+      }
+      if (operation === "/export-restore-precedence") {
+        // Reviewer repro 1, inside the Durable Object: a manual valuation
+        // of 5000 today, then a holding worth 1000 today. The source
+        // balance is 1000; the export must carry the write order, and the
+        // restore into a fresh household must reproduce 1000 — on cloud
+        // the tiebreak is (date, created_at, rowid), so insertion order
+        // and the monotonic stamps both have to match the source.
+        const { accountId } = await createAccount(exec, actor, {
+          name: "Cloud precedence brokerage",
+          type: "other_asset",
+          currency: "NPR",
+          openedOn: today,
+          openingBalanceDisplayMinor: 0,
+          includedInReports: true,
+          joint: false
+        });
+        await recordValuation(exec, actor, {
+          accountId,
+          date: today,
+          amountDisplayMinor: 5000,
+          kind: "current"
+        });
+        await recalculateAccount(exec, accountId);
+        await addHolding(exec, actor, {
+          accountId,
+          ticker: "NABIL",
+          quantity: "10",
+          averageCostMinor: null,
+          currentPriceMinor: 100
+        });
+        const source = await getAccountOverview(exec, actor, accountId);
+        const exported = await buildFamilyExport(exec, actor);
+        const todaysValuations = (
+          exported.entries as {
+            accountId: string;
+            kind: string;
+            date: string;
+            amountMinor: number;
+            writeOrder?: number;
+          }[]
+        )
+          .filter((e) => e.accountId === accountId && e.kind === "valuation" && e.date === today)
+          .sort((a, b) => (a.writeOrder ?? 0) - (b.writeOrder ?? 0))
+          .map((e) => ({ amountMinor: e.amountMinor, writeOrder: e.writeOrder ?? null }));
+        const target = await registerAccessHousehold(
+          exec,
+          { subject: "cloud-precedence-target", email: "precedence-target@example.test" },
+          {
+            name: "Target",
+            familyName: "Cloud precedence target",
+            currency: "NPR",
+            timezone: "UTC"
+          }
+        );
+        const targetActor: Actor = {
+          userId: target.id,
+          familyId: target.familyId,
+          email: target.email,
+          name: target.name,
+          familyRole: "admin",
+          platformRole: "user",
+          sessionId: "",
+          emailVerified: true
+        };
+        // Model a larger history that restores faster than one millisecond
+        // per entry: future-dated import stamps must not beat a fresh buy.
+        const archive = JSON.parse(JSON.stringify(exported));
+        const manual = archive.entries[0];
+        const padding = Array.from({ length: 2000 }, (_, i) => ({
+          ...manual,
+          id: `prior-${i}`,
+          writeOrder: i
+        }));
+        for (const e of archive.entries) e.writeOrder += padding.length;
+        archive.entries = [...padding, ...archive.entries];
+        await importFamilyExport(
+          exec,
+          targetActor,
+          parseFamilyExport(new TextEncoder().encode(JSON.stringify(archive)))
+        );
+        const [restored] = await db
+          .select()
+          .from(accounts)
+          .where(eq(accounts.familyId, target.familyId));
+        const restoredOverview = await getAccountOverview(exec, targetActor, restored!.id);
+        await adjustHolding(exec, targetActor, {
+          accountId: restored!.id,
+          ticker: "NABIL",
+          side: "buy",
+          quantity: "1",
+          priceMinor: 100
+        });
+        const afterBuy = await getAccountOverview(exec, targetActor, restored!.id);
+        return Response.json({
+          afterBuy: afterBuy.displayBalanceMinor,
+          sourceBalance: source.displayBalanceMinor,
+          restoredBalance: restoredOverview.displayBalanceMinor,
+          todaysValuations
         });
       }
       if (operation === "/import-meroshare") {

@@ -23,6 +23,7 @@ import * as valuationsSvc from "@/server/domain/valuations";
 import { recalculateAccount } from "@/server/domain/balances";
 import { nextOccurrence } from "@/server/domain/recurring";
 import * as exportsSvc from "@/server/domain/exports";
+import * as holdingsSvc from "@/server/domain/holdings";
 import { importFamilyExport, parseFamilyExport } from "@/server/domain/family-import";
 import {
   accounts,
@@ -77,7 +78,7 @@ async function wipeFamilyData(familyId: string): Promise<void> {
   await exec.execute(sql`DELETE FROM categories WHERE family_id = ${familyId}::uuid`);
 }
 
-describe("family export v2 → restore round-trip", () => {
+describe("family export v3 → restore round-trip", () => {
   it("recreates every entity type with remapped ids and matching balances", async () => {
     const user = await makeUser({ familyName: "RoundTripFamily" });
     const actor = actorOf(user);
@@ -176,7 +177,7 @@ describe("family export v2 → restore round-trip", () => {
     }
 
     const exported = await exportsSvc.buildFamilyExport(exec, actor);
-    expect(exported.version).toBe(2);
+    expect(exported.version).toBe(3);
     expect(exported.budgets).toHaveLength(2);
     expect(exported.recurring).toHaveLength(1);
     expect(exported.savedFilters).toHaveLength(1);
@@ -1014,5 +1015,96 @@ describe("restore hardening (PR #6 review fixes)", () => {
 
     const adminExport = await exportsSvc.buildFamilyExport(db(), actorOf(admin));
     expect(adminExport.transfers).toHaveLength(1);
+  });
+});
+
+describe("manual holdings export → restore round-trip", () => {
+  it("carries holdings with remapped account ids and matching balances", async () => {
+    const user = await makeUser({ familyName: "HoldingsFamily" });
+    const actor = actorOf(user);
+    const exec = db();
+
+    const brokerage = await makeAccount(user, {
+      name: "RT Brokerage",
+      type: "other_asset",
+      openingBalanceDisplayMinor: 0
+    });
+    await holdingsSvc.addHolding(exec, actor, {
+      accountId: brokerage,
+      ticker: "NABIL",
+      companyName: "Nabil Bank",
+      quantity: "100",
+      averageCostMinor: 200_00,
+      currentPriceMinor: 250_00
+    });
+    await holdingsSvc.addHolding(exec, actor, {
+      accountId: brokerage,
+      ticker: "HIDCL",
+      quantity: "50.5",
+      averageCostMinor: 100_00,
+      currentPriceMinor: null
+    });
+    const sourceBalance = (await latestBalance(brokerage))?.balanceMinor;
+    expect(sourceBalance).toBe(2_500_000 + 505_000);
+
+    const exported = await exportsSvc.buildFamilyExport(exec, actor);
+    expect(exported.version).toBe(3);
+    expect(exported.holdings).toHaveLength(2);
+    expect(exported.holdings.find((h) => h.ticker === "HIDCL")).toMatchObject({
+      quantity: "50.5",
+      currentPriceMinor: null
+    });
+
+    await wipeFamilyData(user.familyId);
+
+    const result = await importFamilyExport(
+      exec,
+      actor,
+      parseFamilyExport(encode(JSON.parse(JSON.stringify(exported))))
+    );
+    expect(result.holdings).toBe(2);
+
+    const [restored] = await exec.select().from(accounts).where(eq(accounts.name, "RT Brokerage"));
+    expect(restored).toBeTruthy();
+    expect(restored!.id).not.toBe(brokerage);
+
+    const restoredHoldings = await holdingsSvc.listHoldings(exec, actor, restored!.id);
+    expect(restoredHoldings).toHaveLength(2);
+    expect(restoredHoldings.find((h) => h.ticker === "NABIL")).toMatchObject({
+      companyName: "Nabil Bank",
+      quantity: "100",
+      averageCostMinor: 200_00,
+      currentPriceMinor: 250_00
+    });
+    expect(restoredHoldings.find((h) => h.ticker === "HIDCL")).toMatchObject({
+      quantity: "50.5",
+      currentPriceMinor: null
+    });
+    expect((await latestBalance(restored!.id))?.balanceMinor).toBe(sourceBalance);
+  });
+
+  it("rejects a tampered export whose holding references a missing account", async () => {
+    const user = await makeUser({ familyName: "TamperedHoldingsFamily" });
+    const actor = actorOf(user);
+    const brokerage = await makeAccount(user, {
+      name: "Tamper Brokerage",
+      type: "other_asset",
+      openingBalanceDisplayMinor: 0
+    });
+    await holdingsSvc.addHolding(db(), actor, {
+      accountId: brokerage,
+      ticker: "NABIL",
+      quantity: "10",
+      averageCostMinor: 100_00
+    });
+    const exported = await exportsSvc.buildFamilyExport(db(), actor);
+    const tampered = JSON.parse(JSON.stringify(exported)) as {
+      holdings: { accountId: string }[];
+    };
+    tampered.holdings[0]!.accountId = "00000000-0000-0000-0000-000000000000";
+    await wipeFamilyData(user.familyId);
+    await expect(
+      importFamilyExport(db(), actor, parseFamilyExport(encode(tampered)))
+    ).rejects.toThrow(/references an account that is not part of the export/);
   });
 });
