@@ -74,6 +74,32 @@ describe("Cloudflare SQLite storage", () => {
       deletedEntryAbsent: true
     });
   });
+  it("runs manual holdings with serialized buys and honest cost provenance in cloud DO", async () => {
+    expect(await probe("holdings")).toEqual({
+      quantity: "103",
+      averageCostMinor: 200,
+      averageCostQuantity: "3",
+      partialCost: true,
+      totalCostMinor: 600,
+      balance: 51500,
+      valuationRejected: true,
+      unpriceableRejected: true
+    });
+  });
+  it("preserves same-day valuation precedence across export and restore in cloud DO", async () => {
+    const result = await probe("export-restore-precedence");
+    expect(result.sourceBalance).toBe(1000);
+    expect(result.restoredBalance).toBe(1000);
+    // A fresh buy must beat every restored valuation immediately, even
+    // when a fast restore has more entries than elapsed milliseconds.
+    expect(result.afterBuy).toBe(1100);
+    // The export carries the per-account write order and the manual
+    // valuation (written first) ranks below the holdings valuation.
+    expect(result.todaysValuations).toEqual([
+      { amountMinor: 5000, writeOrder: 0 },
+      { amountMinor: 1000, writeOrder: 1 }
+    ]);
+  });
   it("does not expose uncommitted writes to concurrent readers", async () => {
     expect(await probe("concurrency")).toEqual({ observed: "original" });
   });

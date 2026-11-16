@@ -1,6 +1,6 @@
 import { mkdir, readdir, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { eq, getTableColumns, type Table } from "drizzle-orm";
+import { eq, getTableColumns, sql, type Table } from "drizzle-orm";
 import type { Executor } from "../db/client";
 import { usesCloudStorage } from "../db/dialect";
 import { chunkRows } from "../db/params";
@@ -31,6 +31,7 @@ import {
   oauthClients,
   oauthGrants,
   oauthTokens,
+  portfolioHoldings,
   recurringSeries,
   savedFilters,
   tags,
@@ -104,6 +105,7 @@ const INSTANCE_TABLES: { name: string; table: Table }[] = [
   { name: "meroShareAccounts", table: meroShareAccounts },
   { name: "meroShareHoldings", table: meroShareHoldings },
   { name: "meroShareTransactions", table: meroShareTransactions },
+  { name: "portfolioHoldings", table: portfolioHoldings },
   { name: "chatMessages", table: chatMessages },
   { name: "chatProposals", table: chatProposals },
   { name: "oauthClients", table: oauthClients },
@@ -125,7 +127,23 @@ export async function buildInstanceExport(exec: Executor): Promise<InstanceExpor
   const capture = async (tx: Executor): Promise<InstanceExport> => {
     const tables: Record<string, TableRows> = {};
     for (const { name, table } of INSTANCE_TABLES) {
-      const rows = await tx.select().from(table);
+      // Entries are captured in balance-engine precedence order (date,
+      // created_at, insertion sequence). The restore inserts rows verbatim
+      // — created_at and write_seq survive on PostgreSQL, so order is
+      // redundant there — but on the cloud backend the tiebreak falls
+      // through to rowid when two same-date valuations share a created_at,
+      // so the archive order itself must be the source order.
+      const rows =
+        name === "entries"
+          ? await tx
+              .select()
+              .from(entries)
+              .orderBy(
+                entries.date,
+                entries.createdAt,
+                usesCloudStorage ? sql`"entries"."rowid"` : entries.writeSeq
+              )
+          : await tx.select().from(table);
       tables[name] = rows as TableRows;
     }
     return {
@@ -257,15 +275,23 @@ function reviveTimestamps(table: Table, row: Record<string, unknown>): Record<st
   return revived ?? row;
 }
 
+// The scan is forward and order-preserving on purpose: rows whose parent
+// is not yet placed are deferred to a later pass, but rows that can be
+// placed keep their relative order. The previous backwards scan reversed
+// every parentless row, which is harmless when the verbatim columns carry
+// precedence (PostgreSQL: created_at + write_seq are restored as-is) but
+// flips same-date valuation precedence on the cloud backend, where the
+// tiebreak falls through to rowid — insertion order — when two valuations
+// share a created_at (SQLite's timestamp resolution is one second).
 function sortRowsParentsFirst(rows: TableRows, parentKey: string): TableRows {
   const byId = new Map(rows.map((r) => [String(r.id), r]));
   const sorted: TableRows = [];
   const placed = new Set<string>();
-  const pending = [...rows];
+  let pending = [...rows];
   while (pending.length > 0) {
-    const before = pending.length;
-    for (let i = pending.length - 1; i >= 0; i--) {
-      const row = pending[i]!;
+    const next: TableRows = [];
+    let placedAny = false;
+    for (const row of pending) {
       const parentId = row[parentKey];
       if (
         parentId === null ||
@@ -275,15 +301,18 @@ function sortRowsParentsFirst(rows: TableRows, parentKey: string): TableRows {
       ) {
         sorted.push(row);
         placed.add(String(row.id));
-        pending.splice(i, 1);
+        placedAny = true;
+      } else {
+        next.push(row);
       }
     }
-    if (pending.length === before) {
+    if (!placedAny) {
       // A cycle or dangling parent chain: fall back to the original order and
       // let the database constraint report the problem inside the transaction.
       sorted.push(...pending);
       break;
     }
+    pending = next;
   }
   return sorted;
 }

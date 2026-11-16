@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { and, eq, inArray } from "drizzle-orm";
 import type { Executor } from "../db/client";
+import { statementTimestamp } from "../db/dialect";
 import { chunkParams } from "../db/params";
 import {
   accounts,
@@ -1149,9 +1150,20 @@ async function applySnapshot(
       )
       .limit(1);
     if (valuationEntry) {
+      // A re-sync is a fresh write of today's value: restamp created_at
+      // at statement-execution time so same-day precedence (write order)
+      // treats it as the latest write, exactly like the holdings sync's
+      // replace-on-write. The column default would keep the transaction
+      // start time — and an in-place update would keep the FIRST sync's
+      // timestamp — either of which could lose to a same-day entry that
+      // was actually written earlier.
       await exec
         .update(entries)
-        .set({ amountMinor: totalValueMinor, updatedAt: new Date() })
+        .set({
+          amountMinor: totalValueMinor,
+          updatedAt: new Date(),
+          createdAt: statementTimestamp()
+        })
         .where(eq(entries.id, valuationEntry.id));
     } else {
       const [entry] = await exec
@@ -1164,7 +1176,8 @@ async function applySnapshot(
           name: "MeroShare portfolio valuation",
           externalSource: "meroshare",
           externalId: valuationExternalId,
-          entryableType: "valuation"
+          entryableType: "valuation",
+          createdAt: statementTimestamp()
         })
         .returning({ id: entries.id });
       if (!entry) throw errors.conflict("Could not record the MeroShare valuation.");

@@ -15,6 +15,7 @@ import { errors } from "@/lib/errors";
 import { todayIn } from "@/lib/datetime";
 import { recordAudit } from "../observability/audit";
 import { latestBalancesFor, recalculateAccount } from "./balances";
+import { accountHasHoldings } from "./holdings";
 
 /**
  * Per-account balance tracking for the valuation-driven types
@@ -38,6 +39,8 @@ export type BalanceTrackingPreview = {
   valuationCount: number;
   earliestValuationDate: string | null;
   meroshareLinked: boolean;
+  /** True while manual portfolio holdings manage this account's value. */
+  holdingsManaged: boolean;
 };
 
 export type BalanceTrackingSwitchResult = {
@@ -170,7 +173,8 @@ export async function previewBalanceTracking(
     resultingBalanceMinor: resulting,
     valuationCount: valuationEntries.length,
     earliestValuationDate: valuationEntries[0]?.date ?? null,
-    meroshareLinked: await isMeroShareLinked(exec, accountId)
+    meroshareLinked: await isMeroShareLinked(exec, accountId),
+    holdingsManaged: await accountHasHoldings(exec, accountId)
   };
 }
 
@@ -203,6 +207,11 @@ export async function switchBalanceTracking(
     if (input.to === "transactions" && (await isMeroShareLinked(tx, account.id))) {
       throw errors.conflict(
         "This account is linked to MeroShare, which controls its balance through valuations. Disconnect MeroShare before switching it to transaction tracking."
+      );
+    }
+    if (input.to === "transactions" && (await accountHasHoldings(tx, account.id))) {
+      throw errors.conflict(
+        "This account's value is managed by its portfolio holdings, which publish its balance as a valuation. Remove all holdings before switching it to transaction tracking."
       );
     }
 

@@ -14,6 +14,7 @@ import * as accountsSvc from "@/server/domain/accounts";
 import * as valuationsSvc from "@/server/domain/valuations";
 import * as balancesSvc from "@/server/domain/balances";
 import * as trackingSvc from "@/server/domain/balance-tracking";
+import * as holdingsSvc from "@/server/domain/holdings";
 import * as orchestrate from "@/server/domain/orchestrate";
 import * as exportsSvc from "@/server/domain/exports";
 import { importFamilyExport, parseFamilyExport } from "@/server/domain/family-import";
@@ -349,6 +350,59 @@ describe("balance tracking: the switch", () => {
         to: "transactions"
       })
     ).rejects.toMatchObject({ code: "conflict" });
+  });
+
+  it("rejects switching a holdings-managed account to transactions", async () => {
+    const user = await makeUser();
+    const accountId = await makeAccount(user, {
+      type: "other_asset",
+      name: "Holdings portfolio",
+      currency: "NPR",
+      openedOn: "2026-01-01",
+      openingBalanceDisplayMinor: 0
+    });
+    await holdingsSvc.addHolding(db(), actorOf(user), {
+      accountId,
+      ticker: "NABIL",
+      quantity: "10",
+      averageCostMinor: null,
+      currentPriceMinor: 100
+    });
+
+    const preview = await trackingSvc.previewBalanceTracking(
+      db(),
+      actorOf(user),
+      accountId,
+      "transactions"
+    );
+    expect(preview.holdingsManaged).toBe(true);
+    await expect(
+      trackingSvc.switchBalanceTracking(db(), actorOf(user), {
+        accountId,
+        to: "transactions"
+      })
+    ).rejects.toMatchObject({ code: "conflict" });
+  });
+
+  it("rejects managing holdings on a transaction-tracked account", async () => {
+    const user = await makeUser();
+    const accountId = await makeAccount(user, {
+      type: "other_asset",
+      name: "Loan from day one",
+      currency: "NPR",
+      openedOn: "2026-01-01",
+      openingBalanceDisplayMinor: 0,
+      balanceTracking: "transactions"
+    });
+    await expect(
+      holdingsSvc.addHolding(db(), actorOf(user), {
+        accountId,
+        ticker: "NABIL",
+        quantity: "10",
+        averageCostMinor: null,
+        currentPriceMinor: 100
+      })
+    ).rejects.toMatchObject({ code: "validation.failed" });
   });
 
   it("rejects switches by read_write members and on closed accounts", async () => {

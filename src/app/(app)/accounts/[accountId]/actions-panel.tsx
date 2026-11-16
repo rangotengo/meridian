@@ -22,6 +22,7 @@ export type TrackingPreview = {
   valuationCount: number;
   earliestValuationDate: string | null;
   meroshareLinked: boolean;
+  holdingsManaged: boolean;
 };
 
 export function AccountActions({
@@ -259,7 +260,7 @@ function BalanceTrackingPanel({
   const [state, action] = useActionState(switchBalanceTrackingAction, undefined);
   const toTransactions = preview.to === "transactions";
   const laterValuations = Math.max(0, preview.valuationCount - 1);
-  const blocked = toTransactions && preview.meroshareLinked;
+  const blocked = toTransactions && (preview.meroshareLinked || preview.holdingsManaged);
 
   return (
     <form action={action} className="space-y-4">
@@ -311,8 +312,9 @@ function BalanceTrackingPanel({
 
       {blocked ? (
         <p className="text-sm text-destructive">
-          This account is linked to MeroShare, which controls its balance through valuations.
-          Disconnect MeroShare before switching it to transaction tracking.
+          {preview.meroshareLinked
+            ? "This account is linked to MeroShare, which controls its balance through valuations. Disconnect MeroShare before switching it to transaction tracking."
+            : "This account's value is managed by its portfolio holdings. Remove all holdings before switching it to transaction tracking."}
         </p>
       ) : (
         <SubmitButton>
