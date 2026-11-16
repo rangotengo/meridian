@@ -210,7 +210,7 @@ function CreateForm({
         </Field>
         <Field label="Category (optional)" htmlFor="recurring-category">
           <Select id="recurring-category" name="categoryId">
-            <option value="">—</option>
+            <option value="">Uncategorized</option>
             {categories.map((c) => (
               <option key={c.id} value={c.id}>
                 {c.name}
