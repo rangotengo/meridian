@@ -5,6 +5,7 @@ import { users } from "@/server/db/schema";
 import { cookies } from "next/headers";
 import { getPreference, getUserPrivacyMode } from "@/server/domain/users";
 import { Card, PageHeader } from "@/components/ds/card";
+import { chooseThemePreference, parseThemePreference, THEME_COOKIE_NAME } from "@/lib/theme";
 import { ProfileForms } from "./forms";
 import { OrgForm } from "./org-form";
 import Link from "next/link";
@@ -33,13 +34,11 @@ export default async function SettingsPage() {
   const privacy = user ? await getUserPrivacyMode(db, actor.userId) : false;
   const prefs = (user?.preferences ?? {}) as Record<string, unknown>;
   const themePref = await getPreference<string>(prefs, "theme", "system");
-  const themeCookie = (await cookies()).get("theme")?.value;
-  const theme =
-    themeCookie === "light" || themeCookie === "dark" || themeCookie === "system"
-      ? themeCookie
-      : themePref === "light" || themePref === "dark" || themePref === "system"
-        ? themePref
-        : "system";
+  const themeCookie = (await cookies()).get(THEME_COOKIE_NAME)?.value;
+  const theme = chooseThemePreference(
+    parseThemePreference(themeCookie),
+    parseThemePreference(themePref)
+  );
 
   return (
     <>
