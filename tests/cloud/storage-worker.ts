@@ -299,17 +299,37 @@ export class StorageProbe {
           sessionId: "",
           emailVerified: true
         };
+        // Model a larger history that restores faster than one millisecond
+        // per entry: future-dated import stamps must not beat a fresh buy.
+        const archive = JSON.parse(JSON.stringify(exported));
+        const manual = archive.entries[0];
+        const padding = Array.from({ length: 2000 }, (_, i) => ({
+          ...manual,
+          id: `prior-${i}`,
+          writeOrder: i
+        }));
+        for (const e of archive.entries) e.writeOrder += padding.length;
+        archive.entries = [...padding, ...archive.entries];
         await importFamilyExport(
           exec,
           targetActor,
-          parseFamilyExport(new TextEncoder().encode(JSON.stringify(exported)))
+          parseFamilyExport(new TextEncoder().encode(JSON.stringify(archive)))
         );
         const [restored] = await db
           .select()
           .from(accounts)
           .where(eq(accounts.familyId, target.familyId));
         const restoredOverview = await getAccountOverview(exec, targetActor, restored!.id);
+        await adjustHolding(exec, targetActor, {
+          accountId: restored!.id,
+          ticker: "NABIL",
+          side: "buy",
+          quantity: "1",
+          priceMinor: 100
+        });
+        const afterBuy = await getAccountOverview(exec, targetActor, restored!.id);
         return Response.json({
+          afterBuy: afterBuy.displayBalanceMinor,
           sourceBalance: source.displayBalanceMinor,
           restoredBalance: restoredOverview.displayBalanceMinor,
           todaysValuations

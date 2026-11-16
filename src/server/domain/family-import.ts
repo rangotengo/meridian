@@ -506,7 +506,7 @@ async function importRecords(
   // in that order — entries without a rank (a partially keyed export)
   // sort after the ranked ones within their account, array order kept —
   // and stamped with monotonically increasing destination-local timestamps
-  // (one millisecond apart from the import's start), so the created_at
+  // (one millisecond apart, ending before the import's start), so the created_at
   // tiebreak resolves identically to the source. Insertion order carries
   // the same sequence into write_seq (PostgreSQL) and rowid (cloud).
   // A split child is still deferred until its parent lands; valuations
@@ -525,7 +525,11 @@ async function importRecords(
       const bo = b.writeOrder ?? Number.MAX_SAFE_INTEGER;
       return ao - bo;
     });
-    const stampBase = Date.now();
+    // Keep the entire imported history before the first possible live
+    // write. Starting at now and adding a millisecond per entry can put
+    // fast restores ahead of wall time, letting stale imported values
+    // override subsequent holdings changes until the clock catches up.
+    const stampBase = Date.now() - data.entries.length;
     let stampSeq = 0;
     let pendingEntries = orderedEntries;
     while (pendingEntries.length > 0) {

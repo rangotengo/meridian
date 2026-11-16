@@ -80,6 +80,9 @@ describe("Cloudflare SQLite storage", () => {
     const result = await probe("export-restore-precedence");
     expect(result.sourceBalance).toBe(1000);
     expect(result.restoredBalance).toBe(1000);
+    // A fresh buy must beat every restored valuation immediately, even
+    // when a fast restore has more entries than elapsed milliseconds.
+    expect(result.afterBuy).toBe(1100);
     // The export carries the per-account write order and the manual
     // valuation (written first) ranks below the holdings valuation.
     expect(result.todaysValuations).toEqual([
