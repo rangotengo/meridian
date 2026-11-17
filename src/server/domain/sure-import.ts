@@ -753,17 +753,12 @@ export async function sureImportStatus(
     .select({ metadata: auditEvents.metadata })
     .from(auditEvents)
     .where(
-      and(
-        eq(auditEvents.familyId, familyId),
-        eq(auditEvents.action, "family.imported_from_sure")
-      )
+      and(eq(auditEvents.familyId, familyId), eq(auditEvents.action, "family.imported_from_sure"))
     )
     .orderBy(desc(auditEvents.createdAt))
     .limit(1);
   const metadata = (row?.metadata ?? {}) as Record<string, unknown>;
-  const accounts =
-    typeof metadata.accounts === "number" ? metadata.accounts : 0;
-  const transactions =
-    typeof metadata.transactions === "number" ? metadata.transactions : 0;
+  const accounts = typeof metadata.accounts === "number" ? metadata.accounts : 0;
+  const transactions = typeof metadata.transactions === "number" ? metadata.transactions : 0;
   return { imported: Boolean(row), accounts, transactions };
 }
