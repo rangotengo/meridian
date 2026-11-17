@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useActionState } from "react";
+import Link from "next/link";
 import { setBudgetAction, removeBudgetAction } from "./actions";
 import { Card, Badge } from "@/components/ds/card";
 import { Field, FormError, Input } from "@/components/ds/form";
@@ -146,7 +147,11 @@ export function BudgetsView({
 
         <Card>
           <h2 className="mb-3 text-base font-medium text-primary">Add / edit category budget</h2>
-          <SetBudgetForm categories={categoriesWithoutBudget} currency={currency} />
+          <SetBudgetForm
+            categories={categoriesWithoutBudget}
+            hasCategories={perCategory.length > 0 || categoriesWithoutBudget.length > 0}
+            currency={currency}
+          />
         </Card>
       </div>
     </div>
@@ -271,19 +276,32 @@ function OverallCapForm({
 
 function SetBudgetForm({
   categories,
+  hasCategories,
   currency
 }: {
   categories: { id: string; name: string }[];
+  /** Whether any category exists at all (with or without a budget). */
+  hasCategories: boolean;
   currency: string;
 }) {
   const [state, action] = useActionState(setBudgetAction, undefined);
   if (categories.length === 0) {
     return (
       <div className="space-y-2 py-2">
-        <p className="text-sm text-muted-foreground">
-          All existing categories have monthly budgets set. You can adjust limits by clicking
-          &ldquo;Edit limit&rdquo; on any budget on the left.
-        </p>
+        {hasCategories ? (
+          <p className="text-sm text-muted-foreground">
+            All existing categories have monthly budgets set. You can adjust limits by clicking
+            &ldquo;Edit limit&rdquo; on any budget on the left.
+          </p>
+        ) : (
+          <p className="text-sm text-muted-foreground">
+            No categories yet.{" "}
+            <Link href="/settings/categories" className="text-primary hover:underline">
+              Add one in Settings
+            </Link>{" "}
+            to set its monthly limit here.
+          </p>
+        )}
       </div>
     );
   }

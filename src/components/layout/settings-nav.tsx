@@ -37,10 +37,19 @@ export function SettingsNav() {
   const pathname = usePathname();
 
   return (
-    <aside className="lg:sticky lg:top-20 lg:self-start">
-      <nav aria-label="Settings" className="space-y-5">
+    <aside className="min-w-0 lg:sticky lg:top-20 lg:self-start">
+      {/* min-w-0: the aside is a grid item; without it the nav strip's
+          min-content width would force the whole page wider than the
+          viewport on phones instead of scrolling inside the strip. */}
+      {/* On phones the sections sit side by side in a horizontal strip
+          instead of a ~450px vertical list above the page content; on
+          desktop it is the usual vertical nav. */}
+      <nav
+        aria-label="Settings"
+        className="flex gap-6 overflow-x-auto pb-2 lg:block lg:space-y-5 lg:overflow-visible lg:pb-0"
+      >
         {sections.map((section) => (
-          <section key={section.label}>
+          <section key={section.label} className="min-w-44 shrink-0 lg:min-w-0">
             <div className="mb-2 flex items-center gap-2 px-2">
               <h2 className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
                 {section.label}

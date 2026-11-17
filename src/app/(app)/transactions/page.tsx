@@ -112,6 +112,33 @@ export default async function TransactionsPage({ searchParams }: { searchParams:
     return `?${params.toString()}`;
   };
 
+  // Shared by the desktop table and the mobile stacked list so both
+  // paginate identically.
+  const pagination = (
+    <div className="flex items-center justify-between px-4 py-3 text-sm">
+      {page.hasPrevious && page.items[0] ? (
+        <Link
+          href={`/transactions${listQuery({ date: page.items[0].date, id: page.items[0].id }, "prev")}`}
+          className="text-primary hover:underline"
+        >
+          ← Previous
+        </Link>
+      ) : (
+        <span />
+      )}
+      {page.nextCursor ? (
+        <Link
+          href={`/transactions${listQuery(page.nextCursor)}`}
+          className="text-primary hover:underline"
+        >
+          Next →
+        </Link>
+      ) : (
+        <span />
+      )}
+    </div>
+  );
+
   return (
     <div className="space-y-4 pb-6 lg:pb-12">
       <PageHeader
@@ -331,80 +358,99 @@ export default async function TransactionsPage({ searchParams }: { searchParams:
           hint="Try clearing the filters or record a new transaction."
         />
       ) : (
-        <Card className="overflow-x-auto p-0 ring-1 ring-foreground/10">
-          <table className="w-full min-w-160 text-sm">
-            <thead>
-              <tr className="border-b border-border text-left text-xs uppercase tracking-wide text-muted-foreground">
-                <th scope="col" className="px-4 py-3 font-medium">
-                  Date
-                </th>
-                <th scope="col" className="px-4 py-3 font-medium">
-                  Description
-                </th>
-                <th scope="col" className="px-4 py-3 font-medium">
-                  Account
-                </th>
-                <th scope="col" className="px-4 py-3 text-right font-medium">
-                  Amount
-                </th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-border">
+        <>
+          {/* Desktop: full table. The 640px minimum width would push the
+              amount column off-screen on phones, so small screens get a
+              stacked list instead (same data, same pagination). */}
+          <Card className="hidden overflow-x-auto p-0 ring-1 ring-foreground/10 sm:block">
+            <table className="w-full min-w-160 text-sm">
+              <thead>
+                <tr className="border-b border-border text-left text-xs uppercase tracking-wide text-muted-foreground">
+                  <th scope="col" className="px-4 py-3 font-medium">
+                    Date
+                  </th>
+                  <th scope="col" className="px-4 py-3 font-medium">
+                    Description
+                  </th>
+                  <th scope="col" className="px-4 py-3 font-medium">
+                    Account
+                  </th>
+                  <th scope="col" className="px-4 py-3 text-right font-medium">
+                    Amount
+                  </th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-border">
+                {page.items.map((e: EntryListItem) => (
+                  <tr key={e.id} className="transition-colors hover:bg-muted/50">
+                    <td className="whitespace-nowrap px-4 py-3 text-muted-foreground">
+                      {fmtDate(e.date)}
+                    </td>
+                    <td className="px-4 py-3">
+                      <Link href={`/transactions/${e.id}`} className="font-medium hover:underline">
+                        {e.transferId ? <span aria-hidden>⇄ </span> : null}
+                        {e.name}
+                      </Link>
+                      <div className="mt-0.5 flex flex-wrap items-center gap-1.5 text-xs text-muted-foreground">
+                        {e.categoryName ? (
+                          <span>{e.categoryName}</span>
+                        ) : (
+                          <span>Uncategorized</span>
+                        )}
+                        {e.merchant ? <span>· {e.merchant}</span> : null}
+                        {e.tagIds.map((id) => (
+                          <span key={id}>#{tagNameById.get(id) ?? "tag"}</span>
+                        ))}
+                      </div>
+                    </td>
+                    <td className="px-4 py-3 text-muted-foreground">{e.accountName}</td>
+                    <td className="px-4 py-3 text-right">
+                      <Amount
+                        minor={-e.amountMinor}
+                        currency={e.currency}
+                        masked={privacy}
+                        signed
+                        colorize
+                      />
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {pagination}
+          </Card>
+          <Card className="p-0 ring-1 ring-foreground/10 sm:hidden">
+            <ul className="divide-y divide-border">
               {page.items.map((e: EntryListItem) => (
-                <tr key={e.id} className="transition-colors hover:bg-muted/50">
-                  <td className="whitespace-nowrap px-4 py-3 text-muted-foreground">
-                    {fmtDate(e.date)}
-                  </td>
-                  <td className="px-4 py-3">
-                    <Link href={`/transactions/${e.id}`} className="font-medium hover:underline">
-                      {e.transferId ? <span aria-hidden>⇄ </span> : null}
-                      {e.name}
-                    </Link>
-                    <div className="mt-0.5 flex flex-wrap items-center gap-1.5 text-xs text-muted-foreground">
-                      {e.categoryName ? <span>{e.categoryName}</span> : <span>Uncategorized</span>}
-                      {e.merchant ? <span>· {e.merchant}</span> : null}
-                      {e.tagIds.map((id) => (
-                        <span key={id}>#{tagNameById.get(id) ?? "tag"}</span>
-                      ))}
-                    </div>
-                  </td>
-                  <td className="px-4 py-3 text-muted-foreground">{e.accountName}</td>
-                  <td className="px-4 py-3 text-right">
+                <li key={e.id}>
+                  <Link
+                    href={`/transactions/${e.id}`}
+                    className="flex items-start justify-between gap-3 px-4 py-3 transition-colors hover:bg-muted/50"
+                  >
+                    <span className="min-w-0">
+                      <span className="block truncate text-sm font-medium">
+                        {e.transferId ? <span aria-hidden>⇄ </span> : null}
+                        {e.name}
+                      </span>
+                      <span className="mt-0.5 block truncate text-xs text-muted-foreground">
+                        {fmtDate(e.date)} · {e.accountName} · {e.categoryName ?? "Uncategorized"}
+                      </span>
+                    </span>
                     <Amount
                       minor={-e.amountMinor}
                       currency={e.currency}
                       masked={privacy}
                       signed
                       colorize
+                      className="shrink-0 text-sm"
                     />
-                  </td>
-                </tr>
+                  </Link>
+                </li>
               ))}
-            </tbody>
-          </table>
-          <div className="flex items-center justify-between px-4 py-3 text-sm">
-            {page.hasPrevious && page.items[0] ? (
-              <Link
-                href={`/transactions${listQuery({ date: page.items[0].date, id: page.items[0].id }, "prev")}`}
-                className="text-primary hover:underline"
-              >
-                ← Previous
-              </Link>
-            ) : (
-              <span />
-            )}
-            {page.nextCursor ? (
-              <Link
-                href={`/transactions${listQuery(page.nextCursor)}`}
-                className="text-primary hover:underline"
-              >
-                Next →
-              </Link>
-            ) : (
-              <span />
-            )}
-          </div>
-        </Card>
+            </ul>
+            {pagination}
+          </Card>
+        </>
       )}
     </div>
   );

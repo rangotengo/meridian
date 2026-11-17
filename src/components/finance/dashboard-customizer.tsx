@@ -155,7 +155,7 @@ export function DashboardCustomizer({ data }: { data: DashboardData }) {
       <div className="flex flex-1 flex-col gap-4">
         <div className="flex flex-wrap items-end justify-between gap-3">
           <div>
-            <h1 className="text-2xl font-semibold tracking-tight">{data.greeting}</h1>
+            <h1 className="text-2xl font-semibold tracking-tight sm:text-3xl">{data.greeting}</h1>
             <p className="text-sm text-muted-foreground">{data.dateLabel}</p>
           </div>
           <div className="flex items-center gap-2">

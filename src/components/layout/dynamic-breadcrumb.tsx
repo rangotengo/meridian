@@ -28,8 +28,22 @@ const labelMap: Record<string, string> = {
   members: "Members",
   data: "Data",
   security: "Security",
-  admin: "Admin"
+  admin: "Admin",
+  insights: "Insights",
+  ssis: "SSIS",
+  "api-keys": "API keys",
+  "ai-agents": "AI agents",
+  "exchange-rates": "Exchange rates"
 };
+
+// A UUID (or other id) segment is not a readable label: name it after its
+// parent route instead of showing a truncated id.
+const idParentLabel: Record<string, string> = {
+  accounts: "Account",
+  transactions: "Transaction"
+};
+
+const UUID_LIKE = /^[0-9a-f-]{8,}$/i;
 
 export function DynamicBreadcrumb() {
   const pathname = usePathname();
@@ -53,7 +67,11 @@ export function DynamicBreadcrumb() {
         {segments.map((segment, index) => {
           const href = "/" + segments.slice(0, index + 1).join("/");
           const mapped = labelMap[segment];
-          const label = mapped ?? (segment.length > 18 ? `${segment.slice(0, 8)}…` : segment);
+          const idLabel =
+            !mapped && UUID_LIKE.test(segment)
+              ? (idParentLabel[segments[index - 1] ?? ""] ?? "Detail")
+              : undefined;
+          const label = mapped ?? idLabel ?? segment;
           const isLast = index === segments.length - 1;
 
           return (

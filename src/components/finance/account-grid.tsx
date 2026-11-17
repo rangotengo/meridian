@@ -167,9 +167,11 @@ export function AccountsView({
                     <div className="flex size-8 items-center justify-center rounded-full bg-muted">
                       <BuildingIcon className="size-4 text-muted-foreground" />
                     </div>
-                    <span className="text-xs text-muted-foreground">
-                      {account.institution ?? typeLabel(account.type)}
-                    </span>
+                    {account.institution ? (
+                      <span className="truncate text-xs text-muted-foreground">
+                        {account.institution}
+                      </span>
+                    ) : null}
                   </div>
                   <div className="mt-3">
                     <p className="text-sm font-semibold">{account.name}</p>

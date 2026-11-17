@@ -84,7 +84,9 @@ function PrivacyToggle({ privacy }: { privacy: boolean }) {
           Hide every monetary amount on screen. Currently {privacy ? "on" : "off"}.
         </p>
       </div>
-      <SubmitButton variant="secondary">{privacy ? "Turn off" : "Turn on"}</SubmitButton>
+      <SubmitButton variant="secondary" className="shrink-0 whitespace-nowrap">
+        {privacy ? "Turn off" : "Turn on"}
+      </SubmitButton>
     </form>
   );
 }

@@ -149,6 +149,19 @@
   * {
     @apply border-border outline-ring/50;
   }
+  /*
+   * Keyboard focus fallback for interactive elements that carry no
+   * component-level focus style (raw buttons/links, dialog triggers,
+   * filter tabs, table links). Library components (ui/*, ds controls)
+   * define their own focus-visible ring and keep it: their
+   * outline-none/outline-hidden utilities win over this base rule.
+   */
+  button:focus-visible,
+  a:focus-visible,
+  [role="button"]:focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
   body {
     @apply bg-background text-foreground;
   }

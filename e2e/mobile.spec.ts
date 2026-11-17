@@ -20,6 +20,8 @@ test("dashboard renders at 390px without horizontal overflow", async ({ page }) 
 
 test("transactions render at 390px without horizontal overflow", async ({ page }) => {
   await page.goto("/transactions");
-  await expect(page.getByText(getData().entry.name).first()).toBeVisible();
+  // The list renders twice in the DOM (desktop table + mobile stacked
+  // list, one hidden per breakpoint), so assert on the visible instance.
+  await expect(page.locator("a:visible", { hasText: getData().entry.name }).first()).toBeVisible();
   await expectNoHorizontalOverflow(page);
 });

@@ -15,6 +15,7 @@ import {
 } from "react";
 import { SubmitButton } from "./submit-button";
 import { FormError } from "./form";
+import { XIcon } from "lucide-react";
 
 const DialogCloseContext = createContext<(() => void) | null>(null);
 
@@ -136,7 +137,7 @@ export function Dialog({
               aria-label="Close dialog"
               className="rounded-md p-1 text-muted-foreground hover:bg-border/50 hover:text-foreground"
             >
-              ✕
+              <XIcon className="size-4" aria-hidden />
             </button>
           </div>
           {description ? (

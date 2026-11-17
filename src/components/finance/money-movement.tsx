@@ -54,7 +54,10 @@ export function MoneyMovement() {
           onValueChange={(value) => value && setMonths(value as "3" | "6" | "12")}
         >
           <SelectTrigger aria-label="Money movement period" className="h-8 w-[110px] text-xs">
-            <SelectValue />
+            {/* Base UI's Value falls back to the raw value ("6") once the
+                popup is closed and its items unmount, so render the label
+                explicitly. */}
+            <SelectValue>{`${months} months`}</SelectValue>
           </SelectTrigger>
           <SelectContent>
             <SelectItem value="3">3 months</SelectItem>
