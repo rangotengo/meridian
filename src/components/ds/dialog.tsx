@@ -68,6 +68,33 @@ export function Dialog({
   };
   const close = () => ref.current?.close();
 
+  // Chromium's native modal-dialog Tab traversal parks focus on <body>
+  // for one stop when wrapping past the last focusable element (verified
+  // with a minimal dialog in Playwright: last button -> BODY -> first
+  // button). The trap still holds — the rest of the page is inert — but
+  // a keyboard user loses the visible focus indicator for a stop. Wrap
+  // Tab explicitly so focus cycles first <-> last without leaving.
+  const wrapTab = (event: ReactKeyboardEvent<HTMLDialogElement>) => {
+    if (event.key !== "Tab") return;
+    const dialog = ref.current;
+    if (!dialog) return;
+    const focusables = Array.from(
+      dialog.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+      )
+    ).filter((el) => el.offsetParent !== null);
+    const first = focusables.at(0);
+    const last = focusables.at(-1);
+    if (!first || !last) return;
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
+
   // Accessible trigger API: the caller's element IS the control — the
   // Dialog forwards the open behavior, a ref, and (for elements that are
   // not natively interactive) button semantics onto it instead of
@@ -122,6 +149,7 @@ export function Dialog({
       <dialog
         ref={ref}
         closedby="any"
+        onKeyDown={wrapTab}
         aria-labelledby={titleId}
         aria-describedby={description ? descId : undefined}
         className={`backdrop:bg-black/40 open:flex open:flex-col m-auto rounded-xl border border-border bg-surface p-0 text-fg shadow-xl ${width} w-[calc(100vw-2rem)]`}

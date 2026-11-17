@@ -152,13 +152,18 @@
   /*
    * Keyboard focus fallback for interactive elements that carry no
    * component-level focus style (raw buttons/links, dialog triggers,
-   * filter tabs, table links). Library components (ui/*, ds controls)
+   * filter tabs, table links, and raw form controls such as checkboxes,
+   * date and file inputs). Library components (ui/*, ds controls)
    * define their own focus-visible ring and keep it: their
    * outline-none/outline-hidden utilities win over this base rule.
    */
   button:focus-visible,
   a:focus-visible,
-  [role="button"]:focus-visible {
+  [role="button"]:focus-visible,
+  input:focus-visible,
+  select:focus-visible,
+  textarea:focus-visible,
+  summary:focus-visible {
     outline: 2px solid var(--ring);
     outline-offset: 2px;
   }
