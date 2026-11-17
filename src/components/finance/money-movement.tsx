@@ -19,12 +19,57 @@ import { Bar, BarChart, CartesianGrid, XAxis, YAxis } from "recharts";
 import { useDashboardData } from "@/components/finance/dashboard-data";
 import { fmtMoney, fmtMonth } from "@/lib/format";
 import { minorToMajor } from "@/lib/money";
+import {
+  compareFlowWindows,
+  monthVsLastMonth,
+  type PeriodDelta
+} from "@/lib/period-comparison";
 import { ArrowDownLeftIcon, ArrowUpRightIcon } from "lucide-react";
 
 const chartConfig = {
   moneyIn: { label: "Money in", color: "var(--color-primary)" },
   moneyOut: { label: "Money out", color: "var(--color-muted-foreground)" }
 } satisfies ChartConfig;
+
+function formatPct(pct: number | null): string {
+  if (pct === null || !Number.isFinite(pct)) return "—";
+  return `${pct >= 0 ? "+" : ""}${(pct * 100).toFixed(1)}%`;
+}
+
+function DeltaLine({
+  delta,
+  currency,
+  privacy,
+  label
+}: {
+  delta: PeriodDelta;
+  currency: string;
+  privacy: boolean;
+  label: string;
+}) {
+  if (privacy) {
+    return (
+      <p className="text-[11px] text-muted-foreground">
+        {label}: ••••
+      </p>
+    );
+  }
+  return (
+    <p className="text-[11px] text-muted-foreground">
+      {label}:{" "}
+      <span
+        className={`font-semibold tabular-nums ${
+          delta.deltaMinor >= 0
+            ? "text-emerald-600 dark:text-emerald-400"
+            : "text-destructive"
+        }`}
+      >
+        {delta.deltaMinor >= 0 ? "+" : ""}
+        {fmtMoney(delta.deltaMinor, currency, "en", "always")} ({formatPct(delta.pct)})
+      </span>
+    </p>
+  );
+}
 
 export function MoneyMovement() {
   const { flows, currency, privacy, locale } = useDashboardData();
@@ -44,6 +89,21 @@ export function MoneyMovement() {
     { in: 0, out: 0 }
   );
   const net = totals.in - totals.out;
+
+  const comparison = useMemo(() => {
+    const n = Number(months);
+    const previous = flows.slice(-2 * n, -n);
+    return compareFlowWindows(sliced, previous);
+  }, [flows, sliced, months]);
+
+  const monthComparison = useMemo(() => monthVsLastMonth(flows), [flows]);
+
+  const previousLabel =
+    comparison.previousMonths === 0
+      ? null
+      : comparison.previousMonths < Number(months)
+        ? `vs previous ${comparison.previousMonths} mo (partial history)`
+        : `vs previous ${months} mo`;
 
   return (
     <Card>
@@ -72,31 +132,72 @@ export function MoneyMovement() {
             <div className="flex size-8 items-center justify-center rounded-lg bg-emerald-100 dark:bg-emerald-900/50">
               <ArrowDownLeftIcon className="size-4 text-emerald-600 dark:text-emerald-400" />
             </div>
-            <div>
+            <div className="min-w-0">
               <p className="text-[10px] font-medium text-emerald-600/70 dark:text-emerald-400/70">
                 Money in
               </p>
               <p className="text-sm font-bold tabular-nums text-emerald-700 dark:text-emerald-300">
                 {privacy ? "••••" : fmtMoney(totals.in, currency)}
               </p>
+              {previousLabel ? (
+                <DeltaLine
+                  delta={comparison.in}
+                  currency={currency}
+                  privacy={privacy}
+                  label={previousLabel}
+                />
+              ) : (
+                <p className="text-[11px] text-muted-foreground">No previous period</p>
+              )}
             </div>
           </div>
           <div className="flex items-center gap-2.5 rounded-xl bg-rose-50 px-3 py-2.5 dark:bg-rose-950/30">
             <div className="flex size-8 items-center justify-center rounded-lg bg-rose-100 dark:bg-rose-900/50">
               <ArrowUpRightIcon className="size-4 text-rose-600 dark:text-rose-400" />
             </div>
-            <div>
+            <div className="min-w-0">
               <p className="text-[10px] font-medium text-rose-600/70 dark:text-rose-400/70">
                 Money out
               </p>
               <p className="text-sm font-bold tabular-nums text-rose-700 dark:text-rose-300">
                 {privacy ? "••••" : fmtMoney(totals.out, currency)}
               </p>
+              {previousLabel ? (
+                <DeltaLine
+                  delta={comparison.out}
+                  currency={currency}
+                  privacy={privacy}
+                  label={previousLabel}
+                />
+              ) : (
+                <p className="text-[11px] text-muted-foreground">No previous period</p>
+              )}
             </div>
           </div>
         </div>
         <div className="flex items-center justify-between rounded-lg border px-3 py-2">
-          <span className="text-xs text-muted-foreground">Net flow</span>
+          <span className="text-xs text-muted-foreground">
+            Net flow
+            {previousLabel && (
+              <span className="ml-2">
+                {privacy ? (
+                  "••••"
+                ) : (
+                  <span
+                    className={`font-semibold tabular-nums ${
+                      comparison.net.deltaMinor >= 0
+                        ? "text-emerald-600 dark:text-emerald-400"
+                        : "text-destructive"
+                    }`}
+                  >
+                    {comparison.net.deltaMinor >= 0 ? "+" : ""}
+                    {fmtMoney(comparison.net.deltaMinor, currency, "en", "always")} (
+                    {formatPct(comparison.net.pct)})
+                  </span>
+                )}
+              </span>
+            )}
+          </span>
           <span
             className={`text-sm font-bold tabular-nums ${
               net >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-destructive"
@@ -105,6 +206,115 @@ export function MoneyMovement() {
             {privacy ? "••••" : fmtMoney(net, currency, "en", "always")}
           </span>
         </div>
+        {monthComparison && (
+          <div className="rounded-lg border px-3 py-2">
+            <p className="text-xs font-medium text-muted-foreground">
+              This month vs last month
+            </p>
+            <div className="mt-1.5 grid grid-cols-3 gap-2 text-xs">
+              <div>
+                <p className="text-muted-foreground">
+                  {fmtMonth(monthComparison.current.monthKey, locale)}
+                </p>
+                <p className="font-semibold tabular-nums">
+                  {privacy ? "••••" : fmtMoney(monthComparison.current.inMinor, currency)}
+                </p>
+                <p className="text-muted-foreground">in</p>
+              </div>
+              <div>
+                <p className="text-muted-foreground">
+                  {fmtMonth(monthComparison.previous.monthKey, locale)}
+                </p>
+                <p className="font-semibold tabular-nums">
+                  {privacy ? "••••" : fmtMoney(monthComparison.previous.inMinor, currency)}
+                </p>
+                <p className="text-muted-foreground">in</p>
+              </div>
+              <div>
+                <p className="text-muted-foreground">Change</p>
+                <p
+                  className={`font-semibold tabular-nums ${
+                    monthComparison.in.deltaMinor >= 0
+                      ? "text-emerald-600 dark:text-emerald-400"
+                      : "text-destructive"
+                  }`}
+                >
+                  {privacy
+                    ? "••••"
+                    : `${monthComparison.in.deltaMinor >= 0 ? "+" : ""}${fmtMoney(
+                        monthComparison.in.deltaMinor,
+                        currency,
+                        "en",
+                        "always"
+                      )} (${formatPct(monthComparison.in.pct)})`}
+                </p>
+                <p className="text-muted-foreground">in</p>
+              </div>
+              <div>
+                <p className="font-semibold tabular-nums">
+                  {privacy ? "••••" : fmtMoney(monthComparison.current.outMinor, currency)}
+                </p>
+                <p className="text-muted-foreground">out</p>
+              </div>
+              <div>
+                <p className="font-semibold tabular-nums">
+                  {privacy ? "••••" : fmtMoney(monthComparison.previous.outMinor, currency)}
+                </p>
+                <p className="text-muted-foreground">out</p>
+              </div>
+              <div>
+                <p
+                  className={`font-semibold tabular-nums ${
+                    monthComparison.out.deltaMinor >= 0
+                      ? "text-emerald-600 dark:text-emerald-400"
+                      : "text-destructive"
+                  }`}
+                >
+                  {privacy
+                    ? "••••"
+                    : `${monthComparison.out.deltaMinor >= 0 ? "+" : ""}${fmtMoney(
+                        monthComparison.out.deltaMinor,
+                        currency,
+                        "en",
+                        "always"
+                      )} (${formatPct(monthComparison.out.pct)})`}
+                </p>
+                <p className="text-muted-foreground">out</p>
+              </div>
+              <div>
+                <p className="font-semibold tabular-nums">
+                  {privacy ? "••••" : fmtMoney(monthComparison.current.netMinor, currency)}
+                </p>
+                <p className="text-muted-foreground">net</p>
+              </div>
+              <div>
+                <p className="font-semibold tabular-nums">
+                  {privacy ? "••••" : fmtMoney(monthComparison.previous.netMinor, currency)}
+                </p>
+                <p className="text-muted-foreground">net</p>
+              </div>
+              <div>
+                <p
+                  className={`font-semibold tabular-nums ${
+                    monthComparison.net.deltaMinor >= 0
+                      ? "text-emerald-600 dark:text-emerald-400"
+                      : "text-destructive"
+                  }`}
+                >
+                  {privacy
+                    ? "••••"
+                    : `${monthComparison.net.deltaMinor >= 0 ? "+" : ""}${fmtMoney(
+                        monthComparison.net.deltaMinor,
+                        currency,
+                        "en",
+                        "always"
+                      )} (${formatPct(monthComparison.net.pct)})`}
+                </p>
+                <p className="text-muted-foreground">net</p>
+              </div>
+            </div>
+          </div>
+        )}
         <ChartContainer config={chartConfig} className="h-[180px] w-full">
           <BarChart data={data} margin={{ top: 4, right: 4, bottom: 0, left: -24 }} barGap={2}>
             <CartesianGrid
