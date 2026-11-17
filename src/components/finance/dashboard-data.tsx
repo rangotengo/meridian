@@ -32,6 +32,17 @@ export type HealthFactor = {
   description: string;
 };
 
+export type DashboardBill = {
+  seriesId: string;
+  name: string;
+  amountMinor: number;
+  currency: string;
+  accountName: string;
+  dueDate: string;
+  status: "missed" | "due-soon" | "upcoming";
+  daysUntilDue: number;
+};
+
 export type DashboardData = {
   greeting: string;
   dateLabel: string;
@@ -63,6 +74,11 @@ export type DashboardData = {
     remainingMinor: number;
     pct: number;
   } | null;
+  bills: {
+    missed: DashboardBill[];
+    dueSoon: DashboardBill[];
+    upcoming: DashboardBill[];
+  };
   fx: {
     /** True when some amounts were excluded because no rate exists. */
     incomplete: boolean;

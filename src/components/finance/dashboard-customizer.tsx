@@ -23,6 +23,7 @@ import { MoneyMovement } from "@/components/finance/money-movement";
 import { RecentTransactions } from "@/components/finance/recent-transactions";
 import { HealthScore } from "@/components/finance/health-score";
 import { GoalsWidget } from "@/components/finance/goals-widget";
+import { BillsWidget } from "@/components/finance/bills-widget";
 import { FxWarning } from "@/components/finance/fx-warning";
 
 type WidgetSize = "sm" | "lg" | "full";
@@ -39,6 +40,7 @@ const defaultBlocks: Block[] = [
   { id: "transfer-spending", label: "Actions & spending", size: "sm" },
   { id: "money-movement", label: "Money movement", size: "sm" },
   { id: "goals", label: "Goals", size: "sm" },
+  { id: "bills", label: "Bills & reminders", size: "sm" },
   { id: "health-score", label: "Financial health", size: "sm" },
   { id: "recent-transactions", label: "Recent transactions", size: "full" }
 ];
@@ -73,6 +75,8 @@ function widgetFor(id: string) {
       return <MoneyMovement />;
     case "goals":
       return <GoalsWidget />;
+    case "bills":
+      return <BillsWidget />;
     case "health-score":
       return <HealthScore />;
     case "recent-transactions":
