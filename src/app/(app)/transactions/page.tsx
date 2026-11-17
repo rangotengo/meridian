@@ -90,6 +90,12 @@ export default async function TransactionsPage({ searchParams }: { searchParams:
 
   const tagNameById = new Map(tags.map((t) => [t.id, t.name]));
 
+  // Selection in TransactionList is scoped to the visible page: the list
+  // remounts (fresh selection) whenever the filters or the page cursor
+  // change, so a cross-page selection can never grow past the 25 ids the
+  // bulk-delete action accepts (see transaction-list.tsx).
+  const listKey = JSON.stringify({ ...currentParams, cursor: cursorRaw ?? "", dir: direction });
+
   const removeParamUrl = (removeKey: string) => {
     const params = new URLSearchParams();
     for (const [k, v] of Object.entries(currentParams)) {
@@ -358,6 +364,7 @@ export default async function TransactionsPage({ searchParams }: { searchParams:
         />
       ) : (
         <TransactionList
+          key={listKey}
           items={page.items}
           privacy={privacy}
           tagNames={Object.fromEntries(tagNameById)}

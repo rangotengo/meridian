@@ -1,32 +1,74 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { entries } from "@/server/db/schema";
-import { withTransaction } from "@/server/db/client";
 import * as orchestrate from "@/server/domain/orchestrate";
-import { DomainError } from "@/lib/errors";
-import {
-  db,
-  truncateAll,
-  makeUser,
-  makeAccount,
-  addTxn,
-  actorOf,
-  latestBalance
-} from "../helpers";
+import type { Actor } from "@/server/auth/context";
+import { db, truncateAll, makeUser, makeAccount, addTxn, actorOf, latestBalance } from "../helpers";
 
 /**
- * Exercises the exact per-item loop the bulk delete server action runs:
- * one transaction per entry via orchestrate.removeEntry, failures recorded
- * per entry instead of rolling the whole batch back.
+ * Calls the ACTUAL bulkDeleteEntriesAction (not a copy of its loop):
+ * one transaction per entry via orchestrate.removeEntry, failures
+ * recorded per entry instead of rolling the whole batch back, and the
+ * 25-id schema cap enforced up front.
  */
-describe("bulk delete (per-item removeEntry loop)", () => {
+
+const mocks = vi.hoisted(() => ({
+  revalidated: [] as string[],
+  actor: null as Actor | null
+}));
+
+vi.mock("next/cache", () => ({
+  revalidatePath: (path: string) => {
+    mocks.revalidated.push(path);
+  }
+}));
+
+vi.mock("next/navigation", () => ({
+  redirect: (url: string) => {
+    const err = new Error(`NEXT_REDIRECT ${url}`) as Error & { digest: string };
+    err.digest = `NEXT_REDIRECT;replace;${url};307;`;
+    throw err;
+  }
+}));
+
+vi.mock("@/server/auth/context", async (importOriginal) => {
+  const orig = await importOriginal<typeof import("@/server/auth/context")>();
+  return {
+    ...orig,
+    assertActor: async () => {
+      if (!mocks.actor) throw new Error("test actor not set");
+      return mocks.actor;
+    }
+  };
+});
+
+import { bulkDeleteEntriesAction } from "@/app/(app)/actions";
+
+function deleteForm(entryIds: string[]): FormData {
+  const form = new FormData();
+  form.set("entryIds", JSON.stringify(entryIds));
+  return form;
+}
+
+async function countEntries(accountId: string): Promise<number> {
+  const rows = await db()
+    .select({ id: entries.id })
+    .from(entries)
+    .where(eq(entries.accountId, accountId));
+  return rows.length;
+}
+
+describe("bulkDeleteEntriesAction", () => {
   beforeEach(async () => {
     await truncateAll();
+    mocks.actor = null;
+    mocks.revalidated.length = 0;
   });
 
   it("deletes the deletable entries, skips a split part, and recalculates the balance", async () => {
     const user = await makeUser();
     const actor = actorOf(user);
+    mocks.actor = actor;
     const accountId = await makeAccount(user);
     const a = await addTxn(user, accountId, { amountLedgerMinor: 5000, name: "A" });
     const b = await addTxn(user, accountId, { amountLedgerMinor: 3000, name: "B" });
@@ -45,24 +87,14 @@ describe("bulk delete (per-item removeEntry loop)", () => {
     const before = await latestBalance(accountId);
     expect(before).not.toBeNull();
 
-    const deleted: string[] = [];
-    const skipped: { id: string; reason: string }[] = [];
-    for (const entryId of [a, childId, b]) {
-      try {
-        await withTransaction((tx) => orchestrate.removeEntry(tx, actor, entryId));
-        deleted.push(entryId);
-      } catch (e) {
-        skipped.push({
-          id: entryId,
-          reason: e instanceof DomainError ? e.userMessage : "Could not delete."
-        });
-      }
-    }
+    const res = await bulkDeleteEntriesAction(undefined, deleteForm([a, childId, b]));
 
-    expect(deleted).toEqual([a, b]);
-    expect(skipped).toHaveLength(1);
-    expect(skipped[0]!.id).toBe(childId);
-    expect(skipped[0]!.reason).toMatch(/split/i);
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.data?.deleted).toEqual([a, b]);
+    expect(res.data?.skipped).toHaveLength(1);
+    expect(res.data?.skipped[0]?.id).toBe(childId);
+    expect(res.data?.skipped[0]?.reason).toMatch(/split/i);
 
     // The split parent and its parts survive; the deleted rows are gone.
     const remaining = await db()
@@ -78,5 +110,42 @@ describe("bulk delete (per-item removeEntry loop)", () => {
     // Removing 5,000 + 3,000 of outflow adds 8,000 back to the balance.
     const after = await latestBalance(accountId);
     expect(after?.balanceMinor).toBe((before?.balanceMinor ?? 0) + 8000);
+  });
+
+  it("rejects more than 25 ids and deletes nothing", async () => {
+    const user = await makeUser();
+    mocks.actor = actorOf(user);
+    const accountId = await makeAccount(user);
+    const ids: string[] = [];
+    for (let i = 0; i < 26; i++) {
+      ids.push(await addTxn(user, accountId, { amountLedgerMinor: 100, name: `T${i}` }));
+    }
+
+    // 26 ids is what a cross-page selection used to submit (25 + 25);
+    // the UI can no longer build one, and the action still refuses it.
+    const res = await bulkDeleteEntriesAction(undefined, deleteForm(ids));
+
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+    expect(res.code).toBe("validation.failed");
+    expect(await countEntries(accountId)).toBe(26);
+  });
+
+  it("accepts exactly 25 ids", async () => {
+    const user = await makeUser();
+    mocks.actor = actorOf(user);
+    const accountId = await makeAccount(user);
+    const ids: string[] = [];
+    for (let i = 0; i < 25; i++) {
+      ids.push(await addTxn(user, accountId, { amountLedgerMinor: 100, name: `T${i}` }));
+    }
+
+    const res = await bulkDeleteEntriesAction(undefined, deleteForm(ids));
+
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.data?.deleted).toHaveLength(25);
+    expect(res.data?.skipped).toHaveLength(0);
+    expect(await countEntries(accountId)).toBe(0);
   });
 });

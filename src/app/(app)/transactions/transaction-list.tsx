@@ -53,7 +53,11 @@ export function TransactionList({
   const allSelected = pageIds.length > 0 && pageIds.every((id) => selected.includes(id));
   const someSelected = pageIds.some((id) => selected.includes(id));
 
-  const selectedItems = items.filter((e) => selected.includes(e.id));
+  // Selection is scoped to the visible page: ids that left the page (e.g.
+  // after a revalidation) are never shown as selected and never submitted,
+  // so the selection can never exceed the 25 ids on this page.
+  const visibleSelected = selected.filter((id) => pageIds.includes(id));
+  const selectedItems = items.filter((e) => visibleSelected.includes(e.id));
   const skippedWithNames =
     deleteState?.ok && deleteState.data
       ? deleteState.data.skipped.map((s) => ({
@@ -64,31 +68,32 @@ export function TransactionList({
 
   return (
     <div className="space-y-3">
-      {selected.length > 0 ? (
+      {visibleSelected.length > 0 ? (
         <Card className="flex flex-wrap items-center gap-3 px-4 py-3">
           <span className="text-sm font-medium" aria-live="polite">
-            {selected.length} selected
+            {visibleSelected.length} selected on this page
+          </span>
+          <span className="text-xs text-muted-foreground">
+            Changing page or filters clears the selection.
           </span>
           {confirming ? (
             <span className="text-sm text-muted-foreground">
-              Delete {selected.length} transaction{selected.length === 1 ? "" : "s"}? Split
-              transactions also delete their parts; transfer legs also remove the transfer
-              link. This cannot be undone.
+              Delete {visibleSelected.length} transaction
+              {visibleSelected.length === 1 ? "" : "s"}? Split transactions also delete their parts;
+              transfer legs also remove the transfer link. This cannot be undone.
             </span>
           ) : null}
           <span className="ml-auto flex flex-wrap items-center gap-2">
             {confirming ? (
-                <form
-                  action={(formData) => {
-                    setAttemptNames(
-                      Object.fromEntries(selectedItems.map((e) => [e.id, e.name]))
-                    );
-                    deleteAction(formData);
-                  }}
-                >
-                <input type="hidden" name="entryIds" value={JSON.stringify(selected)} />
+              <form
+                action={(formData) => {
+                  setAttemptNames(Object.fromEntries(selectedItems.map((e) => [e.id, e.name])));
+                  deleteAction(formData);
+                }}
+              >
+                <input type="hidden" name="entryIds" value={JSON.stringify(visibleSelected)} />
                 <SubmitButton variant="destructive">
-                  Confirm delete ({selected.length})
+                  Confirm delete ({visibleSelected.length})
                 </SubmitButton>
               </form>
             ) : (
@@ -204,11 +209,7 @@ export function TransactionList({
                     {e.name}
                   </Link>
                   <div className="mt-0.5 flex flex-wrap items-center gap-1.5 text-xs text-muted-foreground">
-                    {e.categoryName ? (
-                      <span>{e.categoryName}</span>
-                    ) : (
-                      <span>Uncategorized</span>
-                    )}
+                    {e.categoryName ? <span>{e.categoryName}</span> : <span>Uncategorized</span>}
                     {e.merchant ? <span>· {e.merchant}</span> : null}
                     {e.tagIds.map((id) => (
                       <span key={id}>#{tagNames[id] ?? "tag"}</span>
@@ -242,9 +243,7 @@ export function TransactionList({
             }}
             onChange={() =>
               setSelected((prev) =>
-                allSelected
-                  ? deselectAllOnPage(prev, pageIds)
-                  : selectAllOnPage(prev, pageIds)
+                allSelected ? deselectAllOnPage(prev, pageIds) : selectAllOnPage(prev, pageIds)
               )
             }
           />
