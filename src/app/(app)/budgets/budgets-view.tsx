@@ -4,6 +4,7 @@ import { useState, useActionState } from "react";
 import Link from "next/link";
 import { setBudgetAction, removeBudgetAction } from "./actions";
 import { Card, Badge } from "@/components/ds/card";
+import { SetupPanel } from "@/components/ds/setup-panel";
 import { Field, FormError, Input } from "@/components/ds/form";
 import { SubmitButton } from "@/components/ds/submit-button";
 import { BudgetRings } from "@/components/finance/budget-rings";
@@ -145,14 +146,23 @@ export function BudgetsView({
           )}
         </Card>
 
-        <Card>
-          <h2 className="mb-3 text-base font-medium text-primary">Add / edit category budget</h2>
+        <SetupPanel
+          title="Add / edit category budget"
+          description="Select a category to establish or update its monthly limit."
+          complete={overall !== null || perCategory.length > 0}
+          summary={
+            overall !== null || perCategory.length > 0
+              ? `Overall cap ${overall ? fmt(overall.limitMinor) : "not set"} · ${perCategory.length} categor${perCategory.length === 1 ? "y" : "ies"} budgeted`
+              : ""
+          }
+          panelId="budget-setup-panel"
+        >
           <SetBudgetForm
             categories={categoriesWithoutBudget}
             hasCategories={perCategory.length > 0 || categoriesWithoutBudget.length > 0}
             currency={currency}
           />
-        </Card>
+        </SetupPanel>
       </div>
     </div>
   );
@@ -309,9 +319,6 @@ function SetBudgetForm({
   return (
     <form action={action} className="space-y-4">
       <FormError message={state?.ok === false ? state.error : undefined} />
-      <p className="text-xs text-muted-foreground">
-        Select a category to establish or update its monthly limit.
-      </p>
       <label className="block space-y-1 text-sm">
         <span className="font-medium">Category</span>
         <select

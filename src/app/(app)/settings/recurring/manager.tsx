@@ -8,6 +8,7 @@ import {
   skipNextOccurrenceAction
 } from "./actions";
 import { Card, Badge } from "@/components/ds/card";
+import { SetupPanel } from "@/components/ds/setup-panel";
 import { Field, FormError, Input, Select } from "@/components/ds/form";
 import { SubmitButton } from "@/components/ds/submit-button";
 import { ConfirmDialog } from "@/components/ds/dialog";
@@ -65,12 +66,28 @@ export function RecurringManager({
   accounts: Option[];
   categories: { id: string; name: string }[];
 }) {
+  const setupComplete = series.length > 0;
+  const activeCount = series.filter((s) => s.active).length;
+  const nextDue = [...series]
+    .map((s) => s.nextDue)
+    .sort()
+    .at(0);
+
   return (
     <div className="grid gap-6 lg:grid-cols-2">
-      <Card>
-        <h2 className="mb-3 text-base font-medium text-primary">New recurring series</h2>
+      <SetupPanel
+        title="New recurring series"
+        description="Bills and income posted automatically on a schedule — rent, salary, subscriptions."
+        complete={setupComplete}
+        summary={
+          setupComplete
+            ? `${series.length} series (${activeCount} active)${nextDue ? ` · next due ${nextDue}` : ""}`
+            : ""
+        }
+        panelId="recurring-setup-panel"
+      >
         <CreateForm accounts={accounts} categories={categories} />
-      </Card>
+      </SetupPanel>
       <Card>
         <h2 className="mb-3 text-base font-medium text-primary">Existing series</h2>
         {series.length === 0 ? (
