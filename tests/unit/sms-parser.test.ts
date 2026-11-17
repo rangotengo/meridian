@@ -89,3 +89,30 @@ describe("sms-parser currency exponents", () => {
     expect(amountTextToMinor("24,360.00", "NPR")).toBe(2436000);
   });
 });
+
+describe("sms-parser — wallets", () => {
+  it("parses an eSewa debit SMS", () => {
+    const text = `Your eSewa account 9850 has been debited by NPR 500.00 on 17/11/2026. Remarks: Payment to Bhatbhateni`;
+    const parsed = parseSms(text, "eSewa");
+    expect(parsed.kind).toBe("expense");
+    expect(parsed.amountMajor).toBe(500);
+    expect(parsed.amountMinor).toBe(50000);
+    expect(parsed.currency).toBe("NPR");
+    expect(parsed.date).toBe("2026-11-17");
+    expect(parsed.bankName).toBe("eSewa");
+    expect(parsed.accountDigits).toBe("9850");
+    expect(parsed.referenceId).toBeTruthy();
+  });
+
+  it("parses a Khalti credit SMS", () => {
+    const text = `Your Khalti account has been credited by NPR 1,250.00 on 17/11/2026. Remarks: Received from 98XXXXXXXX`;
+    const parsed = parseSms(text, "Khalti");
+    expect(parsed.kind).toBe("income");
+    expect(parsed.amountMajor).toBe(1250);
+    expect(parsed.amountMinor).toBe(125000);
+    expect(parsed.currency).toBe("NPR");
+    expect(parsed.date).toBe("2026-11-17");
+    expect(parsed.bankName).toBe("Khalti");
+    expect(parsed.referenceId).toBeTruthy();
+  });
+});

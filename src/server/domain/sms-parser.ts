@@ -39,6 +39,8 @@ const KNOWN_SENDER_BANKS: Record<string, string> = {
   hbl: "Himalayan Bank",
   scb: "Standard Chartered Bank",
   scbn: "Standard Chartered Bank",
+  esewa: "eSewa",
+  khalti: "Khalti",
   czbil: "Citizens Bank",
   mbl: "Machhapuchchhre Bank",
   adbl: "Agricultural Development Bank",
@@ -59,6 +61,8 @@ const KNOWN_BODY_BANKS = [
   "NMB Bank",
   "Himalayan Bank",
   "Standard Chartered",
+  "eSewa",
+  "Khalti",
   "Citizens Bank",
   "Machhapuchchhre Bank",
   "Nepal Bank"
@@ -199,8 +203,13 @@ export function parseSms(text: string, sender?: string | null): ParsedSmsResult 
   let accountNumber: string | null = null;
   let accountDigits: string | null = null;
 
+  // Explicit account keywords first: in "Your eSewa account 9850" the
+  // "Your <word>" branch would otherwise capture the bank name ("eSewa")
+  // and find no digits. The "Your" branch still handles "Your #88011052"
+  // and "Your 110##02167".
   const acctMatch =
-    clean.match(/(?:Your\s+#?|AC\s+|A\/C\s+|account\s+|acct\s+)([0-9A-Za-z#*]{4,})/i) ||
+    clean.match(/(?:AC\s+|A\/C\s+|account\s+|acct\s+)([0-9A-Za-z#*]{4,})/i) ||
+    clean.match(/Your\s+#?([0-9A-Za-z#*]{4,})/i) ||
     clean.match(/#([0-9A-Za-z#*]{4,})/i);
 
   if (acctMatch?.[1]) {

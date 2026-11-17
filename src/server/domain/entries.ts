@@ -136,6 +136,13 @@ export async function createTransactionEntry(
   return { entryId, duplicated: false };
 }
 
+export async function findEntryByExternalId(
+  exec: Executor,
+  input: Pick<TransactionEntryInput, "accountId" | "externalSource" | "externalId">
+): Promise<string | null> {
+  return findByExternalId(exec, input);
+}
+
 async function findByExternalId(
   exec: Executor,
   input: Pick<TransactionEntryInput, "accountId" | "externalSource" | "externalId">
