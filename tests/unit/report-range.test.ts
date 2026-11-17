@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
-import { resolveReportRange } from "@/lib/report-range";
+import { resolveReportRange, selectNetWorthInRange } from "@/lib/report-range";
 
-const base = { currentMonth: "2026-11" };
+const base = { currentMonth: "2026-11", today: "2026-11-17" };
 
 describe("resolveReportRange presets", () => {
   it("resolves monthly to the current month", () => {
@@ -59,9 +59,7 @@ describe("resolveReportRange custom", () => {
     expect(resolveReportRange({ ...base, from: "2026-10-01", to: "2026-09-01" }).key).toBe(
       "monthly"
     );
-    expect(resolveReportRange({ ...base, from: "banana", to: "2026-09-01" }).key).toBe(
-      "monthly"
-    );
+    expect(resolveReportRange({ ...base, from: "banana", to: "2026-09-01" }).key).toBe("monthly");
     expect(resolveReportRange({ ...base, from: "2026-09-01" }).key).toBe("monthly");
   });
 
@@ -76,5 +74,53 @@ describe("resolveReportRange custom", () => {
     expect(r.monthsBack).toBe(5);
     expect(r.previousFromMonth).toBe("2026-07");
     expect(r.previousToMonth).toBe("2026-08");
+  });
+});
+
+describe("resolveReportRange net worth coverage", () => {
+  it("fetches coverage back to range.from for a historical custom range", () => {
+    const r = resolveReportRange({ ...base, from: "2026-09-15", to: "2026-10-10" });
+    expect([r.from, r.to]).toEqual(["2026-09-01", "2026-10-31"]);
+    // Sep 1 -> Nov 17 inclusive: 30 + 31 + 17 days of coverage, so the
+    // series reaches back to the start of the range.
+    expect(r.netWorthDays).toBe(78);
+  });
+
+  it("never produces a negative day count for a custom range", () => {
+    // The old span math passed diffDays in the wrong order and produced
+    // -59 for Sep–Oct, which made the series come back empty and the
+    // headline read 0.
+    const r = resolveReportRange({ ...base, from: "2026-09-01", to: "2026-10-31" });
+    expect(r.netWorthDays).toBeGreaterThan(0);
+    expect(r.netWorthDays).toBe(78);
+  });
+
+  it("covers exactly the current month for the monthly preset", () => {
+    expect(resolveReportRange({ ...base, period: "monthly" }).netWorthDays).toBe(17);
+    expect(resolveReportRange({ ...base, period: "quarterly" }).netWorthDays).toBe(78);
+  });
+});
+
+describe("selectNetWorthInRange", () => {
+  const points = [
+    { date: "2026-08-31", valueMinor: 1000 },
+    { date: "2026-09-15", valueMinor: 100000 },
+    { date: "2026-10-31", valueMinor: 150000 },
+    { date: "2026-11-17", valueMinor: 999000 }
+  ];
+
+  it("keeps only points inside the range and picks the latest as the headline", () => {
+    const { points: inRange, latest } = selectNetWorthInRange(points, "2026-09-01", "2026-10-31");
+    expect(inRange).toEqual([
+      { date: "2026-09-15", valueMinor: 100000 },
+      { date: "2026-10-31", valueMinor: 150000 }
+    ]);
+    expect(latest).toEqual({ date: "2026-10-31", valueMinor: 150000 });
+  });
+
+  it("returns null when no snapshot falls inside the range", () => {
+    const { points: inRange, latest } = selectNetWorthInRange(points, "2026-09-01", "2026-09-14");
+    expect(inRange).toEqual([]);
+    expect(latest).toBeNull();
   });
 });

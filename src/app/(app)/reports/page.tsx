@@ -14,9 +14,9 @@ import { Amount } from "@/components/finance/amount";
 import { CategoryDonut } from "@/components/finance/category-donut";
 import { FxIssuesAlert } from "@/components/finance/fx-issues-alert";
 import { SpendingHeatmap } from "@/components/finance/spending-heatmap";
-import { fmtMoney, fmtMonth } from "@/lib/format";
+import { fmtDate, fmtMoney, fmtMonth } from "@/lib/format";
 import { monthKeyIn, todayIn } from "@/lib/datetime";
-import { REPORT_PERIODS, resolveReportRange } from "@/lib/report-range";
+import { REPORT_PERIODS, resolveReportRange, selectNetWorthInRange } from "@/lib/report-range";
 import { PrintButton } from "./print-button";
 import { cn } from "@/lib/utils";
 
@@ -59,13 +59,10 @@ function DeltaLine({
       ) : (
         <span
           className={`font-semibold tabular-nums ${
-            deltaMinor >= 0
-              ? "text-emerald-600 dark:text-emerald-400"
-              : "text-destructive"
+            deltaMinor >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-destructive"
           }`}
         >
-          {deltaMinor >= 0 ? "+" : ""}
-          {fmtMoney(deltaMinor, currency, "en", "always")} ({formatPct(pct)})
+          {fmtMoney(deltaMinor, currency, "en", "exceptZero")} ({formatPct(pct)})
         </span>
       )}
     </p>
@@ -92,24 +89,32 @@ export default async function ReportsPage({ searchParams }: { searchParams: Sear
     from: sp.from,
     to: sp.to,
     compare,
-    currentMonth
+    currentMonth,
+    today: todayIn(family.timezone)
   });
 
   const [seriesResult, flowsResult, spendResult, heatmapResult] = await Promise.all([
-    netWorthSeries(db, family, actor.userId, range.days),
+    netWorthSeries(db, family, actor.userId, range.netWorthDays),
     incomeExpenseSeries(db, family, actor.userId, range.monthsBack),
     spendingByCategory(db, family, actor.userId, { from: range.from, to: range.to }),
     dailySpendingSeries(db, family, actor.userId, 365)
   ]);
-  const series = seriesResult.points;
+  // Net worth is constrained to the chosen dates: the fetch reaches
+  // back to range.from, and the headline is the latest snapshot inside
+  // the range — labelled as-of its date — never today's value for a
+  // historical range.
+  const { latest: latestNetWorthPoint } = selectNetWorthInRange(
+    seriesResult.points,
+    range.from,
+    range.to
+  );
   const allFlows = flowsResult.flows;
   const flows = allFlows.filter(
     (flow) => flow.monthKey >= range.fromMonth && flow.monthKey <= range.toMonth
   );
   const prevFlows = compare
     ? allFlows.filter(
-        (flow) =>
-          flow.monthKey >= range.previousFromMonth && flow.monthKey <= range.previousToMonth
+        (flow) => flow.monthKey >= range.previousFromMonth && flow.monthKey <= range.previousToMonth
       )
     : [];
   const spend = spendResult.categories;
@@ -142,7 +147,6 @@ export default async function ReportsPage({ searchParams }: { searchParams: Sear
   const latestNet = latestIncome - latestExpense;
   const previousNet = previous.income - previous.expense;
   const topSpend = spend[0];
-  const latestNetWorth = series[series.length - 1]?.valueMinor ?? 0;
 
   // Links that keep the current range/compare selection.
   const pageUrl = (patch: Record<string, string | undefined>) => {
@@ -269,10 +273,7 @@ export default async function ReportsPage({ searchParams }: { searchParams: Sear
             <span className="text-muted-foreground">
               Comparing with {range.previousFrom} &ndash; {range.previousTo}
             </span>
-            <a
-              href={pageUrl({ compare: undefined })}
-              className="text-primary hover:underline"
-            >
+            <a href={pageUrl({ compare: undefined })} className="text-primary hover:underline">
               Turn off comparison
             </a>
           </>
@@ -332,11 +333,21 @@ export default async function ReportsPage({ searchParams }: { searchParams: Sear
         </Card>
         <Card>
           <p className="text-sm text-muted-foreground">Net worth</p>
-          <p className="tabular mt-2 text-2xl font-semibold">
-            <Amount minor={latestNetWorth} currency={family.currency} masked={privacy} />
-          </p>
+          {latestNetWorthPoint ? (
+            <p className="tabular mt-2 text-2xl font-semibold">
+              <Amount
+                minor={latestNetWorthPoint.valueMinor}
+                currency={family.currency}
+                masked={privacy}
+              />
+            </p>
+          ) : (
+            <p className="tabular mt-2 text-2xl font-semibold text-muted-foreground">—</p>
+          )}
           <p className="mt-1 text-sm text-muted-foreground">
-            {topSpend ? `Top category: ${topSpend.name}` : "Add transactions to see trends"}
+            {latestNetWorthPoint
+              ? `As of ${fmtDate(latestNetWorthPoint.date)}${topSpend ? ` · Top category: ${topSpend.name}` : ""}`
+              : "Add transactions to see trends"}
           </p>
         </Card>
       </div>
