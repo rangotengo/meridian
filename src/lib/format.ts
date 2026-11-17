@@ -18,6 +18,16 @@ export function fmtMoney(
   }).format(minor / 10 ** exp);
 }
 
+/**
+ * Signed money for deltas: exactly one sign mechanism. Positive renders
+ * "+…", negative renders "−…", zero renders with no sign. Callers must NOT
+ * add their own "+" prefix — combining a manual prefix with a signed
+ * format rendered "++…" (PR #22 review).
+ */
+export function fmtSignedMoney(minor: number, currency: string, locale = "en"): string {
+  return fmtMoney(minor, currency, locale, "exceptZero");
+}
+
 function currencyExponent(currency: string): number {
   try {
     const opts = Intl.NumberFormat("en", { style: "currency", currency }).resolvedOptions();

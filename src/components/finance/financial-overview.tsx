@@ -10,8 +10,9 @@ import {
 } from "@/components/ui/chart";
 import { Area, AreaChart, CartesianGrid, XAxis, YAxis, type DotProps } from "recharts";
 import { useDashboardData } from "@/components/finance/dashboard-data";
-import { fmtMoney } from "@/lib/format";
+import { fmtMoney, fmtSignedMoney } from "@/lib/format";
 import { minorToMajor } from "@/lib/money";
+import { netWorthChange } from "@/lib/period-comparison";
 
 function SquareDot({
   cx,
@@ -41,8 +42,14 @@ const chartConfig: ChartConfig = {
   }
 };
 
+function formatPct(pct: number | null): string {
+  if (pct === null || !Number.isFinite(pct)) return "—";
+  return `${pct >= 0 ? "+" : ""}${(pct * 100).toFixed(1)}%`;
+}
+
 export function FinancialOverview() {
-  const { series, currency } = useDashboardData();
+  const { series, currency, netWorthMinor, assetsMinor, liabilitiesMinor, privacy } =
+    useDashboardData();
 
   const formattedData = useMemo(() => {
     if (!series || series.length === 0) return [];
@@ -53,10 +60,43 @@ export function FinancialOverview() {
     }));
   }, [series, currency]);
 
+  const change = useMemo(() => netWorthChange(series), [series]);
+  const startLabel = change
+    ? new Date(change.startDate).toLocaleDateString(undefined, {
+        month: "short",
+        day: "numeric"
+      })
+    : null;
+
   return (
     <Card className="col-span-full">
       <CardHeader>
         <CardTitle>Net Worth History</CardTitle>
+        <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 pt-1">
+          <span className="text-2xl font-bold tabular-nums">
+            {privacy ? "••••••" : fmtMoney(netWorthMinor, currency)}
+          </span>
+          {change && (
+            <span
+              className={`text-sm font-semibold tabular-nums ${
+                change.deltaMinor >= 0
+                  ? "text-emerald-600 dark:text-emerald-400"
+                  : "text-destructive"
+              }`}
+            >
+              {privacy
+                ? "••••"
+                : `${fmtSignedMoney(change.deltaMinor, currency)} (${formatPct(change.pct)})`}
+              <span className="ml-1 text-xs font-normal text-muted-foreground">
+                vs {startLabel}
+              </span>
+            </span>
+          )}
+        </div>
+        <p className="text-xs text-muted-foreground">
+          Assets {privacy ? "••••" : fmtMoney(assetsMinor, currency)}
+          {" · "}Liabilities {privacy ? "••••" : fmtMoney(liabilitiesMinor, currency)}
+        </p>
       </CardHeader>
       <CardContent>
         {formattedData.length === 0 ? (
