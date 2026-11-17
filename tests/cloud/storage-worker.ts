@@ -267,7 +267,11 @@ export class StorageProbe {
           name: "Principal"
         });
         await switchBalanceTracking(exec, actor, { accountId, to: "transactions" });
-        await switchBalanceTracking(exec, actor, { accountId, to: "valuation" });
+        await switchBalanceTracking(exec, actor, {
+          accountId,
+          to: "valuation",
+          acknowledgeDataLoss: true
+        });
         await recordValuation(exec, actor, {
           accountId,
           date: isoDaysAgo(3),
@@ -356,7 +360,11 @@ export class StorageProbe {
           bankEntry.entryId,
           adjustmentId
         );
-        await switchBalanceTracking(exec, actor, { accountId, to: "valuation" });
+        await switchBalanceTracking(exec, actor, {
+          accountId,
+          to: "valuation",
+          acknowledgeDataLoss: true
+        });
         await recordValuation(exec, actor, {
           accountId,
           date: isoDaysAgo(3),

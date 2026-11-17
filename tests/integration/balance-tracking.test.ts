@@ -306,7 +306,8 @@ describe("balance tracking: the switch", () => {
 
     const result = await trackingSvc.switchBalanceTracking(db(), actorOf(user), {
       accountId,
-      to: "valuation"
+      to: "valuation",
+      acknowledgeDataLoss: true
     });
     expect(result.resultingBalanceMinor).toBe(0);
     expect((await latestBalance(accountId))?.balanceMinor).toBe(0);
@@ -588,7 +589,8 @@ describe("balance tracking: valuation precedence", () => {
     const preview = await trackingSvc.previewBalanceTracking(db(), actor, accountId, "valuation");
     const switched = await trackingSvc.switchBalanceTracking(db(), actor, {
       accountId,
-      to: "valuation"
+      to: "valuation",
+      acknowledgeDataLoss: true
     });
     expect(preview.resultingBalanceMinor).toBe(2000);
     expect(switched.resultingBalanceMinor).toBe(preview.resultingBalanceMinor);
@@ -722,7 +724,8 @@ describe("balance tracking: normalized conversion (review round)", () => {
     for (const date of ["2026-02-01", "2026-03-01"]) {
       await trackingSvc.switchBalanceTracking(db(), actorOf(user), {
         accountId,
-        to: "valuation"
+        to: "valuation",
+        acknowledgeDataLoss: true
       });
       await valuationsSvc.recordValuation(db(), actorOf(user), {
         accountId,
@@ -853,7 +856,8 @@ describe("balance tracking: report flows exclude the opening adjustment", () => 
     // reports must still see only the genuine 25,000.
     await trackingSvc.switchBalanceTracking(db(), actorOf(user), {
       accountId,
-      to: "valuation"
+      to: "valuation",
+      acknowledgeDataLoss: true
     });
     await valuationsSvc.recordValuation(db(), actorOf(user), {
       accountId,
@@ -1111,7 +1115,8 @@ describe("balance tracking: backdated conversion after a round trip (review roun
     // show 100,000.
     await trackingSvc.switchBalanceTracking(db(), actorOf(user), {
       accountId,
-      to: "valuation"
+      to: "valuation",
+      acknowledgeDataLoss: true
     });
     await valuationsSvc.recordValuation(db(), actorOf(user), {
       accountId,
@@ -1172,7 +1177,8 @@ describe("balance tracking: backdated conversion after a round trip (review roun
     // A third round trip must not drift either date.
     await trackingSvc.switchBalanceTracking(db(), actorOf(user), {
       accountId,
-      to: "valuation"
+      to: "valuation",
+      acknowledgeDataLoss: true
     });
     await valuationsSvc.recordValuation(db(), actorOf(user), {
       accountId,
@@ -1221,7 +1227,8 @@ describe("balance tracking: backdated conversion after a round trip (review roun
 
     await trackingSvc.switchBalanceTracking(db(), actorOf(user), {
       accountId,
-      to: "valuation"
+      to: "valuation",
+      acknowledgeDataLoss: true
     });
     await valuationsSvc.recordValuation(db(), actorOf(user), {
       accountId,
@@ -1296,7 +1303,8 @@ describe("balance tracking: backdated conversion after a round trip (review roun
 
     await trackingSvc.switchBalanceTracking(db(), actorOf(user), {
       accountId,
-      to: "valuation"
+      to: "valuation",
+      acknowledgeDataLoss: true
     });
     await valuationsSvc.recordValuation(db(), actorOf(user), {
       accountId,
@@ -1375,7 +1383,8 @@ describe("balance tracking: backdated conversion after a round trip (review roun
     // conversion date-correct after the round trip.
     await trackingSvc.switchBalanceTracking(db(), actorOf(target), {
       accountId: restored!.id,
-      to: "valuation"
+      to: "valuation",
+      acknowledgeDataLoss: true
     });
     await valuationsSvc.recordValuation(db(), actorOf(target), {
       accountId: restored!.id,
@@ -1538,7 +1547,11 @@ describe("balance tracking: restatement must never unbalance a transfer (review 
     type: "other_asset" | "other_liability"
   ) {
     const actor = actorOf(user);
-    await trackingSvc.switchBalanceTracking(db(), actor, { accountId, to: "valuation" });
+    await trackingSvc.switchBalanceTracking(db(), actor, {
+      accountId,
+      to: "valuation",
+      acknowledgeDataLoss: true
+    });
     await valuationsSvc.recordValuation(db(), actor, {
       accountId,
       date: daysAgo(3),
@@ -1697,7 +1710,11 @@ describe("balance tracking: restatement must never unbalance a transfer (review 
 
     // A later anchor: the leg is in-window, so the plug absorbs it —
     // the switch succeeds and the entry itself is never modified.
-    await trackingSvc.switchBalanceTracking(db(), actor, { accountId, to: "valuation" });
+    await trackingSvc.switchBalanceTracking(db(), actor, {
+      accountId,
+      to: "valuation",
+      acknowledgeDataLoss: true
+    });
     await valuationsSvc.recordValuation(db(), actor, {
       accountId,
       date: daysAgo(1),

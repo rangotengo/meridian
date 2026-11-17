@@ -48,7 +48,11 @@ it.each(["link", "switch"] as const)(
       name: "Funding",
       amountLedgerMinor: 1000
     });
-    await switchBalanceTracking(db(), actor, { accountId: loan, to: "valuation" });
+    await switchBalanceTracking(db(), actor, {
+      accountId: loan,
+      to: "valuation",
+      acknowledgeDataLoss: true
+    });
     await recordValuation(db(), actor, {
       accountId: loan,
       date: daysAgo(3),

@@ -25,3 +25,13 @@ test("transactions render at 390px without horizontal overflow", async ({ page }
   await expect(page.locator("a:visible", { hasText: getData().entry.name }).first()).toBeVisible();
   await expectNoHorizontalOverflow(page);
 });
+
+test("accounts render the real balance at 390px without horizontal overflow", async ({ page }) => {
+  await page.goto("/accounts");
+  // Seeded E2E Checking: $0 opening + $120 expense = -$120.00. A $0.00
+  // rendering here would be the reported zero-balance bug.
+  await expect(
+    page.locator("a:visible", { hasText: getData().accountA.name }).first()
+  ).toContainText("-$120.00");
+  await expectNoHorizontalOverflow(page);
+});

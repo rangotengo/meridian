@@ -266,6 +266,15 @@ function BalanceTrackingPanel({
   const toTransactions = preview.to === "transactions";
   const laterValuations = Math.max(0, preview.valuationCount - 1);
   const blocked = toTransactions && (preview.meroshareLinked || preview.holdingsManaged);
+  // Switching back with no valuations left discards a nonzero balance:
+  // the earlier switch removed the valuations, so the balance falls back
+  // to the opening balance. The dialog must ask for it explicitly; the
+  // server rejects the switch without the acknowledgement.
+  const destructiveFlipBack =
+    !toTransactions &&
+    preview.valuationCount === 0 &&
+    preview.currentBalanceMinor !== 0 &&
+    preview.resultingBalanceMinor !== preview.currentBalanceMinor;
 
   return (
     <form action={action} className="space-y-4">
@@ -320,6 +329,33 @@ function BalanceTrackingPanel({
           — until you record a new valuation.
         </p>
       )}
+
+      {destructiveFlipBack ? (
+        <div className="space-y-2 rounded-lg border border-border p-3">
+          <p className="text-sm font-medium text-destructive">
+            This switch will discard the current balance of{" "}
+            {fmtMoney(preview.currentBalanceMinor, currency)}.
+          </p>
+          <p className="text-sm text-muted-foreground">
+            This account has no valuations left — the earlier switch removed them — so the balance
+            will fall back to its opening balance and cannot be restored automatically. You will
+            need to record a new valuation afterwards.
+          </p>
+          <label className="flex items-start gap-2 text-sm">
+            <input
+              type="checkbox"
+              name="acknowledgeDataLoss"
+              value="true"
+              required
+              className="mt-0.5"
+            />
+            <span>
+              I understand the balance will be discarded and the removed valuations cannot be
+              restored automatically.
+            </span>
+          </label>
+        </div>
+      ) : null}
 
       {blocked ? (
         <p className="text-sm text-destructive">

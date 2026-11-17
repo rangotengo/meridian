@@ -167,7 +167,12 @@ export async function shareAccountAction(
 
 const switchTrackingSchema = z.object({
   accountId: z.string().uuid(),
-  to: z.enum(["valuation", "transactions"])
+  to: z.enum(["valuation", "transactions"]),
+  // Sent as "true" only by the dialog's explicit acknowledgement checkbox,
+  // shown when switching back to valuation tracking would discard a
+  // nonzero balance. Absent otherwise; the domain rejects the switch
+  // without it.
+  acknowledgeDataLoss: z.string().optional()
 });
 
 export async function switchBalanceTrackingAction(
@@ -183,7 +188,8 @@ export async function switchBalanceTrackingAction(
     await withTransaction((tx) =>
       balanceTrackingSvc.switchBalanceTracking(tx, actor, {
         accountId: input.accountId,
-        to: input.to
+        to: input.to,
+        acknowledgeDataLoss: input.acknowledgeDataLoss === "true"
       })
     );
     revalidatePath("/accounts");

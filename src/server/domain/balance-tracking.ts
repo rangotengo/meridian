@@ -1,4 +1,4 @@
-import { and, asc, eq, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import type { Executor } from "../db/client";
 import { usesCloudStorage } from "../db/dialect";
 import { accounts, entries, meroShareAccounts, transactions, valuations } from "../db/schema";
@@ -27,6 +27,14 @@ import { accountHasHoldings, lockHoldingsAccount } from "./holdings";
  * valuation → transactions converts the earliest valuation into the
  * opening transaction and removes the later ones — they are balance
  * snapshots and have no meaning as transactions.
+ *
+ * The reverse switch is lossy by the same token: the valuations the
+ * earlier switch removed are gone, so switching back with none left
+ * falls back to the opening balance. That switch therefore requires
+ * an explicit acknowledgement (acknowledgeDataLoss) whenever it would
+ * discard a nonzero balance, and the removed valuations' dates,
+ * amounts, names and kinds are preserved in this switch's audit event
+ * so the loss is recoverable from the audit log.
  *
  * The conversion is a NORMALIZED anchor, not a raw sign flip. A valuation
  * states the account's whole balance on its date, so the converted entry
@@ -438,7 +446,17 @@ export async function previewBalanceTracking(
 export async function switchBalanceTracking(
   exec: Executor,
   actor: Actor,
-  input: { accountId: string; to: BalanceTracking }
+  input: {
+    accountId: string;
+    to: BalanceTracking;
+    /**
+     * Required only when switching back to valuation tracking would
+     * discard a nonzero balance because no valuations remain. The
+     * dialog asks for it explicitly; direct callers must pass it
+     * deliberately — its absence is a rejection, not a default.
+     */
+    acknowledgeDataLoss?: boolean;
+  }
 ): Promise<BalanceTrackingSwitchResult> {
   return exec.transaction(async (tx) => {
     // Serialize against every other writer of this account's balance
@@ -472,9 +490,33 @@ export async function switchBalanceTracking(
       );
     }
 
+    if (from === "transactions" && input.to === "valuation" && !input.acknowledgeDataLoss) {
+      const valuationEntries = await listValuationEntries(tx, account.id);
+      const current = await latestBalancesFor(tx, [account.id]);
+      const currentBalanceMinor =
+        current.get(account.id)?.balanceMinor ?? account.openingBalanceMinor;
+      if (valuationEntries.length === 0 && currentBalanceMinor !== 0) {
+        throw errors.validation(
+          "Switching back to valuation tracking would discard this account's transaction-tracked balance because it has no valuations left — the balance would fall back to its opening balance. The valuations removed by the earlier switch cannot be restored automatically. Record a new valuation after switching, or keep the account on transaction tracking to preserve its balance."
+        );
+      }
+    }
+
     let convertedValuationDate: string | null = null;
     let openingTransactionAmountMinor: number | null = null;
     let removedValuations = 0;
+    let convertedValuation: {
+      date: string;
+      amountMinor: number;
+      name: string;
+      kind: string | null;
+    } | null = null;
+    let removedValuationsDetail: Array<{
+      date: string;
+      amountMinor: number;
+      name: string;
+      kind: string | null;
+    }> = [];
     let restatedOpeningAdjustments = 0;
     let restatedOpeningTotalMinor = 0;
 
@@ -483,8 +525,33 @@ export async function switchBalanceTracking(
       // The switch executes exactly the plan the preview showed.
       const plan = await planConversionToTransactions(tx, account, valuationEntries);
       const [earliest, ...later] = valuationEntries;
+      // Preserve what this switch removes, with kinds, so the loss is
+      // recoverable from the audit event below: the converted anchor's
+      // original valuation and every later valuation it deletes.
+      const valuationKinds = new Map(
+        (valuationEntries.length > 0
+          ? await tx
+              .select({ entryId: valuations.entryId, kind: valuations.kind })
+              .from(valuations)
+              .where(
+                inArray(
+                  valuations.entryId,
+                  valuationEntries.map((e) => e.id)
+                )
+              )
+          : []
+        ).map((r) => [r.entryId, r.kind] as const)
+      );
+      const valuationDetail = (entry: ValuationEntryRow) => ({
+        date: entry.date,
+        amountMinor: entry.amountMinor,
+        name: entry.name,
+        kind: valuationKinds.get(entry.id) ?? null
+      });
+      removedValuationsDetail = later.map(valuationDetail);
       if (earliest) {
         convertedValuationDate = earliest.date;
+        convertedValuation = valuationDetail(earliest);
         openingTransactionAmountMinor = plan.openingTransactionAmountMinor;
         // Convert in place: the entry keeps its date and name, but its
         // amount becomes the plan's reconciliation plug — the amount
@@ -552,8 +619,10 @@ export async function switchBalanceTracking(
         from,
         to: input.to,
         convertedValuationDate,
+        convertedValuation,
         openingTransactionAmountMinor,
         removedValuations,
+        removedValuationsDetail,
         restatedOpeningAdjustments,
         restatedOpeningTotalMinor,
         resultingBalanceMinor
