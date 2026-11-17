@@ -27,12 +27,15 @@ function PlanSummary({
   label,
   plan,
   currency,
-  highlight
+  highlight,
+  privacy
 }: {
   label: string;
   plan: PayoffPlan;
   currency: string;
   highlight?: boolean;
+  /** When true, money amounts render masked, like every other surface. */
+  privacy: boolean;
 }) {
   return (
     <div
@@ -55,13 +58,21 @@ function PlanSummary({
           <div className="flex justify-between gap-2">
             <dt className="text-muted-foreground">Total interest</dt>
             <dd className="font-medium tabular-nums">
-              {plan.totalInterestMinor !== null ? fmtMoney(plan.totalInterestMinor, currency) : "—"}
+              {privacy
+                ? "••••"
+                : plan.totalInterestMinor !== null
+                  ? fmtMoney(plan.totalInterestMinor, currency)
+                  : "—"}
             </dd>
           </div>
           <div className="flex justify-between gap-2">
             <dt className="text-muted-foreground">Total paid</dt>
             <dd className="font-medium tabular-nums">
-              {plan.totalPaidMinor !== null ? fmtMoney(plan.totalPaidMinor, currency) : "—"}
+              {privacy
+                ? "••••"
+                : plan.totalPaidMinor !== null
+                  ? fmtMoney(plan.totalPaidMinor, currency)
+                  : "—"}
             </dd>
           </div>
         </dl>
@@ -109,7 +120,7 @@ function LoanCard({
       : null;
 
   return (
-    <Card className="space-y-4 p-4">
+    <Card className="space-y-4 p-4" data-testid={`loan-${loan.id}`}>
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div>
           <p className="font-medium">{loan.name}</p>
@@ -193,21 +204,25 @@ function LoanCard({
                   label="Current payment"
                   plan={comparison.base}
                   currency={loan.currency}
+                  privacy={privacy}
                 />
                 <PlanSummary
                   label="With extra payment"
                   plan={comparison.withExtra}
                   currency={loan.currency}
                   highlight
+                  privacy={privacy}
                 />
               </div>
               {parsed.ok &&
               comparison.interestSavedMinor !== null &&
               comparison.monthsSaved !== null ? (
                 <p className="text-sm">
-                  The extra {fmtMoney(parsed.extra, loan.currency)}/month saves{" "}
-                  <strong>{fmtMoney(comparison.interestSavedMinor, loan.currency)}</strong> of
-                  interest and <strong>{comparison.monthsSaved} months</strong>.
+                  The extra {privacy ? "••••" : fmtMoney(parsed.extra, loan.currency)}/month saves{" "}
+                  <strong>
+                    {privacy ? "••••" : fmtMoney(comparison.interestSavedMinor, loan.currency)}
+                  </strong>{" "}
+                  of interest and <strong>{comparison.monthsSaved} months</strong>.
                 </p>
               ) : (
                 <p className="text-sm text-muted-foreground">
