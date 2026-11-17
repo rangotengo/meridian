@@ -149,12 +149,20 @@ export default async function TransactionsPage({ searchParams }: { searchParams:
       <PageHeader
         title="Transactions"
         actions={
-          <Link
-            href="/transactions/new"
-            className="inline-flex h-8 items-center rounded-lg bg-primary px-3 text-sm font-medium text-primary-foreground"
-          >
-            New transaction
-          </Link>
+          <div className="flex items-center gap-2">
+            <Link
+              href="/transactions/import-csv"
+              className="inline-flex h-8 items-center rounded-lg border border-border px-3 text-sm font-medium"
+            >
+              Import CSV
+            </Link>
+            <Link
+              href="/transactions/new"
+              className="inline-flex h-8 items-center rounded-lg bg-primary px-3 text-sm font-medium text-primary-foreground"
+            >
+              New transaction
+            </Link>
+          </div>
         }
       />
 
