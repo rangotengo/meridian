@@ -3,7 +3,9 @@ import { todayIn } from "@/lib/datetime";
 import { getDb } from "@/server/db/client";
 import { listAccountsForActor } from "@/server/domain/accounts";
 import { listCategories } from "@/server/domain/categories";
+import { listEntriesPage } from "@/server/domain/entries";
 import { listTags } from "@/server/domain/tags";
+import { recentCategories, recentPayees } from "@/lib/recent-transactions";
 import { Card, PageHeader } from "@/components/ds/card";
 import { QuickAddForm } from "./form";
 
@@ -13,10 +15,11 @@ export default async function QuickAddPage() {
   const actor = await requireVerifiedActor();
   const family = await currentFamily(actor);
   const db = getDb();
-  const [accounts, categories, tags] = await Promise.all([
+  const [accounts, categories, tags, recent] = await Promise.all([
     listAccountsForActor(db, actor),
     listCategories(db, actor.familyId),
-    listTags(db, actor.familyId)
+    listTags(db, actor.familyId),
+    listEntriesPage(db, actor, { limit: 50 })
   ]);
 
   return (
@@ -29,6 +32,8 @@ export default async function QuickAddPage() {
             .map((a) => ({ id: a.id, name: a.name, currency: a.currency }))}
           categories={categories.map((c) => ({ id: c.id, name: c.name }))}
           tags={tags.map((t) => ({ id: t.id, name: t.name }))}
+          recentPayees={recentPayees(recent.items)}
+          recentCategories={recentCategories(recent.items)}
           today={todayIn(family.timezone)}
         />
       </Card>
