@@ -1,19 +1,18 @@
 import Link from "next/link";
 import { requireVerifiedActor } from "@/server/auth/context";
 import { getDb } from "@/server/db/client";
-import { listEntriesPage, type EntryListItem } from "@/server/domain/entries";
+import { listEntriesPage } from "@/server/domain/entries";
 import { listAccountsForActor } from "@/server/domain/accounts";
 import { listCategories } from "@/server/domain/categories";
 import { listTags } from "@/server/domain/tags";
 import { getUserPrivacyMode } from "@/server/domain/users";
 import { listSavedFilters } from "@/server/domain/saved-filters";
 import { Card, EmptyState, PageHeader } from "@/components/ds/card";
-import { Amount } from "@/components/finance/amount";
-import { fmtDate } from "@/lib/format";
 import { isIsoDate } from "@/lib/datetime";
 import { Select, Input } from "@/components/ds/form";
 import { SubmitButton } from "@/components/ds/submit-button";
 import { SavedFilterBar } from "./saved-filter-bar";
+import { TransactionList } from "./transaction-list";
 
 export const metadata = { title: "Transactions" };
 
@@ -90,6 +89,12 @@ export default async function TransactionsPage({ searchParams }: { searchParams:
   );
 
   const tagNameById = new Map(tags.map((t) => [t.id, t.name]));
+
+  // Selection in TransactionList is scoped to the visible page: the list
+  // remounts (fresh selection) whenever the filters or the page cursor
+  // change, so a cross-page selection can never grow past the 25 ids the
+  // bulk-delete action accepts (see transaction-list.tsx).
+  const listKey = JSON.stringify({ ...currentParams, cursor: cursorRaw ?? "", dir: direction });
 
   const removeParamUrl = (removeKey: string) => {
     const params = new URLSearchParams();
@@ -358,99 +363,13 @@ export default async function TransactionsPage({ searchParams }: { searchParams:
           hint="Try clearing the filters or record a new transaction."
         />
       ) : (
-        <>
-          {/* Desktop: full table. The 640px minimum width would push the
-              amount column off-screen on phones, so small screens get a
-              stacked list instead (same data, same pagination). */}
-          <Card className="hidden overflow-x-auto p-0 ring-1 ring-foreground/10 sm:block">
-            <table className="w-full min-w-160 text-sm">
-              <thead>
-                <tr className="border-b border-border text-left text-xs uppercase tracking-wide text-muted-foreground">
-                  <th scope="col" className="px-4 py-3 font-medium">
-                    Date
-                  </th>
-                  <th scope="col" className="px-4 py-3 font-medium">
-                    Description
-                  </th>
-                  <th scope="col" className="px-4 py-3 font-medium">
-                    Account
-                  </th>
-                  <th scope="col" className="px-4 py-3 text-right font-medium">
-                    Amount
-                  </th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-border">
-                {page.items.map((e: EntryListItem) => (
-                  <tr key={e.id} className="transition-colors hover:bg-muted/50">
-                    <td className="whitespace-nowrap px-4 py-3 text-muted-foreground">
-                      {fmtDate(e.date)}
-                    </td>
-                    <td className="px-4 py-3">
-                      <Link href={`/transactions/${e.id}`} className="font-medium hover:underline">
-                        {e.transferId ? <span aria-hidden>⇄ </span> : null}
-                        {e.name}
-                      </Link>
-                      <div className="mt-0.5 flex flex-wrap items-center gap-1.5 text-xs text-muted-foreground">
-                        {e.categoryName ? (
-                          <span>{e.categoryName}</span>
-                        ) : (
-                          <span>Uncategorized</span>
-                        )}
-                        {e.merchant ? <span>· {e.merchant}</span> : null}
-                        {e.tagIds.map((id) => (
-                          <span key={id}>#{tagNameById.get(id) ?? "tag"}</span>
-                        ))}
-                      </div>
-                    </td>
-                    <td className="px-4 py-3 text-muted-foreground">{e.accountName}</td>
-                    <td className="px-4 py-3 text-right">
-                      <Amount
-                        minor={-e.amountMinor}
-                        currency={e.currency}
-                        masked={privacy}
-                        signed
-                        colorize
-                      />
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-            {pagination}
-          </Card>
-          <Card className="p-0 ring-1 ring-foreground/10 sm:hidden">
-            <ul className="divide-y divide-border">
-              {page.items.map((e: EntryListItem) => (
-                <li key={e.id}>
-                  <Link
-                    href={`/transactions/${e.id}`}
-                    className="flex items-start justify-between gap-3 px-4 py-3 transition-colors hover:bg-muted/50"
-                  >
-                    <span className="min-w-0">
-                      <span className="block truncate text-sm font-medium">
-                        {e.transferId ? <span aria-hidden>⇄ </span> : null}
-                        {e.name}
-                      </span>
-                      <span className="mt-0.5 block truncate text-xs text-muted-foreground">
-                        {fmtDate(e.date)} · {e.accountName} · {e.categoryName ?? "Uncategorized"}
-                      </span>
-                    </span>
-                    <Amount
-                      minor={-e.amountMinor}
-                      currency={e.currency}
-                      masked={privacy}
-                      signed
-                      colorize
-                      className="shrink-0 text-sm"
-                    />
-                  </Link>
-                </li>
-              ))}
-            </ul>
-            {pagination}
-          </Card>
-        </>
+        <TransactionList
+          key={listKey}
+          items={page.items}
+          privacy={privacy}
+          tagNames={Object.fromEntries(tagNameById)}
+          pagination={pagination}
+        />
       )}
     </div>
   );
