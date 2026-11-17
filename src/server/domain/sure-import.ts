@@ -1,6 +1,6 @@
 import { usesCloudStorage } from "@/server/db/dialect";
 import { inflateRawSync } from "node:zlib";
-import { eq, sql } from "drizzle-orm";
+import { and, desc, eq, sql } from "drizzle-orm";
 import type { Executor } from "../db/client";
 import { chunkRows } from "../db/params";
 import {
@@ -731,4 +731,39 @@ function readUInt32(bytes: Uint8Array, offset: number): number {
       (bytes[offset + 3]! << 24)) >>>
     0
   );
+}
+
+export type SureImportStatus = {
+  /** True once a Sure import has been recorded for the family. */
+  imported: boolean;
+  accounts: number;
+  transactions: number;
+};
+
+/**
+ * Whether this family arrived via a Sure import, read from the audit event
+ * the import records (with its counts). Used by the guided-setup panel on
+ * the data page: the panel collapses once an import exists.
+ */
+export async function sureImportStatus(
+  exec: Executor,
+  familyId: string
+): Promise<SureImportStatus> {
+  const [row] = await exec
+    .select({ metadata: auditEvents.metadata })
+    .from(auditEvents)
+    .where(
+      and(
+        eq(auditEvents.familyId, familyId),
+        eq(auditEvents.action, "family.imported_from_sure")
+      )
+    )
+    .orderBy(desc(auditEvents.createdAt))
+    .limit(1);
+  const metadata = (row?.metadata ?? {}) as Record<string, unknown>;
+  const accounts =
+    typeof metadata.accounts === "number" ? metadata.accounts : 0;
+  const transactions =
+    typeof metadata.transactions === "number" ? metadata.transactions : 0;
+  return { imported: Boolean(row), accounts, transactions };
 }

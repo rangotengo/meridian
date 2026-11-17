@@ -13,6 +13,7 @@ import { Alert } from "@/components/ds/card";
 import { Field, FormError, Input, Select } from "@/components/ds/form";
 import { SubmitButton } from "@/components/ds/submit-button";
 import { ConfirmDialog } from "@/components/ds/dialog";
+import { SetupPanel } from "@/components/ds/setup-panel";
 import { usePrivacy } from "@/components/layout/privacy-context";
 
 type Capital = { id: number; code: string; name: string };
@@ -71,9 +72,37 @@ export function MeroShareManager({ connections }: { connections: Connection[] })
     });
   }, []);
 
+  // Setup is complete once a portfolio is connected AND data has arrived
+  // (a sync ran or holdings are present) — the SSIS setup pattern.
+  const hasData = connections.some(
+    (item) =>
+      item.connection.lastSyncedAt !== null ||
+      item.accounts.some((account) => account.holdings.length > 0)
+  );
+  const setupComplete = connections.length > 0 && hasData;
+  const accountCount = connections.reduce((total, item) => total + item.accounts.length, 0);
+  const lastSynced = connections
+    .flatMap((item) => [item.connection.lastSyncedAt])
+    .filter((d): d is Date => d !== null)
+    .sort((a, b) => b.getTime() - a.getTime())[0];
+
   return (
     <div className="space-y-6">
-      <ConnectForm capitals={capitals} capitalError={capitalError} />
+      <SetupPanel
+        title="Connect MeroShare"
+        description="Meridian signs in directly with CDSC to read your portfolio. Your CDSC session token is never stored; your login is encrypted at rest with your server key."
+        complete={setupComplete}
+        summary={
+          setupComplete
+            ? `${connections.length} connection${connections.length === 1 ? "" : "s"} · ${accountCount} DEMAT account${accountCount === 1 ? "" : "s"}${
+                lastSynced ? ` · last synced ${lastSynced.toLocaleString()}` : ""
+              }`
+            : ""
+        }
+        panelId="meroshare-setup-panel"
+      >
+        <ConnectForm capitals={capitals} capitalError={capitalError} />
+      </SetupPanel>
       {connections.length ? (
         <section className="space-y-3" aria-label="Connected MeroShare portfolios">
           {connections.map((item) => (
@@ -192,17 +221,7 @@ function ConnectForm({ capitals, capitalError }: { capitals: Capital[]; capitalE
   const [selectedId, setSelectedId] = useState("");
   const selected = capitals.find((capital) => String(capital.id) === selectedId);
   return (
-    <form
-      action={action}
-      className="space-y-4 rounded-xl border border-border bg-surface p-4 shadow-sm"
-    >
-      <div>
-        <h2 className="font-medium text-primary">Connect MeroShare</h2>
-        <p className="mt-1 text-sm text-muted-foreground">
-          Meridian signs in directly with CDSC to read your portfolio. Your CDSC session token is
-          never stored; your login is encrypted at rest with your server key.
-        </p>
-      </div>
+    <form action={action} className="space-y-4">
       <FormError message={state?.ok === false ? state.error : capitalError} />
       <MeroShareSyncWarnings result={state?.ok ? state.data : undefined} />
       <div className="grid gap-4 sm:grid-cols-2">

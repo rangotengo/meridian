@@ -1,5 +1,9 @@
 import { requireVerifiedActor, currentFamily } from "@/server/auth/context";
+import { getDb } from "@/server/db/client";
+import { sureImportStatus } from "@/server/domain/sure-import";
 import { Card, PageHeader, Alert } from "@/components/ds/card";
+import { SetupPanel } from "@/components/ds/setup-panel";
+import { pluralize } from "@/lib/format";
 import { DeleteFamilyForm } from "./delete-family-form";
 import { FamilyImportForm } from "./family-import-form";
 import { SureImportForm } from "./sure-import-form";
@@ -9,6 +13,7 @@ export const metadata = { title: "Your data" };
 export default async function DataPage() {
   const actor = await requireVerifiedActor();
   const family = await currentFamily(actor);
+  const sure = await sureImportStatus(getDb(), actor.familyId);
 
   return (
     <>
@@ -41,15 +46,19 @@ export default async function DataPage() {
         <FamilyImportForm />
       </Card>
 
-      <Card>
-        <h2 className="mb-1 text-base font-medium text-primary">Move from Sure</h2>
-        <p className="mb-4 text-sm text-muted-foreground">
-          Import Sure&apos;s standard family export into a new Meridian family. Accounts,
-          categories, tags, transactions, splits, transfers, and valuations are carried across with
-          their original dates.
-        </p>
+      <SetupPanel
+        title="Move from Sure"
+        description="Import Sure's standard family export into a new Meridian family. Accounts, categories, tags, transactions, splits, transfers, and valuations are carried across with their original dates."
+        complete={sure.imported}
+        summary={
+          sure.imported
+            ? `Imported from Sure · ${pluralize(sure.accounts, "account")} · ${pluralize(sure.transactions, "transaction")}`
+            : ""
+        }
+        panelId="sure-setup-panel"
+      >
         <SureImportForm />
-      </Card>
+      </SetupPanel>
 
       <Alert title="Deleting your family is permanent" tone="destructive">
         Every account, transaction, category, and member record will be destroyed immediately. There
