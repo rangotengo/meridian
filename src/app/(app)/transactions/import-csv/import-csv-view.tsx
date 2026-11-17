@@ -56,6 +56,15 @@ export function ImportCsvView({ accounts }: { accounts: AccountOption[] }) {
   // override once the user changes a column. A new parse clears the
   // override in the submit handler, so no effect is needed to sync them.
   const [mappingOverride, setMappingOverride] = useState<StatementMapping | null>(null);
+  // A preview is only valid for the exact parse + mapping it was computed
+  // from. These epochs hide stale server state: a new parse invalidates the
+  // old preview, changing any mapping select invalidates the preview until
+  // it is re-run, and Start over hides the parsed/preview cards even though
+  // useActionState state cannot be cleared from the client.
+  const [parseEpoch, setParseEpoch] = useState(0);
+  const [parsedEpoch, setParsedEpoch] = useState(-1);
+  const [previewEpoch, setPreviewEpoch] = useState(0);
+  const [previewShownEpoch, setPreviewShownEpoch] = useState(-1);
   const fileRef = useRef<HTMLInputElement>(null);
 
   const [parseState, parseAction] = useActionState(parseStatementCsvAction, undefined);
@@ -70,6 +79,9 @@ export function ImportCsvView({ accounts }: { accounts: AccountOption[] }) {
 
   function updateMapping(patch: Partial<StatementMapping>) {
     if (!mapping) return;
+    // The visible preview was computed from the old mapping: hide it (and
+    // its Import button) until the user previews again.
+    setPreviewEpoch((e) => e + 1);
     setMappingOverride({ ...mapping, ...patch });
   }
 
@@ -77,6 +89,10 @@ export function ImportCsvView({ accounts }: { accounts: AccountOption[] }) {
     setCsvText("");
     setParsedText("");
     setMappingOverride(null);
+    // parseState/previewState cannot be cleared from the client, so bump
+    // both epochs: the parsed and preview cards stop rendering.
+    setParseEpoch((e) => e + 1);
+    setPreviewEpoch((e) => e + 1);
     if (fileRef.current) fileRef.current.value = "";
   }
 
@@ -127,7 +143,7 @@ export function ImportCsvView({ accounts }: { accounts: AccountOption[] }) {
             id="account"
             value={accountId}
             onChange={(e) => setAccountId(e.target.value)}
-            disabled={Boolean(parsed)}
+            disabled={Boolean(parsed) && parsedEpoch === parseEpoch}
             className="h-9 w-full rounded-lg border border-border bg-surface px-3 text-sm disabled:opacity-50"
           >
             {accounts.map((a) => (
@@ -145,6 +161,10 @@ export function ImportCsvView({ accounts }: { accounts: AccountOption[] }) {
           action={(formData) => {
             setMappingOverride(null);
             setParsedText(csvText);
+            const nextParse = parseEpoch + 1;
+            setParseEpoch(nextParse);
+            setParsedEpoch(nextParse);
+            setPreviewEpoch((e) => e + 1);
             parseAction(formData);
           }}
           className="space-y-3"
@@ -174,7 +194,7 @@ export function ImportCsvView({ accounts }: { accounts: AccountOption[] }) {
           <FormError message={!parseState?.ok ? parseState?.error : undefined} />
           <div className="flex gap-2">
             <SubmitButton>Parse statement</SubmitButton>
-            {parsed ? (
+            {parsed && parsedEpoch === parseEpoch ? (
               <button
                 type="button"
                 onClick={reset}
@@ -185,7 +205,7 @@ export function ImportCsvView({ accounts }: { accounts: AccountOption[] }) {
             ) : null}
           </div>
         </form>
-        {parsed ? (
+        {parsed && parsedEpoch === parseEpoch ? (
           <p className="text-sm text-muted-foreground">
             Found {parsed.headers.length} columns and {parsed.rowCount} rows. Columns were detected
             automatically — correct them below if needed.
@@ -193,9 +213,17 @@ export function ImportCsvView({ accounts }: { accounts: AccountOption[] }) {
         ) : null}
       </Card>
 
-      {parsed && mapping ? (
+      {parsed && mapping && parsedEpoch === parseEpoch ? (
         <Card className="space-y-4 p-4">
-          <form action={previewAction} className="space-y-3">
+          <form
+            action={(formData) => {
+              const nextPreview = previewEpoch + 1;
+              setPreviewEpoch(nextPreview);
+              setPreviewShownEpoch(nextPreview);
+              previewAction(formData);
+            }}
+            className="space-y-3"
+          >
             <input type="hidden" name="accountId" value={accountId} />
             <input type="hidden" name="csvText" value={parsedText} />
             <div className="grid gap-3 sm:grid-cols-2">
@@ -242,10 +270,16 @@ export function ImportCsvView({ accounts }: { accounts: AccountOption[] }) {
             <FormError message={!previewState?.ok ? previewState?.error : undefined} />
             <SubmitButton>Preview import</SubmitButton>
           </form>
+          {preview && previewShownEpoch !== previewEpoch ? (
+            <p className="text-sm text-amber-600 dark:text-amber-400">
+              The preview is out of date — run Preview import again to see the updated rows before
+              importing.
+            </p>
+          ) : null}
         </Card>
       ) : null}
 
-      {preview && account ? (
+      {preview && account && previewShownEpoch === previewEpoch && parsedEpoch === parseEpoch ? (
         <Card className="space-y-4 p-4">
           <p className="text-sm">
             <strong>{preview.importableCount}</strong> ready to import,{" "}

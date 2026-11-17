@@ -483,8 +483,10 @@ export type StatementImportResult = {
  * Import the clean, non-duplicate rows. The preview is display-only: the
  * file is re-parsed and duplicates re-checked here, so a row that changed
  * between preview and confirm cannot slip through. One transaction for the
- * whole import (plus the per-family advisory lock, like the Sure import),
- * then a single balance recalculation from the earliest imported date.
+ * whole import (plus the per-family advisory lock, like the Sure import):
+ * duplicate discovery, entries, audit, AND the balance recalculation all
+ * run inside it, so a recalculation failure rolls the import back instead
+ * of leaving committed entries with stale balances that no retry can heal.
  */
 export async function confirmStatementImport(
   exec: Executor,
@@ -504,31 +506,34 @@ export async function confirmStatementImport(
       row: r,
       externalId: statementExternalId(input.accountId, r.date!, r.amountLedgerMinor!, r.name!)
     }));
-  const duplicates = await findDuplicates(
-    exec,
-    input.accountId,
-    clean.map((c) => ({
-      date: c.row.date!,
-      amountLedgerMinor: c.row.amountLedgerMinor!,
-      name: c.row.name!,
-      externalId: c.externalId
-    }))
-  );
-  const seen = new Set<string>();
-  const importable = clean.filter((c) => {
-    if (seen.has(c.externalId)) return false;
-    seen.add(c.externalId);
-    return !duplicates.has(c.externalId);
-  });
-  const skippedDuplicates = clean.length - importable.length;
-  const skippedErrors = parsed.length - clean.length;
-
-  let imported = 0;
-  let earliest: string | null = null;
-  await exec.transaction(async (tx) => {
+  return exec.transaction(async (tx) => {
     if (!usesCloudStorage) {
       await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${actor.familyId}))`);
     }
+    // Duplicate discovery runs inside the lock/transaction, so its snapshot
+    // is serialized with the writes: a concurrent import cannot slip in
+    // between the check and the insert.
+    const duplicates = await findDuplicates(
+      tx,
+      input.accountId,
+      clean.map((c) => ({
+        date: c.row.date!,
+        amountLedgerMinor: c.row.amountLedgerMinor!,
+        name: c.row.name!,
+        externalId: c.externalId
+      }))
+    );
+    const seen = new Set<string>();
+    const importable = clean.filter((c) => {
+      if (seen.has(c.externalId)) return false;
+      seen.add(c.externalId);
+      return !duplicates.has(c.externalId);
+    });
+    const skippedDuplicates = clean.length - importable.length;
+    const skippedErrors = parsed.length - clean.length;
+
+    let imported = 0;
+    let earliest: string | null = null;
     for (const c of importable) {
       const res = await createTransactionEntry(tx, actor, {
         accountId: input.accountId,
@@ -550,9 +555,13 @@ export async function confirmStatementImport(
       entityId: input.accountId,
       metadata: { imported, skippedDuplicates, skippedErrors, totalRows: parsed.length }
     });
+    // Balances are derived state of the entries just written, so they are
+    // rebuilt in the same transaction: if this throws, the entries roll
+    // back with it and a retry imports cleanly instead of finding every
+    // row already duplicated with balances still stale.
+    if (imported > 0 && earliest) {
+      await recalculateAccount(tx, input.accountId, earliest);
+    }
+    return { imported, skippedDuplicates, skippedErrors, totalRows: parsed.length };
   });
-  if (imported > 0 && earliest) {
-    await recalculateAccount(exec, input.accountId, earliest);
-  }
-  return { imported, skippedDuplicates, skippedErrors, totalRows: parsed.length };
 }

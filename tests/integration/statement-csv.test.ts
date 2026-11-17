@@ -1,4 +1,18 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+// Injected recalculation failure for the rollback test below: the mock
+// delegates to the real module and only throws while the flag is set.
+const recalcCtl = vi.hoisted(() => ({ fail: false }));
+vi.mock("@/server/domain/balances", async (importOriginal) => {
+  const mod = await importOriginal<typeof import("@/server/domain/balances")>();
+  return {
+    ...mod,
+    recalculateAccount: async (...args: Parameters<typeof mod.recalculateAccount>) => {
+      if (recalcCtl.fail) throw new Error("injected recalculation failure");
+      return mod.recalculateAccount(...args);
+    }
+  };
+});
 import { eq } from "drizzle-orm";
 import {
   addTxn,
@@ -46,6 +60,7 @@ async function entriesFor(accountId: string) {
 
 describe("statement CSV import", () => {
   beforeEach(async () => {
+    recalcCtl.fail = false;
     await truncateAll();
   });
 
@@ -181,6 +196,42 @@ describe("statement CSV import", () => {
     const rows = await entriesFor(accountId);
     expect(rows.map((r) => [r.name, r.amountMinor])).toContainEqual(["Card payment", 25050]);
     expect(rows.map((r) => [r.name, r.amountMinor])).toContainEqual(["Refund", -100000]);
+  });
+
+  it("rolls the import back when recalculation fails, so a retry heals it", async () => {
+    const user = await makeUser({ currency: "NPR" });
+    const actor = actorOf(user);
+    const accountId = await makeAccount(user, {
+      type: "depository",
+      name: "Nabil Savings",
+      currency: "NPR",
+      openingBalanceDisplayMinor: 0
+    });
+    const csv = [
+      "Date,Particulars,Debit,Credit,Balance",
+      `${dmy(daysAgo(5))},ATM Withdrawal,5000,,95000`,
+      `${dmy(daysAgo(4))},Salary,,20000,115000`,
+      `${dmy(daysAgo(3))},Grocery Store,1250.50,,113749.50`
+    ].join("\n");
+    const mapping = detectStatementMapping(["Date", "Particulars", "Debit", "Credit", "Balance"]);
+    const balanceBefore = await latestBalance(accountId);
+
+    // The balance rebuild fails after the entries were written: the whole
+    // import must roll back, not leave committed entries with stale balances.
+    recalcCtl.fail = true;
+    await expect(
+      confirmStatementImport(db(), actor, { accountId, text: csv, mapping })
+    ).rejects.toThrow("injected recalculation failure");
+    expect(await entryCount(accountId)).toBe(0);
+    expect(await latestBalance(accountId)).toEqual(balanceBefore);
+    recalcCtl.fail = false;
+
+    // Retry imports cleanly instead of finding every row already duplicated
+    // with balances still stale.
+    const retry = await confirmStatementImport(db(), actor, { accountId, text: csv, mapping });
+    expect(retry).toEqual({ imported: 3, skippedDuplicates: 0, skippedErrors: 0, totalRows: 3 });
+    expect(await entryCount(accountId)).toBe(3);
+    expect((await latestBalance(accountId))?.balanceMinor).toBe(1374950);
   });
 
   it("refuses an account the actor cannot manage", async () => {
