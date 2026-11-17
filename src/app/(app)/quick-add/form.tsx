@@ -6,6 +6,9 @@ import { Input, Select, FormError } from "@/components/ds/form";
 import { SubmitButton } from "@/components/ds/submit-button";
 import { TagPicker } from "@/components/ds/tag-picker";
 import { useDraftResyncOnError } from "@/components/finance/use-draft-resync";
+import { QUICK_AMOUNT_CHIPS, addAmountToDraft } from "@/lib/quick-amounts";
+import { currencyExponent } from "@/lib/money";
+import type { RecentCategory, RecentPayee } from "@/lib/recent-transactions";
 import { Check } from "lucide-react";
 
 export function QuickAddForm({
@@ -13,6 +16,8 @@ export function QuickAddForm({
   categories,
   tags,
   today,
+  recentPayees,
+  recentCategories,
   onSaved,
   onCancel
 }: {
@@ -20,6 +25,13 @@ export function QuickAddForm({
   categories: { id: string; name: string }[];
   tags: { id: string; name: string }[];
   today: string;
+  /**
+   * Most-recently-used payees/categories for one-tap fill. Optional: the
+   * dashboard dialog host does not supply them, so the form simply hides
+   * the chips there. The standalone page passes them.
+   */
+  recentPayees?: RecentPayee[];
+  recentCategories?: RecentCategory[];
   /**
    * Dialog hosts (e.g. the dashboard Quick actions shortcut) pass this to
    * take over the success path — close + refresh — instead of the
@@ -48,6 +60,9 @@ export function QuickAddForm({
   const [categoryId, setCategoryId] = useState("");
   const [tagIds, setTagIds] = useState<string[]>([]);
   useDraftResyncOnError(state);
+
+  const accountCurrency =
+    accounts.find((a) => a.id === accountId)?.currency ?? accounts[0]?.currency ?? "USD";
 
   async function handleAction(formData: FormData) {
     const result = await quickAddAction(undefined, formData);
@@ -128,6 +143,36 @@ export function QuickAddForm({
         />
       </label>
 
+      <div className="flex flex-wrap items-center gap-1.5" aria-label="Quick amounts">
+        {QUICK_AMOUNT_CHIPS.map((chip) => (
+          <button
+            key={chip}
+            type="button"
+            onClick={() =>
+              setAmount((prev) =>
+                addAmountToDraft(
+                  prev,
+                  chip * 10 ** currencyExponent(accountCurrency),
+                  accountCurrency
+                )
+              )
+            }
+            className="rounded-full border border-border bg-surface px-2.5 py-1 text-xs font-medium text-muted-foreground hover:bg-accent hover:text-foreground"
+          >
+            +{chip.toLocaleString()}
+          </button>
+        ))}
+        {amount ? (
+          <button
+            type="button"
+            onClick={() => setAmount("")}
+            className="rounded-full border border-border bg-surface px-2.5 py-1 text-xs font-medium text-muted-foreground hover:bg-accent hover:text-foreground"
+          >
+            Clear
+          </button>
+        ) : null}
+      </div>
+
       <label className="block space-y-1">
         <span className="text-sm font-medium">Description</span>
         <Input
@@ -141,6 +186,26 @@ export function QuickAddForm({
           onChange={(event) => setName(event.target.value)}
         />
       </label>
+
+      {recentPayees && recentPayees.length > 0 ? (
+        <div className="flex flex-wrap items-center gap-1.5" aria-label="Recent payees">
+          <span className="text-xs text-muted-foreground">Recent:</span>
+          {recentPayees.map((payee) => (
+            <button
+              key={payee.name}
+              type="button"
+              onClick={() => {
+                setName(payee.name);
+                if (payee.categoryId) setCategoryId(payee.categoryId);
+              }}
+              className="max-w-44 truncate rounded-full border border-border bg-surface px-2.5 py-1 text-xs font-medium text-muted-foreground hover:bg-accent hover:text-foreground"
+              title={payee.name}
+            >
+              {payee.name}
+            </button>
+          ))}
+        </div>
+      ) : null}
 
       <label className="block space-y-1">
         <span className="text-sm font-medium">Account</span>
@@ -175,6 +240,23 @@ export function QuickAddForm({
           ))}
         </Select>
       </label>
+
+      {recentCategories && recentCategories.length > 0 ? (
+        <div className="flex flex-wrap items-center gap-1.5" aria-label="Recent categories">
+          <span className="text-xs text-muted-foreground">Recent:</span>
+          {recentCategories.map((category) => (
+            <button
+              key={category.id}
+              type="button"
+              onClick={() => setCategoryId(category.id)}
+              className="max-w-44 truncate rounded-full border border-border bg-surface px-2.5 py-1 text-xs font-medium text-muted-foreground hover:bg-accent hover:text-foreground"
+              title={category.name}
+            >
+              {category.name}
+            </button>
+          ))}
+        </div>
+      ) : null}
 
       <TagPicker tags={tags} selected={tagIds} onSelectedChange={setTagIds} />
 
