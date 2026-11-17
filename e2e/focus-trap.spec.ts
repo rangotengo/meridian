@@ -85,9 +85,7 @@ test("native dialog traps Tab focus and returns focus to its trigger", async ({ 
   await page.waitForLoadState("networkidle");
 
   const { trigger, dialog } = await openCloseAccountDialog(page);
-  await expect(
-    page.getByRole("heading", { name: "Close this account?" })
-  ).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Close this account?" })).toBeVisible();
 
   expect(await activeElementInside(page, "dialog[open]")).toBe(true);
   for (let i = 0; i < 12; i++) {
