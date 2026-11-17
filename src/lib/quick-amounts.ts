@@ -9,11 +9,7 @@ export const QUICK_AMOUNT_CHIPS = [100, 500, 1000, 5000] as const;
  * An unparseable draft is treated as empty; the result is a decimal string
  * the amount field can display and the server can parse back.
  */
-export function addAmountToDraft(
-  current: string,
-  addMinor: number,
-  currency: string
-): string {
+export function addAmountToDraft(current: string, addMinor: number, currency: string): string {
   const currentMinor = tryParseAmountToMinor(current.trim(), currency) ?? 0;
   return minorToDecimal(currentMinor + addMinor, currency);
 }

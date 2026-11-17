@@ -17,10 +17,7 @@ export type RecentPayee = { name: string; categoryId: string | null };
  * category its latest transaction used (so one tap can fill description
  * and category together). Entries without a merchant are skipped.
  */
-export function recentPayees(
-  items: RecentEntryLike[],
-  limit = 6
-): RecentPayee[] {
+export function recentPayees(items: RecentEntryLike[], limit = 6): RecentPayee[] {
   const seen = new Set<string>();
   const out: RecentPayee[] = [];
   for (const item of items) {
@@ -36,10 +33,7 @@ export function recentPayees(
 export type RecentCategory = { id: string; name: string };
 
 /** Distinct categories from the most recent entries first. */
-export function recentCategories(
-  items: RecentEntryLike[],
-  limit = 6
-): RecentCategory[] {
+export function recentCategories(items: RecentEntryLike[], limit = 6): RecentCategory[] {
   const seen = new Set<string>();
   const out: RecentCategory[] = [];
   for (const item of items) {
