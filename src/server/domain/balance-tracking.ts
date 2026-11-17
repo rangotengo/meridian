@@ -221,8 +221,10 @@ async function familyToday(exec: Executor, familyId: string): Promise<string> {
 
 /**
  * The balance the engine settles on in valuation mode: the opening
- * balance, overridden by each in-window valuation in write order. Only
- * entries dated within [openedOn, today] count.
+ * balance, overridden by each in-window valuation in write order. Every
+ * entry dated on or before today counts, even when it predates openedOn
+ * (Sure imports carry history older than the Meridian opening date) —
+ * matching what recalculateAccount settles on.
  */
 async function projectedValuationBalance(
   exec: Executor,
@@ -230,7 +232,7 @@ async function projectedValuationBalance(
   valuationEntries: ValuationEntryRow[]
 ): Promise<number> {
   const today = await familyToday(exec, account.familyId);
-  const inWindow = (date: string) => date >= account.openedOn && date <= today;
+  const inWindow = (date: string) => date <= today;
   let balance = account.openingBalanceMinor;
   for (const entry of valuationEntries) {
     if (inWindow(entry.date)) balance = entry.amountMinor;
@@ -292,11 +294,12 @@ async function planConversionToTransactions(
   valuationEntries: ValuationEntryRow[]
 ): Promise<ConversionPlan> {
   const today = await familyToday(exec, account.familyId);
-  const inWindow = (date: string) => date >= account.openedOn && date <= today;
+  const inWindow = (date: string) => date <= today;
 
-  // Load every leaf transaction from the account's opening onward —
-  // including future-dated rows, which the engine ignores until their
-  // date arrives but which a restatement decision must still see.
+  // Load every leaf transaction — including ones predating openedOn,
+  // which the engine counts (see recalculateAccount), and future-dated
+  // rows, which the engine ignores until their date arrives but which a
+  // restatement decision must still see.
   const res = await exec.execute<{
     id: string;
     date: string;
@@ -316,7 +319,6 @@ async function planConversionToTransactions(
     FROM entries
     WHERE account_id = ${account.id}
       AND entryable_type = 'transaction'
-      AND date >= ${account.openedOn}
       AND NOT EXISTS (
         SELECT 1 FROM entries c WHERE c.parent_entry_id = entries.id
       )

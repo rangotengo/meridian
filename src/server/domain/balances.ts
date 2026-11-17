@@ -85,6 +85,20 @@ export async function recalculateAccount(
     start = minDate(meta.openedOn, fromDate);
   }
 
+  // Entries can predate openedOn: Sure imports carry years of history for
+  // accounts Meridian created on the import date. A full rebuild (no
+  // fromDate) started at openedOn and silently dropped those entries, so
+  // the balance flipped between correct after a write-path recalc and
+  // wrong after the nightly rebuild. Anchor the window at the earliest
+  // entry so every recalc sees the same history.
+  const earliestRes = await exec.execute<{ d: string | null }>(sql`
+    SELECT CAST(min(date) AS TEXT) AS d FROM entries WHERE account_id = ${accountId}
+  `);
+  const earliestDate = (earliestRes.rows ?? [])[0]?.d?.slice(0, 10);
+  if (earliestDate && isIsoDate(earliestDate)) {
+    start = minDate(start, earliestDate);
+  }
+
   const dayCount = Math.max(1, diffDays(today, start) + 1);
 
   // F04: Allow up to 36,500 days (100 years of ledger history), but fail visibly if exceeded
