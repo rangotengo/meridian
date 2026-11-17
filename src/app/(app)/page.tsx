@@ -8,6 +8,7 @@ import {
   type FxCompleteness
 } from "@/server/domain/reports";
 import { budgetOverview } from "@/server/domain/budgets";
+import { listUpcomingBills } from "@/server/domain/bills";
 import { getUserPrivacyMode } from "@/server/domain/users";
 import { listAccountsForActor } from "@/server/domain/accounts";
 import { listCategories } from "@/server/domain/categories";
@@ -44,7 +45,7 @@ export default async function DashboardPage({
   const nwRange = nw && NW_RANGES.has(nw) ? nw : "90";
   const seriesDays = nwRange === "all" ? ("all" as const) : Number(nwRange);
 
-  const [summary, accounts, seriesResult, budget, flowsResult, categories, tags] =
+  const [summary, accounts, seriesResult, budget, flowsResult, categories, tags, bills] =
     await Promise.all([
       dashboardSummary(db, family, actor.userId),
       listAccountsForActor(db, actor),
@@ -52,7 +53,8 @@ export default async function DashboardPage({
       budgetOverview(db, family, actor.userId),
       incomeExpenseSeries(db, family, actor.userId, 12),
       listCategories(db, actor.familyId),
-      listTags(db, actor.familyId)
+      listTags(db, actor.familyId),
+      listUpcomingBills(db, actor, todayIn(family.timezone))
     ]);
   const series = seriesResult.points;
   const flows = flowsResult.flows;
@@ -157,6 +159,38 @@ export default async function DashboardPage({
           pct: budget.overall.pct
         }
       : null,
+    bills: {
+      missed: bills.missed.map((b) => ({
+        seriesId: b.seriesId,
+        name: b.name,
+        amountMinor: b.amountMinor,
+        currency: b.currency,
+        accountName: b.accountName,
+        dueDate: b.dueDate,
+        status: b.status,
+        daysUntilDue: b.daysUntilDue
+      })),
+      dueSoon: bills.dueSoon.map((b) => ({
+        seriesId: b.seriesId,
+        name: b.name,
+        amountMinor: b.amountMinor,
+        currency: b.currency,
+        accountName: b.accountName,
+        dueDate: b.dueDate,
+        status: b.status,
+        daysUntilDue: b.daysUntilDue
+      })),
+      upcoming: bills.upcoming.map((b) => ({
+        seriesId: b.seriesId,
+        name: b.name,
+        amountMinor: b.amountMinor,
+        currency: b.currency,
+        accountName: b.accountName,
+        dueDate: b.dueDate,
+        status: b.status,
+        daysUntilDue: b.daysUntilDue
+      }))
+    },
     fx: (() => {
       // The banner covers every total and chart on the page, so merge the
       // completeness of the summary, the historical series, the monthly
