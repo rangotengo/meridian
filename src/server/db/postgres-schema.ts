@@ -491,6 +491,7 @@ export const budgets = pgTable(
       .references(() => families.id, { onDelete: "cascade" }),
     categoryId: uuid("category_id").references(() => categories.id, { onDelete: "cascade" }),
     amountMinor: bigint("amount_minor", { mode: "number" }).notNull(),
+    rollover: boolean("rollover").notNull().default(false),
     active: boolean("active").notNull().default(true),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow()

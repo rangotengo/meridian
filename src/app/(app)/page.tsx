@@ -170,7 +170,9 @@ export default async function DashboardPage({
           limitMinor: budget.overall.limitMinor,
           spentMinor: budget.overall.spentMinor,
           remainingMinor: budget.overall.remainingMinor,
-          pct: budget.overall.pct
+          pct: budget.overall.pct,
+          effectiveLimitMinor: budget.overall.effectiveLimitMinor,
+          rolloverCreditMinor: budget.overall.rolloverCreditMinor
         }
       : null,
     bills: {

@@ -47,8 +47,14 @@ export function SpendingLimit() {
         <div>
           <p className="text-xs text-muted-foreground">Budget</p>
           <p className="text-2xl font-bold tabular-nums tracking-tight">
-            {privacy ? "••••" : fmtMoney(budgetOverall.limitMinor, currency)}
+            {privacy ? "••••" : fmtMoney(budgetOverall.effectiveLimitMinor, currency)}
           </p>
+          {budgetOverall.rolloverCreditMinor > 0 ? (
+            <p className="text-xs text-muted-foreground">
+              Includes {privacy ? "••••" : fmtMoney(budgetOverall.rolloverCreditMinor, currency)}{" "}
+              rolled over from last month
+            </p>
+          ) : null}
         </div>
         <Progress value={Math.min(percentUsed, 100)} className="h-2" />
         <div className="flex items-center justify-between text-sm">
