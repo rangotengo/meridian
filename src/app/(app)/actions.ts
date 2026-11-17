@@ -7,7 +7,7 @@ import { z } from "zod";
 import { getDb, withTransaction } from "@/server/db/client";
 import { assertActor } from "@/server/auth/context";
 import { parseAmountToMinor } from "@/lib/money";
-import { errors } from "@/lib/errors";
+import { errors, DomainError } from "@/lib/errors";
 import { runAction, formValues, optionalString, type ActionState } from "@/server/actions/runner";
 import * as valuationsSvc from "@/server/domain/valuations";
 import * as holdingsSvc from "@/server/domain/holdings";
@@ -157,6 +157,58 @@ export async function deleteEntryAction(formData: FormData): Promise<ActionState
     revalidatePath("/transactions");
     revalidatePath("/");
     redirect("/transactions");
+  });
+}
+
+export type BulkDeleteResult = {
+  deleted: string[];
+  skipped: { id: string; reason: string }[];
+};
+
+const bulkDeleteSchema = z.object({
+  entryIds: z.array(z.string().uuid()).min(1).max(25)
+});
+
+/**
+ * Delete several transactions from the list in one go. Each entry is
+ * removed in its own transaction via the same removeEntry path as a single
+ * delete (so balances are recalculated per account), and a failure for one
+ * entry — e.g. a split part, which cannot be deleted directly — only skips
+ * that entry instead of rolling back the rest. The result names every
+ * deleted id and every skipped id with its reason.
+ */
+export async function bulkDeleteEntriesAction(
+  _prev: ActionState<BulkDeleteResult> | undefined,
+  formData: FormData
+): Promise<ActionState<BulkDeleteResult>> {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(String(formData.get("entryIds") ?? "[]"));
+  } catch {
+    return { ok: false, error: "Invalid selection.", code: "validation.failed" };
+  }
+  const parsed = bulkDeleteSchema.safeParse({ entryIds: raw });
+  if (!parsed.success) {
+    return { ok: false, error: "Check the highlighted fields.", code: "validation.failed" };
+  }
+  return runAction("txn.bulk-delete", async () => {
+    const actor = await assertActor();
+    const deleted: string[] = [];
+    const skipped: { id: string; reason: string }[] = [];
+    for (const entryId of parsed.data.entryIds) {
+      try {
+        await withTransaction((tx) => orchestrate.removeEntry(tx, actor, entryId));
+        deleted.push(entryId);
+      } catch (e) {
+        skipped.push({
+          id: entryId,
+          reason: e instanceof DomainError ? e.userMessage : "Could not delete."
+        });
+      }
+    }
+    revalidatePath("/transactions");
+    revalidatePath("/");
+    return { deleted, skipped };
   });
 }
 
