@@ -2,6 +2,8 @@
 
 import { createContext, useContext } from "react";
 
+import type { GoalProgress } from "@/server/domain/goals";
+
 export type DashboardAccount = {
   id: string;
   name: string;
@@ -64,6 +66,8 @@ export type DashboardData = {
     tags: { id: string; name: string }[];
     today: string;
   };
+  /** Active goals with live progress, for the Goals widget. */
+  goals: GoalProgress[];
   budgetOverall: {
     limitMinor: number;
     spentMinor: number;

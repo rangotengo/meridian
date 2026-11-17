@@ -503,6 +503,42 @@ export const budgets = pgTable(
   ]
 );
 
+export const goals = pgTable(
+  "goals",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    familyId: uuid("family_id")
+      .notNull()
+      .references(() => families.id, { onDelete: "cascade" }),
+    createdBy: uuid("created_by")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    name: text("name").notNull(),
+    targetMinor: bigint("target_minor", { mode: "number" }).notNull(),
+    currency: char("currency", { length: 3 }).notNull(),
+    deadline: date("deadline"),
+    accountId: uuid("account_id").references(() => accounts.id, { onDelete: "set null" }),
+    categoryId: uuid("category_id").references(() => categories.id, { onDelete: "set null" }),
+    startingBalanceMinor: bigint("starting_balance_minor", { mode: "number" }).notNull().default(0),
+    status: text("status").notNull().default("active"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow()
+  },
+  (t) => [
+    check("goals_target_minor_check", sql`${t.targetMinor} > 0`),
+    check("goals_status_check", sql`${t.status} IN ('active', 'achieved', 'archived')`),
+    // At most one link: creation enforces exactly one, but ON DELETE SET
+    // NULL must be able to clear the surviving link when its target is
+    // deleted (a goal with no link is the link-removed state).
+    check(
+      "goals_at_most_one_link_check",
+      sql`NOT (${t.accountId} IS NOT NULL AND ${t.categoryId} IS NOT NULL)`
+    ),
+    index("goals_family_idx").on(t.familyId),
+    index("goals_family_status_idx").on(t.familyId, t.status)
+  ]
+);
+
 export const savedFilters = pgTable(
   "saved_filters",
   {

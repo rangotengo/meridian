@@ -16,6 +16,7 @@ const labelMap: Record<string, string> = {
   accounts: "Accounts",
   transactions: "Transactions",
   budgets: "Budgets",
+  goals: "Goals",
   reports: "Reports",
   chat: "Assistant",
   settings: "Settings",
