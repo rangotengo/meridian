@@ -24,12 +24,15 @@ export function CategoryDonut({
   items,
   currency,
   privacy,
-  title = "Spending by category"
+  title = "Spending by category",
+  action
 }: {
   items: { name: string; totalMinor: number }[];
   currency: string;
   privacy: boolean;
   title?: string;
+  /** Optional header action, e.g. an Export CSV link on the reports page. */
+  action?: React.ReactNode;
 }) {
   const total = items.reduce((sum, item) => sum + item.totalMinor, 0);
   const pieData = items.map((item, index) => ({
@@ -47,8 +50,9 @@ export function CategoryDonut({
 
   return (
     <Card>
-      <CardHeader>
+      <CardHeader className="flex flex-row items-center justify-between space-y-0">
         <CardTitle className="text-base font-semibold">{title}</CardTitle>
+        {action}
       </CardHeader>
       <CardContent>
         {items.length === 0 ? (
