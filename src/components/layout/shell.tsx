@@ -1,7 +1,7 @@
 "use client";
 
 import { AppSidebar, type NavAccount } from "@/components/layout/app-sidebar";
-import { CommandPalette } from "@/components/layout/command-palette";
+import { CommandPalette, type PaletteCategory } from "@/components/layout/command-palette";
 import { DynamicBreadcrumb } from "@/components/layout/dynamic-breadcrumb";
 import { ThemeToggle } from "@/components/layout/theme-toggle";
 import { Separator } from "@/components/ui/separator";
@@ -19,6 +19,8 @@ export function Shell({
   privacy,
   assets,
   liabilities,
+  categories,
+  merchants,
   netWorthMinor,
   fxIssues,
   currency,
@@ -33,6 +35,8 @@ export function Shell({
   privacy: boolean;
   assets: NavAccount[];
   liabilities: NavAccount[];
+  categories: PaletteCategory[];
+  merchants: string[];
   netWorthMinor: number;
   fxIssues: { base: string; quote: string }[];
   currency: string;
@@ -88,13 +92,21 @@ export function Shell({
                 <span className="sr-only">Toggle privacy mode</span>
               </Button>
             </form>
-            <kbd className="pointer-events-none hidden h-6 select-none items-center gap-1 rounded border bg-muted px-2 font-mono text-[10px] font-medium text-muted-foreground sm:flex">
+            <kbd
+              title="Search (⌘K or /) · New transaction (N) · Quick add (Q)"
+              className="pointer-events-none hidden h-6 select-none items-center gap-1 rounded border bg-muted px-2 font-mono text-[10px] font-medium text-muted-foreground sm:flex"
+            >
               <span className="text-xs">⌘</span>K
             </kbd>
             <ThemeToggle />
           </div>
         </header>
-        <CommandPalette accounts={accounts} privacy={privacy} />
+        <CommandPalette
+          accounts={accounts}
+          categories={categories}
+          merchants={merchants}
+          privacy={privacy}
+        />
         <main id="main" className="flex flex-1 flex-col">
           <PrivacyProvider value={privacy}>
             <div className="flex flex-1 flex-col gap-4 p-4 pt-0 pb-8">{children}</div>
