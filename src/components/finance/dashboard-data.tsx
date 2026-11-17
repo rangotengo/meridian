@@ -79,6 +79,14 @@ export type DashboardData = {
     dueSoon: DashboardBill[];
     upcoming: DashboardBill[];
   };
+  /** Forward projection, only when the net_worth_projections flag is on. */
+  projection: {
+    points: { date: string; valueMinor: number }[];
+    horizonEnd: string;
+    valuationFlatMinor: number;
+    valuationAccountCount: number;
+    skippedSeries: number;
+  } | null;
   fx: {
     /** True when some amounts were excluded because no rate exists. */
     incomplete: boolean;
