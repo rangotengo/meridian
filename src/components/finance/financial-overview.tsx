@@ -8,7 +8,7 @@ import {
   ChartTooltipContent,
   type ChartConfig
 } from "@/components/ui/chart";
-import { Area, AreaChart, CartesianGrid, XAxis, YAxis, type DotProps } from "recharts";
+import { Area, AreaChart, CartesianGrid, Line, XAxis, YAxis, type DotProps } from "recharts";
 import { useDashboardData } from "@/components/finance/dashboard-data";
 import { fmtMoney, fmtSignedMoney } from "@/lib/format";
 import { minorToMajor } from "@/lib/money";
@@ -39,6 +39,10 @@ const chartConfig: ChartConfig = {
   netWorth: {
     label: "Net Worth",
     color: "var(--color-primary)"
+  },
+  projected: {
+    label: "Projected",
+    color: "var(--color-muted-foreground)"
   }
 };
 
@@ -48,17 +52,35 @@ function formatPct(pct: number | null): string {
 }
 
 export function FinancialOverview() {
-  const { series, currency, netWorthMinor, assetsMinor, liabilitiesMinor, privacy } =
+  const { series, projection, currency, netWorthMinor, assetsMinor, liabilitiesMinor, privacy } =
     useDashboardData();
 
   const formattedData = useMemo(() => {
-    if (!series || series.length === 0) return [];
-    return series.map((point: { date: string; valueMinor: number }) => ({
+    const history = (series ?? []).map((point: { date: string; valueMinor: number }) => ({
       date: point.date,
       valueMinor: point.valueMinor,
-      value: minorToMajor(point.valueMinor, currency)
+      value: minorToMajor(point.valueMinor, currency) as number | undefined,
+      projected: undefined as number | undefined
     }));
-  }, [series, currency]);
+    if (!projection || projection.points.length < 2) return history;
+    // The first projection point is the join: same date/value as the last
+    // history point. The dashed line starts there; the Area ends there.
+    const merged = [...history];
+    projection.points.forEach((point, i) => {
+      const projected = minorToMajor(point.valueMinor, currency);
+      if (i === 0 && merged.length > 0 && merged[merged.length - 1]!.date === point.date) {
+        merged[merged.length - 1] = { ...merged[merged.length - 1]!, projected };
+      } else {
+        merged.push({
+          date: point.date,
+          valueMinor: point.valueMinor,
+          value: undefined,
+          projected
+        });
+      }
+    });
+    return merged;
+  }, [series, projection, currency]);
 
   const change = useMemo(() => netWorthChange(series), [series]);
   const startLabel = change
@@ -136,7 +158,11 @@ export function FinancialOverview() {
                   <ChartTooltipContent
                     formatter={(_val, _name, item) => {
                       const minor = item.payload.valueMinor;
-                      return fmtMoney(minor, currency);
+                      const isProjection =
+                        item.payload.value == null && item.payload.projected != null;
+                      return isProjection
+                        ? `${fmtMoney(minor, currency)} (projection)`
+                        : fmtMoney(minor, currency);
                     }}
                   />
                 }
@@ -150,9 +176,37 @@ export function FinancialOverview() {
                 dot={false}
                 activeDot={(props) => <SquareDot {...props} fill="var(--color-primary)" size={7} />}
               />
+              <Line
+                type="monotone"
+                dataKey="projected"
+                stroke="var(--color-muted-foreground)"
+                strokeWidth={2}
+                strokeDasharray="6 4"
+                dot={false}
+                activeDot={(props) => (
+                  <SquareDot {...props} fill="var(--color-muted-foreground)" size={7} />
+                )}
+              />
             </AreaChart>
           </ChartContainer>
         )}
+        {projection && formattedData.length > 0 ? (
+          <p className="mt-2 text-xs text-muted-foreground">
+            Dashed line: projection to{" "}
+            {new Date(projection.horizonEnd).toLocaleDateString(undefined, {
+              month: "short",
+              day: "numeric"
+            })}{" "}
+            from scheduled recurring flows only — projection, not a guarantee. Overdue occurrences
+            are not projected.
+            {projection.valuationAccountCount > 0
+              ? ` ${privacy ? "••••" : fmtMoney(projection.valuationFlatMinor, currency)} sits in valuation accounts held flat at today's value.`
+              : ""}
+            {projection.skippedSeries > 0
+              ? ` ${projection.skippedSeries} scheduled series skipped (invalid schedule).`
+              : ""}
+          </p>
+        ) : null}
       </CardContent>
     </Card>
   );

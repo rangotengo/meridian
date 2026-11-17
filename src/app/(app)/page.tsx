@@ -5,9 +5,11 @@ import {
   incomeExpenseSeries,
   mergeFxCompleteness,
   netWorthSeries,
+  netWorthProjectionSeries,
   type FxCompleteness
 } from "@/server/domain/reports";
 import { budgetOverview } from "@/server/domain/budgets";
+import { isFlagEnabled } from "@/server/flags";
 import { getUserPrivacyMode } from "@/server/domain/users";
 import { listAccountsForActor } from "@/server/domain/accounts";
 import { listCategories } from "@/server/domain/categories";
@@ -56,6 +58,15 @@ export default async function DashboardPage({
     ]);
   const series = seriesResult.points;
   const flows = flowsResult.flows;
+  const projectionEnabled = await isFlagEnabled(db, "net_worth_projections");
+  const lastHistoryPoint = series.length > 0 ? series[series.length - 1] : undefined;
+  const projection = projectionEnabled
+    ? await netWorthProjectionSeries(db, family, actor.userId, {
+        start: lastHistoryPoint
+          ? { date: lastHistoryPoint.date, valueMinor: lastHistoryPoint.valueMinor }
+          : undefined
+      })
+    : null;
 
   const privacy = await getUserPrivacyMode(db, actor.userId);
   const income = summary.incomeThisMonthMinor;
@@ -157,6 +168,15 @@ export default async function DashboardPage({
           pct: budget.overall.pct
         }
       : null,
+    projection: projection
+      ? {
+          points: projection.points,
+          horizonEnd: projection.horizonEnd,
+          valuationFlatMinor: projection.valuationFlatMinor,
+          valuationAccountCount: projection.valuationAccountCount,
+          skippedSeries: projection.skippedSeries
+        }
+      : null,
     fx: (() => {
       // The banner covers every total and chart on the page, so merge the
       // completeness of the summary, the historical series, the monthly
@@ -168,7 +188,13 @@ export default async function DashboardPage({
         fxIssues: summary.fxIssues ?? [],
         fxRates: summary.fxRates ?? []
       };
-      const merged = mergeFxCompleteness(summaryFx, seriesResult.fx, flowsResult.fx, budget.fx);
+      const merged = mergeFxCompleteness(
+        summaryFx,
+        seriesResult.fx,
+        flowsResult.fx,
+        budget.fx,
+        ...(projection ? [projection.fx] : [])
+      );
       return {
         incomplete: merged.incompleteFx,
         issues: merged.fxIssues,

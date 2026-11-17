@@ -8,7 +8,7 @@ export type FlagKey = (typeof FLAG_KEYS)[number];
 export const DEFAULT_FLAGS: Record<FlagKey, { enabled: boolean; description: string }> = {
   net_worth_projections: {
     enabled: false,
-    description: "Preview: project net worth trend into the next quarter."
+    description: "Project net worth into the next quarter from scheduled recurring flows."
   },
   monthly_digest_email: {
     enabled: false,

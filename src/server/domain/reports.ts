@@ -14,6 +14,13 @@ import {
   todayIn
 } from "@/lib/datetime";
 import { errors } from "@/lib/errors";
+import { isValuationDriven } from "../authorization/access";
+import {
+  nextOccurrence,
+  validateSeriesConfig,
+  type Frequency,
+  type SeriesConfig
+} from "./recurring";
 
 function safeParseMinor(raw: string | number): number {
   const n = typeof raw === "number" ? raw : Number(raw);
@@ -547,6 +554,268 @@ export async function netWorthSeries(
       .map(([date, v]) => ({ date, valueMinor: v })),
     fx,
     incompleteDates
+  };
+}
+
+export const NET_WORTH_PROJECTION_HORIZON_DAYS = 90;
+export const NET_WORTH_PROJECTION_STEP_DAYS = 7;
+
+export type NetWorthProjectionPoint = { date: string; valueMinor: number };
+
+export type NetWorthProjectionResult = {
+  points: NetWorthProjectionPoint[];
+  horizonDays: number;
+  horizonEnd: string;
+  startingMinor: number;
+  /** Converted value of valuation-driven accounts at the start, held flat. */
+  valuationFlatMinor: number;
+  valuationAccountCount: number;
+  /** Active series skipped because their stored schedule is invalid. */
+  skippedSeries: number;
+  fx: FxCompleteness;
+};
+
+/**
+ * Future occurrence dates for one series, strictly after `fromExclusive`
+ * up to and including `throughInclusive`. Overdue occurrences (nextDue in
+ * the past) are skipped: the scheduled poster will catch them up, so they
+ * are not a future flow — the bills widget flags them instead. Bounded so
+ * a series years behind stops advancing instead of looping.
+ */
+export function projectionOccurrenceDates(
+  frequency: Frequency,
+  config: SeriesConfig,
+  nextDue: string,
+  fromExclusive: string,
+  throughInclusive: string
+): string[] {
+  validateSeriesConfig(frequency, config);
+  const dates: string[] = [];
+  let occurrence = nextDue;
+  let guard = 0;
+  while (occurrence <= fromExclusive && guard < 366) {
+    occurrence = nextOccurrence(frequency, config, occurrence);
+    guard++;
+  }
+  while (occurrence <= throughInclusive && guard < 366) {
+    dates.push(occurrence);
+    occurrence = nextOccurrence(frequency, config, occurrence);
+    guard++;
+  }
+  return dates;
+}
+
+/** Weekly point dates from `start` through the horizon end (inclusive). */
+export function projectionPointDates(start: string, horizonEnd: string): string[] {
+  const dates: string[] = [start];
+  let d = addDays(start, NET_WORTH_PROJECTION_STEP_DAYS);
+  while (d < horizonEnd) {
+    dates.push(d);
+    d = addDays(d, NET_WORTH_PROJECTION_STEP_DAYS);
+  }
+  if (dates[dates.length - 1] !== horizonEnd) dates.push(horizonEnd);
+  return dates;
+}
+
+/**
+ * Apply dated net-worth deltas (already converted to the family currency)
+ * to the starting value at each point date. An occurrence dated on a point
+ * counts at that point.
+ */
+export function applyOccurrencesToPoints(
+  startMinor: number,
+  deltas: { date: string; deltaMinor: number }[],
+  pointDates: string[]
+): NetWorthProjectionPoint[] {
+  const sorted = [...deltas].sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+  let value = startMinor;
+  let i = 0;
+  return pointDates.map((date) => {
+    while (i < sorted.length && sorted[i]!.date <= date) {
+      value = safeAdd(value, sorted[i]!.deltaMinor);
+      i++;
+    }
+    return { date, valueMinor: value };
+  });
+}
+
+/**
+ * Project net worth forward from the last historical point, driven ONLY by
+ * the future occurrences of active recurring series over the next quarter
+ * (90 days). No trend extrapolation: a family with no scheduled flows
+ * projects flat.
+ *
+ * - The projection starts exactly where history ends (the caller passes the
+ *   last historical point so the chart joins cleanly); with no history it
+ *   starts at today's per-account balances.
+ * - Valuation-driven accounts (investments, loans) are held flat at their
+ *   starting value — market moves cannot be projected deterministically.
+ *   Their own scheduled occurrences still apply; `valuationFlatMinor`
+ *   reports how much of the starting value is held flat, so the UI can say
+ *   so. An outflow lowers net worth, income raises it.
+ * - Future amounts convert at the latest known rate for their date (see
+ *   getRateInfo); amounts with no rate are excluded and reported in `fx`,
+ *   exactly like the historical series.
+ * - A series whose stored schedule is invalid is skipped and counted in
+ *   `skippedSeries` rather than breaking the whole dashboard.
+ */
+export async function netWorthProjectionSeries(
+  exec: Executor,
+  family: Family,
+  userId: string,
+  opts: {
+    today?: string;
+    horizonDays?: number;
+    /** Last historical point; the projection joins onto it. */
+    start?: { date: string; valueMinor: number };
+  } = {}
+): Promise<NetWorthProjectionResult> {
+  const today = opts.today ?? todayIn(family.timezone);
+  const horizonDays = opts.horizonDays ?? NET_WORTH_PROJECTION_HORIZON_DAYS;
+  const horizonEnd = addDays(today, horizonDays);
+  const startDate = opts.start?.date ?? today;
+  const ctx = newConversionContext();
+
+  let startingMinor = opts.start?.valueMinor;
+  let valuationFlatMinor = 0;
+  let valuationAccountCount = 0;
+  if (startingMinor === undefined) {
+    // No history to join onto: start from the latest snapshot per
+    // in-scope account as of today — the same scope as netWorthSeries.
+    const balanceRows = await exec.execute<{
+      account_id: string;
+      balance_minor: string;
+      currency: string;
+      type: string;
+    }>(sql`
+      SELECT CAST(b.account_id AS TEXT) AS account_id, CAST(b.balance_minor AS TEXT) AS balance_minor, b.currency, a.type
+      FROM balances b
+      JOIN accounts a ON a.id = b.account_id
+      WHERE a.family_id = ${family.id}
+        AND a.status = 'active'
+        AND a.included_in_reports = true
+        AND ${ACCESS_SQL(userId)}
+        AND b.as_of <= ${today}
+        AND b.as_of = (SELECT MAX(latest.as_of) FROM balances latest WHERE latest.account_id = b.account_id AND latest.as_of <= ${today})
+    `);
+    startingMinor = 0;
+    for (const r of balanceRows.rows ?? []) {
+      const converted = await convertTo(
+        exec,
+        safeParseMinor(r.balance_minor),
+        r.currency,
+        family.currency,
+        today,
+        ctx
+      );
+      startingMinor = safeAdd(startingMinor, converted);
+      if (isValuationDriven(r.type)) {
+        valuationFlatMinor = safeAdd(valuationFlatMinor, converted);
+        valuationAccountCount++;
+      }
+    }
+  } else {
+    // The starting value came from history, so the flat/valuation split
+    // must come from the same snapshots that built that point — dated
+    // exactly on the start date — or the flat amount could exceed the
+    // joined total.
+    const balanceRows = await exec.execute<{
+      balance_minor: string;
+      currency: string;
+      type: string;
+    }>(sql`
+      SELECT CAST(b.balance_minor AS TEXT) AS balance_minor, b.currency, a.type
+      FROM balances b
+      JOIN accounts a ON a.id = b.account_id
+      WHERE a.family_id = ${family.id}
+        AND a.status = 'active'
+        AND a.included_in_reports = true
+        AND ${ACCESS_SQL(userId)}
+        AND b.as_of = ${startDate}
+    `);
+    for (const r of balanceRows.rows ?? []) {
+      if (!isValuationDriven(r.type)) continue;
+      const converted = await convertTo(
+        exec,
+        safeParseMinor(r.balance_minor),
+        r.currency,
+        family.currency,
+        startDate,
+        ctx
+      );
+      valuationFlatMinor = safeAdd(valuationFlatMinor, converted);
+      valuationAccountCount++;
+    }
+  }
+
+  const seriesRows = await exec.execute<{
+    id: string;
+    amount_minor: string;
+    currency: string;
+    frequency: string;
+    config: string | Record<string, unknown>;
+    next_due: string;
+  }>(sql`
+    SELECT CAST(s.id AS TEXT) AS id, CAST(s.amount_minor AS TEXT) AS amount_minor, s.currency, s.frequency, s.config, CAST(s.next_due AS TEXT) AS next_due
+    FROM recurring_series s
+    JOIN accounts a ON a.id = s.account_id
+    WHERE s.family_id = ${family.id}
+      AND s.active = true
+      AND a.status = 'active'
+      AND a.included_in_reports = true
+      AND ${ACCESS_SQL(userId)}
+  `);
+  const fromExclusive = startDate > today ? startDate : today;
+  const deltas: { date: string; deltaMinor: number }[] = [];
+  let skippedSeries = 0;
+  for (const r of seriesRows.rows ?? []) {
+    const config =
+      typeof r.config === "string"
+        ? (JSON.parse(r.config) as SeriesConfig)
+        : (r.config as SeriesConfig);
+    let dates: string[];
+    try {
+      dates = projectionOccurrenceDates(
+        r.frequency as Frequency,
+        config,
+        r.next_due.slice(0, 10),
+        fromExclusive,
+        horizonEnd
+      );
+    } catch {
+      skippedSeries++;
+      continue;
+    }
+    for (const date of dates) {
+      // A scheduled outflow lowers net worth; income raises it.
+      const converted = await convertTo(
+        exec,
+        -safeParseMinor(r.amount_minor),
+        r.currency,
+        family.currency,
+        date,
+        ctx
+      );
+      deltas.push({ date, deltaMinor: converted });
+    }
+  }
+
+  const points = applyOccurrencesToPoints(
+    startingMinor,
+    deltas,
+    projectionPointDates(startDate, horizonEnd)
+  );
+  const fx = completenessOf(ctx);
+  await reportFxIssues(exec, ctx, family.id, "net_worth_projection");
+  return {
+    points,
+    horizonDays,
+    horizonEnd,
+    startingMinor,
+    valuationFlatMinor,
+    valuationAccountCount,
+    skippedSeries,
+    fx
   };
 }
 

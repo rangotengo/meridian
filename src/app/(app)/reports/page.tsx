@@ -15,24 +15,13 @@ import { CategoryDonut } from "@/components/finance/category-donut";
 import { FxIssuesAlert } from "@/components/finance/fx-issues-alert";
 import { SpendingHeatmap } from "@/components/finance/spending-heatmap";
 import { fmtDate, fmtMoney, fmtMonth } from "@/lib/format";
+import { deltaWithPct } from "@/lib/period-comparison";
 import { monthKeyIn, todayIn } from "@/lib/datetime";
 import { REPORT_PERIODS, resolveReportRange, selectNetWorthInRange } from "@/lib/report-range";
 import { PrintButton } from "./print-button";
 import { cn } from "@/lib/utils";
 
 export const metadata = { title: "Reports" };
-
-// NOTE: duplicates the shared helper in src/lib/period-comparison.ts
-// (PR #22, unmerged at the time of writing). Replace with that import
-// once it lands instead of keeping two copies.
-function deltaWithPct(
-  currentMinor: number,
-  previousMinor: number
-): { deltaMinor: number; pct: number | null } {
-  const deltaMinor = currentMinor - previousMinor;
-  if (previousMinor === 0) return { deltaMinor, pct: null };
-  return { deltaMinor, pct: deltaMinor / Math.abs(previousMinor) };
-}
 
 function formatPct(pct: number | null): string {
   if (pct === null || !Number.isFinite(pct)) return "—";
