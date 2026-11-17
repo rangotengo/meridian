@@ -31,8 +31,6 @@ describe("categorySpendingCsv", () => {
       ],
       "USD"
     );
-    expect(csv).toBe(
-      "Category,Spending (USD)\nGroceries,1234.56\n\"Café, \"\"Central\"\"\",50.00\n"
-    );
+    expect(csv).toBe('Category,Spending (USD)\nGroceries,1234.56\n"Café, ""Central""",50.00\n');
   });
 });

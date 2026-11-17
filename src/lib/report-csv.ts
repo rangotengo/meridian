@@ -12,10 +12,7 @@ export type IncomeExpenseRow = {
 };
 
 /** One row per month: Month, Income, Spending, Net (major units). */
-export function incomeExpenseCsv(
-  flows: IncomeExpenseRow[],
-  currency: string
-): string {
+export function incomeExpenseCsv(flows: IncomeExpenseRow[], currency: string): string {
   const lines = [`Month,Income (${currency}),Spending (${currency}),Net (${currency})`];
   for (const flow of flows) {
     lines.push(
@@ -33,15 +30,10 @@ export function incomeExpenseCsv(
 export type CategorySpendingRow = { name: string; totalMinor: number };
 
 /** One row per category: Category, Spending (major units). */
-export function categorySpendingCsv(
-  categories: CategorySpendingRow[],
-  currency: string
-): string {
+export function categorySpendingCsv(categories: CategorySpendingRow[], currency: string): string {
   const lines = [`Category,Spending (${currency})`];
   for (const category of categories) {
-    lines.push(
-      [csvCell(category.name), minorToDecimal(category.totalMinor, currency)].join(",")
-    );
+    lines.push([csvCell(category.name), minorToDecimal(category.totalMinor, currency)].join(","));
   }
   return `${lines.join("\n")}\n`;
 }
