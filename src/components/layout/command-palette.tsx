@@ -19,6 +19,7 @@ import {
   ArrowLeftRightIcon,
   PlusIcon,
   ChartAreaIcon,
+  PiggyBankIcon,
   TargetIcon,
   MessageCircleIcon,
   SettingsIcon,
@@ -44,6 +45,7 @@ const pages = [
   { label: "Quick add", icon: PlusIcon, href: "/quick-add", shortcut: "Q" },
   { label: "Reports", icon: ChartAreaIcon, href: "/reports" },
   { label: "Budgets", icon: TargetIcon, href: "/budgets" },
+  { label: "Goals", icon: PiggyBankIcon, href: "/goals" },
   { label: "Assistant", icon: MessageCircleIcon, href: "/chat" },
   { label: "Settings", icon: SettingsIcon, href: "/settings" }
 ];

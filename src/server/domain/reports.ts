@@ -710,6 +710,79 @@ export async function spendingByCategory(
   };
 }
 
+export type IncomeByCategoryResult = {
+  categories: { categoryId: string | null; name: string; totalMinor: number }[];
+  fx: FxCompleteness;
+};
+
+/**
+ * Income grouped by category over a range — the income mirror of
+ * spendingByCategory, with identical filters and FX completeness semantics
+ * (transfer legs, split parts and opening adjustments excluded; amounts
+ * converted to the family currency per currency group). Totals are
+ * positive (money in). Category-linked goals measure progress with this:
+ * income earned in the goal's category since the goal was created.
+ */
+export async function incomeByCategory(
+  exec: Executor,
+  family: Family,
+  userId: string,
+  range: { from: string; to: string }
+): Promise<IncomeByCategoryResult> {
+  const ctx = newConversionContext();
+  const res = await exec.execute<{
+    category_id: string | null;
+    name: string | null;
+    total_minor: string;
+    currency: string;
+  }>(sql`
+    SELECT CAST(t.category_id AS TEXT) AS category_id, c.name, CAST(SUM(e.amount_minor) AS TEXT) AS total_minor, e.currency
+    FROM entries e
+    JOIN accounts a ON a.id = e.account_id
+    JOIN transactions t ON t.entry_id = e.id
+    LEFT JOIN categories c ON c.id = t.category_id
+    WHERE a.family_id = ${family.id}
+      AND a.included_in_reports = true
+      AND a.status = 'active'
+      AND ${ACCESS_SQL(userId)}
+      AND e.entryable_type = 'transaction'
+      AND t.transfer_id IS NULL
+      ${NOT_OPENING_ADJUSTMENT_SQL}
+      AND NOT EXISTS (SELECT 1 FROM entries c WHERE c.parent_entry_id = e.id)
+      AND e.amount_minor < 0
+      AND e.date BETWEEN ${range.from} AND ${range.to}
+    GROUP BY t.category_id, c.name, e.currency
+  `);
+
+  const totals = new Map<string, { categoryId: string | null; name: string; totalMinor: number }>();
+  for (const r of res.rows ?? []) {
+    const converted = await convertTo(
+      exec,
+      -safeParseMinor(r.total_minor),
+      r.currency,
+      family.currency,
+      range.to,
+      ctx
+    );
+    const key = r.category_id ?? "uncategorized";
+    const existing = totals.get(key);
+    const next = safeAdd(existing?.totalMinor ?? 0, converted);
+    totals.set(key, {
+      categoryId: r.category_id,
+      name: r.name ?? "Uncategorized",
+      totalMinor: next
+    });
+  }
+
+  const fx = completenessOf(ctx);
+  await reportFxIssues(exec, ctx, family.id, "income_by_category");
+
+  return {
+    categories: [...totals.values()].sort((a, b) => b.totalMinor - a.totalMinor),
+    fx
+  };
+}
+
 export type MerchantSpending = {
   merchant: string | null;
   totalMinor: number;
