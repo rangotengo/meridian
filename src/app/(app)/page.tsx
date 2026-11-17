@@ -8,6 +8,7 @@ import {
   type FxCompleteness
 } from "@/server/domain/reports";
 import { budgetOverview } from "@/server/domain/budgets";
+import { listGoalsWithProgress } from "@/server/domain/goals";
 import { getUserPrivacyMode } from "@/server/domain/users";
 import { listAccountsForActor } from "@/server/domain/accounts";
 import { listCategories } from "@/server/domain/categories";
@@ -44,7 +45,7 @@ export default async function DashboardPage({
   const nwRange = nw && NW_RANGES.has(nw) ? nw : "90";
   const seriesDays = nwRange === "all" ? ("all" as const) : Number(nwRange);
 
-  const [summary, accounts, seriesResult, budget, flowsResult, categories, tags] =
+  const [summary, accounts, seriesResult, budget, flowsResult, categories, tags, goals] =
     await Promise.all([
       dashboardSummary(db, family, actor.userId),
       listAccountsForActor(db, actor),
@@ -52,7 +53,8 @@ export default async function DashboardPage({
       budgetOverview(db, family, actor.userId),
       incomeExpenseSeries(db, family, actor.userId, 12),
       listCategories(db, actor.familyId),
-      listTags(db, actor.familyId)
+      listTags(db, actor.familyId),
+      listGoalsWithProgress(db, actor, family)
     ]);
   const series = seriesResult.points;
   const flows = flowsResult.flows;
@@ -149,6 +151,7 @@ export default async function DashboardPage({
       tags: tags.map((t) => ({ id: t.id, name: t.name })),
       today: todayIn(family.timezone)
     },
+    goals,
     budgetOverall: budget.overall
       ? {
           limitMinor: budget.overall.limitMinor,

@@ -18,6 +18,7 @@ import migration15 from "../../../../db/cloud-migrations/0016_ssis_config_genera
 import migration16 from "../../../../db/cloud-migrations/0017_balance_tracking.up.sql";
 import migration17 from "../../../../db/cloud-migrations/0018_mcp_ssis_access.up.sql";
 import migration18 from "../../../../db/cloud-migrations/0019_ssis_dataset_coverage.up.sql";
+import migration19 from "../../../../db/cloud-migrations/0020_goals.up.sql";
 
 export const cloudMigrations = [
   { name: "0001_init", sql: migration0 },
@@ -38,5 +39,6 @@ export const cloudMigrations = [
   { name: "0016_ssis_config_generation", sql: migration15 },
   { name: "0017_balance_tracking", sql: migration16 },
   { name: "0018_mcp_ssis_access", sql: migration17 },
-  { name: "0019_ssis_dataset_coverage", sql: migration18 }
+  { name: "0019_ssis_dataset_coverage", sql: migration18 },
+  { name: "0020_goals", sql: migration19 }
 ];
