@@ -10,7 +10,7 @@ import {
 } from "@/components/ui/chart";
 import { Area, AreaChart, CartesianGrid, XAxis, YAxis, type DotProps } from "recharts";
 import { useDashboardData } from "@/components/finance/dashboard-data";
-import { fmtMoney } from "@/lib/format";
+import { fmtMoney, fmtSignedMoney } from "@/lib/format";
 import { minorToMajor } from "@/lib/money";
 import { netWorthChange } from "@/lib/period-comparison";
 
@@ -86,12 +86,7 @@ export function FinancialOverview() {
             >
               {privacy
                 ? "••••"
-                : `${change.deltaMinor >= 0 ? "+" : ""}${fmtMoney(
-                    change.deltaMinor,
-                    currency,
-                    "en",
-                    "always"
-                  )} (${formatPct(change.pct)})`}
+                : `${fmtSignedMoney(change.deltaMinor, currency)} (${formatPct(change.pct)})`}
               <span className="ml-1 text-xs font-normal text-muted-foreground">
                 vs {startLabel}
               </span>

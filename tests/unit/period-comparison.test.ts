@@ -94,9 +94,7 @@ describe("sumFlows / compareFlowWindows", () => {
   });
 
   it("compares a window against the previous window", () => {
-    const result = compareFlowWindows(flows, [
-      { incomeMinor: 100000, expenseMinor: 50000 }
-    ]);
+    const result = compareFlowWindows(flows, [{ incomeMinor: 100000, expenseMinor: 50000 }]);
     expect(result.current).toEqual({ inMinor: 220000, outMinor: 140000, netMinor: 80000 });
     expect(result.previousMonths).toBe(1);
     expect(result.in).toEqual({ deltaMinor: 120000, pct: 1.2 });
@@ -115,9 +113,7 @@ describe("sumFlows / compareFlowWindows", () => {
 describe("monthVsLastMonth", () => {
   it("returns null with fewer than two months", () => {
     expect(monthVsLastMonth([])).toBeNull();
-    expect(
-      monthVsLastMonth([{ monthKey: "2026-11", incomeMinor: 1, expenseMinor: 1 }])
-    ).toBeNull();
+    expect(monthVsLastMonth([{ monthKey: "2026-11", incomeMinor: 1, expenseMinor: 1 }])).toBeNull();
   });
 
   it("compares the last two months", () => {
