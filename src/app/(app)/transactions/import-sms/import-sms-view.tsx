@@ -37,13 +37,28 @@ export function ImportSmsView({
   const [previewState, previewAction] = useActionState(previewSmsImportAction, undefined);
   const [rawSms, setRawSms] = useState("");
   const [sender, setSender] = useState("");
+  // The inputs the current preview was parsed from. The preview (and its
+  // confirm form) only describe one SMS, so once the text or sender is
+  // edited the preview is stale: showing it would let the confirm form
+  // submit the edited SMS together with the old preview's values.
+  const [previewInputs, setPreviewInputs] = useState<{
+    rawSms: string;
+    sender: string;
+  } | null>(null);
   const preview = previewState?.ok ? previewState.data : null;
+  const previewStale =
+    preview !== null &&
+    (previewInputs === null || previewInputs.rawSms !== rawSms || previewInputs.sender !== sender);
 
   return (
     <div className="space-y-4">
       <Card>
         <h2 className="mb-3 text-base font-medium text-primary">Paste the SMS</h2>
-        <form action={previewAction} className="space-y-3">
+        <form
+          action={previewAction}
+          onSubmit={() => setPreviewInputs({ rawSms, sender })}
+          className="space-y-3"
+        >
           <Field label="SMS text">
             <textarea
               name="rawSms"
@@ -72,7 +87,7 @@ export function ImportSmsView({
         </form>
       </Card>
 
-      {preview ? (
+      {preview && !previewStale ? (
         <PreviewCard
           key={preview.parsed.referenceId ?? "preview"}
           preview={preview}
@@ -81,6 +96,15 @@ export function ImportSmsView({
           rawSms={rawSms}
           sender={sender}
         />
+      ) : null}
+      {preview && previewStale ? (
+        <Card>
+          <p className="text-sm font-medium">The SMS text changed since this preview.</p>
+          <p className="mt-1 text-sm text-muted-foreground">
+            The preview below no longer describes the text above, so the record button is hidden
+            until you parse again.
+          </p>
+        </Card>
       ) : null}
     </div>
   );

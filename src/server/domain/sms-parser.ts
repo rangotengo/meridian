@@ -282,10 +282,16 @@ export function parseSms(text: string, sender?: string | null): ParsedSmsResult 
     }
   }
 
-  // Deterministic fallback for deduplication
+  // Deterministic fallback for deduplication. The identity must be
+  // stable across days: an SMS with no explicit date gets today's date
+  // as its *display* date, but that default must not leak into the
+  // identity, or the same text would dedupe differently tomorrow. Only
+  // a date the SMS itself carried is part of the identity.
   if (!referenceId && amountMinor > 0) {
     const rawHash = hashToken(clean).slice(0, 12);
-    referenceId = `sms_${date}_${amountMinor}_${accountDigits ?? "acct"}_${rawHash}`;
+    referenceId = dateExplicit
+      ? `sms_${date}_${amountMinor}_${accountDigits ?? "acct"}_${rawHash}`
+      : `sms_${amountMinor}_${accountDigits ?? "acct"}_${rawHash}`;
   }
 
   return {
@@ -303,4 +309,18 @@ export function parseSms(text: string, sender?: string | null): ParsedSmsResult 
     referenceId,
     rawText: clean
   };
+}
+
+/**
+ * The stable tail of a deterministic `sms_…` fallback id: the 12-hex-char
+ * hash of the raw text. Legacy fallback ids embedded the import day's
+ * date (`sms_2026-11-17_…_<tail>`); the current format omits the date
+ * when the SMS carried none. Both forms end with the same tail, so the
+ * entry layer can recognise a legacy id for the same SMS. Returns null
+ * for anything that is not a fallback id (e.g. a bank reference).
+ */
+export function smsFallbackIdTail(referenceId: string | null): string | null {
+  if (!referenceId) return null;
+  const match = referenceId.match(/^sms_.*_([0-9a-f]{12})$/);
+  return match?.[1] ?? null;
 }

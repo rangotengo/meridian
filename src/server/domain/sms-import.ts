@@ -13,8 +13,12 @@ import { errors } from "@/lib/errors";
 /**
  * Dedupe identity for bank/wallet SMS imports. The identity is the SMS
  * reference id (parsed from the message, or the deterministic `sms_…`
- * fallback the parser builds from date + amount + account digits + text
- * hash), stored as the entry's externalId under this source. The web
+ * fallback the parser builds from amount + account digits + text hash —
+ * plus the SMS's own date when it carried one; a defaulted "today" is
+ * never part of the identity, so the same undated text dedupes the same
+ * way tomorrow). Entries recorded before that change carry a legacy
+ * dated fallback id; the entry layer recognises those by their hash
+ * tail. Stored as the entry's externalId under this source. The web
  * import deliberately reuses the Shortcuts flow's source string, so the
  * same SMS can never be recorded twice no matter which path recorded it
  * first — a second import of the same SMS reports "already recorded"

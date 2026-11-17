@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll } from "vitest";
+import { describe, it, expect, beforeAll, vi } from "vitest";
 import { sql } from "drizzle-orm";
 import { db, makeUser, makeAccount, addTxn, truncateAll, daysAgo, actorOf } from "../helpers";
 import { currentFamily } from "@/server/auth/context";
@@ -197,5 +197,109 @@ describe("sms import — confirm and dedupe", () => {
       })
     ).rejects.toThrow("Could not find an amount");
     expect(await entryCount(accountId)).toBe(0);
+  });
+});
+
+describe("sms import — undated dedupe across days and paths", () => {
+  const UNDATED_SMS = "Your account XX1234 debited NPR 100.00 at Store";
+
+  async function setupHousehold() {
+    const user = await makeUser({ currency: "NPR" });
+    const actor = actorOf(user);
+    const family = await currentFamily(actor);
+    const accountId = await makeAccount(user, {
+      name: "Savings 1234",
+      currency: "NPR"
+    });
+    return { user, actor, family, accountId };
+  }
+
+  it("dedupes the same undated SMS recorded on consecutive days", async () => {
+    const { actor, family, accountId } = await setupHousehold();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(new Date("2026-11-17T12:00:00Z"));
+      const first = await smsImport.confirmSmsImport(db(), actor, family, {
+        rawSms: UNDATED_SMS,
+        accountId
+      });
+      expect(first.duplicated).toBe(false);
+
+      vi.setSystemTime(new Date("2026-11-18T12:00:00Z"));
+      const preview = await smsImport.previewSmsImport(db(), actor, family, UNDATED_SMS);
+      expect(preview.duplicateEntryId).toBe(first.entryId);
+
+      const second = await smsImport.confirmSmsImport(db(), actor, family, {
+        rawSms: UNDATED_SMS,
+        accountId
+      });
+      expect(second).toEqual({ entryId: first.entryId, duplicated: true });
+      expect(await entryCount(accountId)).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("dedupes across the Shortcuts path on the next day", async () => {
+    const { actor, family, accountId } = await setupHousehold();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      // Day 1: the Shortcuts API records with the parsed reference id.
+      vi.setSystemTime(new Date("2026-11-17T12:00:00Z"));
+      const referenceId = parseSms(UNDATED_SMS).referenceId!;
+      const viaShortcuts = await entriesSvc.createTransactionEntry(db(), actor, {
+        accountId,
+        date: "2026-11-17",
+        amountLedgerMinor: 10_000,
+        name: "Store",
+        externalSource: "sms_shortcut",
+        externalId: referenceId
+      });
+      expect(viaShortcuts.duplicated).toBe(false);
+
+      // Day 2: the web import of the same text must find it.
+      vi.setSystemTime(new Date("2026-11-18T12:00:00Z"));
+      const viaWeb = await smsImport.confirmSmsImport(db(), actor, family, {
+        rawSms: UNDATED_SMS,
+        accountId
+      });
+      expect(viaWeb).toEqual({ entryId: viaShortcuts.entryId, duplicated: true });
+      expect(await entryCount(accountId)).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still dedupes against a legacy dated fallback id", async () => {
+    const { actor, family, accountId } = await setupHousehold();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      // Day 1 (old format): the entry was recorded with the dated id.
+      vi.setSystemTime(new Date("2026-11-17T12:00:00Z"));
+      const legacyId = parseSms(UNDATED_SMS).referenceId!.replace("sms_", "sms_2026-11-17_");
+      expect(legacyId).toBe("sms_2026-11-17_10000_1234_230b09eb42cd");
+      const recorded = await entriesSvc.createTransactionEntry(db(), actor, {
+        accountId,
+        date: "2026-11-17",
+        amountLedgerMinor: 10_000,
+        name: "Store",
+        externalSource: "sms_shortcut",
+        externalId: legacyId
+      });
+      expect(recorded.duplicated).toBe(false);
+
+      // Day 2 (new format): preview and confirm must both find it.
+      vi.setSystemTime(new Date("2026-11-18T12:00:00Z"));
+      const preview = await smsImport.previewSmsImport(db(), actor, family, UNDATED_SMS);
+      expect(preview.duplicateEntryId).toBe(recorded.entryId);
+      const second = await smsImport.confirmSmsImport(db(), actor, family, {
+        rawSms: UNDATED_SMS,
+        accountId
+      });
+      expect(second).toEqual({ entryId: recorded.entryId, duplicated: true });
+      expect(await entryCount(accountId)).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
