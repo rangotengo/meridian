@@ -7,6 +7,7 @@ import {
   spendingByCategory,
   currentMonthRange,
   monthRangeOf,
+  mergeFxCompleteness,
   type FxCompleteness
 } from "./reports";
 import { errors } from "@/lib/errors";
@@ -112,10 +113,19 @@ export async function setBudget(
   const rollover = input.rollover ?? current?.rollover ?? false;
 
   await exec.transaction(async (tx) => {
+    // Only currently active rows are deactivated: rewriting updatedAt on
+    // already-inactive historical rows would move their end date forward
+    // and resurrect them for limitActiveAt (phantom rollover).
     await tx
       .update(budgets)
       .set({ active: false, updatedAt: new Date() })
-      .where(and(eq(budgets.familyId, actor.familyId), categoryMatch(input.categoryId)));
+      .where(
+        and(
+          eq(budgets.familyId, actor.familyId),
+          categoryMatch(input.categoryId),
+          eq(budgets.active, true)
+        )
+      );
     await tx.insert(budgets).values({
       familyId: actor.familyId,
       categoryId: input.categoryId,
@@ -194,7 +204,8 @@ export async function removeBudget(
         eq(budgets.familyId, actor.familyId),
         categoryId === null
           ? sql`${budgets.categoryId} IS NULL`
-          : eq(budgets.categoryId, categoryId)
+          : eq(budgets.categoryId, categoryId),
+        eq(budgets.active, true)
       )
     )
     .returning({ id: budgets.id });
@@ -352,7 +363,10 @@ export async function budgetOverview(
       .filter((c) => !budgetedCategoryIds.has(c.id))
       .map((c) => ({ id: c.id, name: c.name })),
     summary,
-    fx: spending.fx
+    // Rollover credit is computed from last month's spending, so its FX
+    // gaps belong to this overview too; without them an unconvertible
+    // last-month amount would silently inflate the credit.
+    fx: lastSpending ? mergeFxCompleteness(spending.fx, lastSpending.fx) : spending.fx
   };
 }
 
