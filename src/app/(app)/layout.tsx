@@ -28,14 +28,12 @@ export default async function AppLayout({ children }: { children: React.ReactNod
   const accounts = await listAccountsForActor(db, actor);
   const [categoryNodes, merchants] = await Promise.all([
     listCategories(db, actor.familyId),
-    listRecentMerchants(db, actor.familyId)
+    listRecentMerchants(db, actor)
   ]);
   const categories = categoryNodes.map((c) => ({
     id: c.id,
     name: c.name,
-    parentName: c.parentId
-      ? (categoryNodes.find((p) => p.id === c.parentId)?.name ?? null)
-      : null
+    parentName: c.parentId ? (categoryNodes.find((p) => p.id === c.parentId)?.name ?? null) : null
   }));
   const active = accounts.filter((a) => a.status === "active");
   const reportAccounts = active.filter((a) => a.includedInReports);
