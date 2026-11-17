@@ -14,7 +14,7 @@ import { SubmitButton } from "@/components/ds/submit-button";
 import { Amount } from "@/components/finance/amount";
 import { fmtDate } from "@/lib/format";
 import type { SsisInsightData } from "@/server/domain/ssis";
-import { RefreshCwIcon, UploadIcon } from "lucide-react";
+import { ChevronDownIcon, ChevronUpIcon, RefreshCwIcon, UploadIcon } from "lucide-react";
 
 function formatNav(minor: number | null): string {
   return minor === null ? "—" : (minor / 100).toFixed(2);
@@ -48,10 +48,59 @@ export function SsisSyncFeedback({ result }: { result?: SsisImportResult }) {
   );
 }
 
+/**
+ * Setup is complete once the BO account is configured AND data has arrived
+ * (snapshot import or live refresh). Until then the panel stays expanded:
+ * there is no collapse control for incomplete setup.
+ *
+ * The collapsed default is decided on mount. Completing setup during this
+ * visit (e.g. importing a snapshot) leaves the panel open so the
+ * import/refresh confirmation stays visible; the summary row is the
+ * default on the next visit.
+ */
 function Controls({ data }: { data: SsisInsightData }) {
+  const setupComplete = data.hasBoAccount && data.hasData;
+  const [expanded, setExpanded] = useState(!setupComplete);
   const [importState, importAction] = useActionState(importSsisAction, undefined);
   const [refreshState, refreshAction] = useActionState(refreshSsisAction, undefined);
   const [boState, boAction] = useActionState(setSsisBoAccountAction, undefined);
+
+  if (!expanded) {
+    const summaryParts = [`BO account ${data.boAccountMasked}`];
+    summaryParts.push(
+      `${data.purchases.length} purchase${data.purchases.length === 1 ? "" : "s"} · ` +
+        `${data.statement.length} statement row${data.statement.length === 1 ? "" : "s"}`
+    );
+    if (data.lastFetchedAt) {
+      // lastFetchedAt is a full ISO timestamp (unlike the date-only
+      // strings fmtDate handles), so format it the same way the page
+      // header does.
+      summaryParts.push(
+        `Last updated ${new Date(data.lastFetchedAt).toLocaleString()} via ${
+          data.lastSource === "refresh" ? "live refresh" : "snapshot import"
+        }`
+      );
+    }
+    return (
+      <Card>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="space-y-1">
+            <h2 className="text-base font-semibold">SSIS setup</h2>
+            <p className="text-sm text-muted-foreground">{summaryParts.join(" · ")}</p>
+          </div>
+          <button
+            type="button"
+            onClick={() => setExpanded(true)}
+            aria-expanded={false}
+            aria-controls="ssis-setup-panel"
+            className="inline-flex min-h-9 items-center justify-center gap-2 rounded-lg border border-border bg-card px-3.5 py-2 text-sm font-medium shadow-sm hover:bg-accent"
+          >
+            Edit setup <ChevronDownIcon className="h-4 w-4" aria-hidden />
+          </button>
+        </div>
+      </Card>
+    );
+  }
 
   return (
     <Card className="space-y-5">
@@ -64,75 +113,90 @@ function Controls({ data }: { data: SsisInsightData }) {
               : "Set your BO account number below to enable live refresh. It is stored only for server-side refresh calls and never shown in full."}
           </p>
         </div>
-        <form action={refreshAction}>
-          <SubmitButton variant="secondary" disabled={!data.hasBoAccount}>
-            <RefreshCwIcon className="h-4 w-4" /> Refresh now
-          </SubmitButton>
-        </form>
-      </div>
-      <FormError message={refreshState?.ok === false ? refreshState.error : undefined} />
-      <SsisSyncFeedback result={refreshState?.ok ? refreshState.data : undefined} />
-
-      <div className="border-t border-border pt-4">
-        <h3 className="text-sm font-semibold">Import a snapshot</h3>
-        <p className="mt-1 text-sm text-muted-foreground">
-          Upload the exported SSIS JSON (the nav.json shape). Only the fields this page displays are
-          kept — personal identifiers in the file are discarded on import.
-        </p>
-        <form action={importAction} className="mt-3 flex flex-wrap items-center gap-3">
-          <input
-            type="file"
-            name="snapshot"
-            accept="application/json,.json"
-            required
-            className="text-sm file:mr-3 file:rounded-lg file:border file:border-border file:bg-card file:px-3 file:py-2 file:text-sm file:font-medium"
-          />
-          <SubmitButton variant="secondary">
-            <UploadIcon className="h-4 w-4" /> Import snapshot
-          </SubmitButton>
-        </form>
-        <FormError message={importState?.ok === false ? importState.error : undefined} />
-        <div className="mt-2">
-          <SsisSyncFeedback result={importState?.ok ? importState.data : undefined} />
+        <div className="flex flex-wrap items-start gap-2">
+          <form action={refreshAction}>
+            <SubmitButton variant="secondary" disabled={!data.hasBoAccount}>
+              <RefreshCwIcon className="h-4 w-4" /> Refresh now
+            </SubmitButton>
+          </form>
+          {setupComplete ? (
+            <button
+              type="button"
+              onClick={() => setExpanded(false)}
+              aria-expanded={true}
+              aria-controls="ssis-setup-panel"
+              className="inline-flex min-h-9 items-center justify-center gap-2 rounded-lg border border-border bg-card px-3.5 py-2 text-sm font-medium shadow-sm hover:bg-accent"
+            >
+              Collapse <ChevronUpIcon className="h-4 w-4" aria-hidden />
+            </button>
+          ) : null}
         </div>
       </div>
+      <div id="ssis-setup-panel" className="space-y-5">
+        <FormError message={refreshState?.ok === false ? refreshState.error : undefined} />
+        <SsisSyncFeedback result={refreshState?.ok ? refreshState.data : undefined} />
 
-      <div className="border-t border-border pt-4">
-        <h3 className="text-sm font-semibold">BO account number</h3>
-        <p className="mt-1 text-sm text-muted-foreground">
-          {data.hasBoAccount
-            ? `Currently set to ${data.boAccountMasked}. Enter a new number to replace it. This insight holds one holder's data: saving a different number requires confirming the switch below, which clears the current holder's purchases and statement.`
-            : "Not set. Refresh stays disabled until it is configured."}
-        </p>
-        <form action={boAction} className="mt-3 flex flex-wrap items-end gap-3">
-          <Field label="BO account number">
-            <Input
-              name="boAccountNo"
-              inputMode="numeric"
-              autoComplete="off"
-              placeholder="e.g. 1301…"
-              required
-            />
-          </Field>
-          <SubmitButton variant="secondary">Save</SubmitButton>
-          {data.hasBoAccount && (data.purchases.length > 0 || data.statement.length > 0) ? (
-            <label className="flex w-full items-start gap-2 text-sm text-muted-foreground">
-              <input type="checkbox" name="resetExistingData" className="mt-0.5" />
-              <span>
-                This is a different holder: clear the existing purchases and statement and switch.
-              </span>
-            </label>
-          ) : null}
-        </form>
-        <FormError message={boState?.ok === false ? boState.error : undefined} />
-        {boState?.ok ? (
-          <p className="mt-2 text-sm text-muted-foreground">
-            Saved.
-            {boState.data?.dataReset
-              ? " The previous holder's purchases and statement were cleared."
-              : ""}
+        <div className="border-t border-border pt-4">
+          <h3 className="text-sm font-semibold">Import a snapshot</h3>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Upload the exported SSIS JSON (the nav.json shape). Only the fields this page displays
+            are kept — personal identifiers in the file are discarded on import.
           </p>
-        ) : null}
+          <form action={importAction} className="mt-3 flex flex-wrap items-center gap-3">
+            <input
+              type="file"
+              name="snapshot"
+              accept="application/json,.json"
+              required
+              className="text-sm file:mr-3 file:rounded-lg file:border file:border-border file:bg-card file:px-3 file:py-2 file:text-sm file:font-medium"
+            />
+            <SubmitButton variant="secondary">
+              <UploadIcon className="h-4 w-4" /> Import snapshot
+            </SubmitButton>
+          </form>
+          <FormError message={importState?.ok === false ? importState.error : undefined} />
+          <div className="mt-2">
+            <SsisSyncFeedback result={importState?.ok ? importState.data : undefined} />
+          </div>
+        </div>
+
+        <div className="border-t border-border pt-4">
+          <h3 className="text-sm font-semibold">BO account number</h3>
+          <p className="mt-1 text-sm text-muted-foreground">
+            {data.hasBoAccount
+              ? `Currently set to ${data.boAccountMasked}. Enter a new number to replace it. This insight holds one holder's data: saving a different number requires confirming the switch below, which clears the current holder's purchases and statement.`
+              : "Not set. Refresh stays disabled until it is configured."}
+          </p>
+          <form action={boAction} className="mt-3 flex flex-wrap items-end gap-3">
+            <Field label="BO account number">
+              <Input
+                name="boAccountNo"
+                inputMode="numeric"
+                autoComplete="off"
+                placeholder="e.g. 1301…"
+                required
+              />
+            </Field>
+            <SubmitButton variant="secondary">Save</SubmitButton>
+            {data.hasBoAccount && (data.purchases.length > 0 || data.statement.length > 0) ? (
+              <label className="flex w-full items-start gap-2 text-sm text-muted-foreground">
+                <input type="checkbox" name="resetExistingData" className="mt-0.5" />
+                <span>
+                  This is a different holder: clear the existing purchases and statement and switch.
+                </span>
+              </label>
+            ) : null}
+          </form>
+          <FormError message={boState?.ok === false ? boState.error : undefined} />
+          {boState?.ok ? (
+            <p className="mt-2 text-sm text-muted-foreground">
+              Saved.
+              {boState.data?.dataReset
+                ? " The previous holder's purchases and statement were cleared."
+                : ""}
+            </p>
+          ) : null}
+        </div>
       </div>
     </Card>
   );
