@@ -3,6 +3,8 @@ import { requireVerifiedActor, currentFamily } from "@/server/auth/context";
 import { getDb } from "@/server/db/client";
 import { users } from "@/server/db/schema";
 import { listAccountsForActor, isLiability } from "@/server/domain/accounts";
+import { listCategories } from "@/server/domain/categories";
+import { listRecentMerchants } from "@/server/domain/merchants";
 import { netWorthMinorForAccounts } from "@/server/domain/reports";
 import { getPreference } from "@/server/domain/users";
 import { signOutAction, togglePrivacyAction } from "@/server/actions/session-actions";
@@ -24,6 +26,15 @@ export default async function AppLayout({ children }: { children: React.ReactNod
     : false;
 
   const accounts = await listAccountsForActor(db, actor);
+  const [categoryNodes, merchants] = await Promise.all([
+    listCategories(db, actor.familyId),
+    listRecentMerchants(db, actor)
+  ]);
+  const categories = categoryNodes.map((c) => ({
+    id: c.id,
+    name: c.name,
+    parentName: c.parentId ? (categoryNodes.find((p) => p.id === c.parentId)?.name ?? null) : null
+  }));
   const active = accounts.filter((a) => a.status === "active");
   const reportAccounts = active.filter((a) => a.includedInReports);
   const toNav = (a: (typeof accounts)[number]) => ({
@@ -53,6 +64,8 @@ export default async function AppLayout({ children }: { children: React.ReactNod
       privacy={privacy}
       assets={assets}
       liabilities={liabilities}
+      categories={categories}
+      merchants={merchants}
       netWorthMinor={netWorthMinor}
       fxIssues={sidebarFx.fxIssues}
       currency={family.currency}
