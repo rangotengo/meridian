@@ -598,6 +598,48 @@ export const budgets = sqliteTable(
   ]
 );
 
+export const goals = sqliteTable(
+  "goals",
+  {
+    id: text("id")
+      .primaryKey()
+      .$defaultFn(() => crypto.randomUUID()),
+    familyId: text("family_id")
+      .notNull()
+      .references(() => families.id, { onDelete: "cascade" }),
+    createdBy: text("created_by")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    name: text("name").notNull(),
+    targetMinor: integer("target_minor").notNull(),
+    currency: text("currency").notNull(),
+    deadline: text("deadline"),
+    accountId: text("account_id").references(() => accounts.id, { onDelete: "set null" }),
+    categoryId: text("category_id").references(() => categories.id, { onDelete: "set null" }),
+    startingBalanceMinor: integer("starting_balance_minor").notNull().default(0),
+    status: text("status").notNull().default("active"),
+    createdAt: isoTimestamp("created_at")
+      .notNull()
+      .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`),
+    updatedAt: isoTimestamp("updated_at")
+      .notNull()
+      .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`)
+  },
+  (t) => [
+    check("goals_target_minor_check", sql`${t.targetMinor} > 0`),
+    check("goals_status_check", sql`${t.status} IN ('active', 'achieved', 'archived')`),
+    // At most one link: creation enforces exactly one, but ON DELETE SET
+    // NULL must be able to clear the surviving link when its target is
+    // deleted (a goal with no link is the link-removed state).
+    check(
+      "goals_at_most_one_link_check",
+      sql`NOT (${t.accountId} IS NOT NULL AND ${t.categoryId} IS NOT NULL)`
+    ),
+    index("goals_family_idx").on(t.familyId),
+    index("goals_family_status_idx").on(t.familyId, t.status)
+  ]
+);
+
 export const savedFilters = sqliteTable(
   "saved_filters",
   {

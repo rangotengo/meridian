@@ -25,6 +25,7 @@ const TABLES = [
   "chat_proposals",
   "saved_filters",
   "budgets",
+  "goals",
   "transaction_tags",
   "transfers",
   "valuations",

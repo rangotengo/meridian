@@ -9,6 +9,8 @@ import {
   type FxCompleteness
 } from "@/server/domain/reports";
 import { budgetOverview } from "@/server/domain/budgets";
+import { listGoalsWithProgress } from "@/server/domain/goals";
+import { listUpcomingBills } from "@/server/domain/bills";
 import { isFlagEnabled } from "@/server/flags";
 import { getUserPrivacyMode } from "@/server/domain/users";
 import { listAccountsForActor } from "@/server/domain/accounts";
@@ -46,7 +48,7 @@ export default async function DashboardPage({
   const nwRange = nw && NW_RANGES.has(nw) ? nw : "90";
   const seriesDays = nwRange === "all" ? ("all" as const) : Number(nwRange);
 
-  const [summary, accounts, seriesResult, budget, flowsResult, categories, tags] =
+  const [summary, accounts, seriesResult, budget, flowsResult, categories, tags, goals, bills] =
     await Promise.all([
       dashboardSummary(db, family, actor.userId),
       listAccountsForActor(db, actor),
@@ -54,7 +56,9 @@ export default async function DashboardPage({
       budgetOverview(db, family, actor.userId),
       incomeExpenseSeries(db, family, actor.userId, 12),
       listCategories(db, actor.familyId),
-      listTags(db, actor.familyId)
+      listTags(db, actor.familyId),
+      listGoalsWithProgress(db, actor, family),
+      listUpcomingBills(db, actor, todayIn(family.timezone))
     ]);
   const series = seriesResult.points;
   const flows = flowsResult.flows;
@@ -160,6 +164,7 @@ export default async function DashboardPage({
       tags: tags.map((t) => ({ id: t.id, name: t.name })),
       today: todayIn(family.timezone)
     },
+    goals,
     budgetOverall: budget.overall
       ? {
           limitMinor: budget.overall.limitMinor,
@@ -168,6 +173,38 @@ export default async function DashboardPage({
           pct: budget.overall.pct
         }
       : null,
+    bills: {
+      missed: bills.missed.map((b) => ({
+        seriesId: b.seriesId,
+        name: b.name,
+        amountMinor: b.amountMinor,
+        currency: b.currency,
+        accountName: b.accountName,
+        dueDate: b.dueDate,
+        status: b.status,
+        daysUntilDue: b.daysUntilDue
+      })),
+      dueSoon: bills.dueSoon.map((b) => ({
+        seriesId: b.seriesId,
+        name: b.name,
+        amountMinor: b.amountMinor,
+        currency: b.currency,
+        accountName: b.accountName,
+        dueDate: b.dueDate,
+        status: b.status,
+        daysUntilDue: b.daysUntilDue
+      })),
+      upcoming: bills.upcoming.map((b) => ({
+        seriesId: b.seriesId,
+        name: b.name,
+        amountMinor: b.amountMinor,
+        currency: b.currency,
+        accountName: b.accountName,
+        dueDate: b.dueDate,
+        status: b.status,
+        daysUntilDue: b.daysUntilDue
+      }))
+    },
     projection: projection
       ? {
           points: projection.points,

@@ -32,6 +32,7 @@ export const jobs = tables.jobs;
 export const cronSchedules = tables.cronSchedules;
 export const recurringSeries = tables.recurringSeries;
 export const budgets = tables.budgets;
+export const goals = tables.goals;
 export const savedFilters = tables.savedFilters;
 export const chatMessages = tables.chatMessages;
 export const chatProposals = tables.chatProposals;

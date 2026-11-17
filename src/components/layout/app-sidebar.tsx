@@ -22,6 +22,7 @@ import {
   LandmarkIcon,
   LayoutDashboardIcon,
   MessageCircleIcon,
+  PiggyBankIcon,
   PlusIcon,
   SettingsIcon,
   ShieldIcon,
@@ -123,6 +124,7 @@ export function AppSidebar({
             { title: "Reports", url: "/reports", icon: <ChartAreaIcon /> },
             { title: "SSIS", url: "/insights/ssis", icon: <LandmarkIcon /> },
             { title: "Budgets", url: "/budgets", icon: <TargetIcon /> },
+            { title: "Goals", url: "/goals", icon: <PiggyBankIcon /> },
             { title: "Assistant", url: "/chat", icon: <MessageCircleIcon /> }
           ]}
         />

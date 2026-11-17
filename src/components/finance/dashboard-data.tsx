@@ -2,6 +2,8 @@
 
 import { createContext, useContext } from "react";
 
+import type { GoalProgress } from "@/server/domain/goals";
+
 export type DashboardAccount = {
   id: string;
   name: string;
@@ -30,6 +32,17 @@ export type HealthFactor = {
   description: string;
 };
 
+export type DashboardBill = {
+  seriesId: string;
+  name: string;
+  amountMinor: number;
+  currency: string;
+  accountName: string;
+  dueDate: string;
+  status: "missed" | "due-soon" | "upcoming";
+  daysUntilDue: number;
+};
+
 export type DashboardData = {
   greeting: string;
   dateLabel: string;
@@ -53,12 +66,19 @@ export type DashboardData = {
     tags: { id: string; name: string }[];
     today: string;
   };
+  /** Active goals with live progress, for the Goals widget. */
+  goals: GoalProgress[];
   budgetOverall: {
     limitMinor: number;
     spentMinor: number;
     remainingMinor: number;
     pct: number;
   } | null;
+  bills: {
+    missed: DashboardBill[];
+    dueSoon: DashboardBill[];
+    upcoming: DashboardBill[];
+  };
   /** Forward projection, only when the net_worth_projections flag is on. */
   projection: {
     points: { date: string; valueMinor: number }[];
