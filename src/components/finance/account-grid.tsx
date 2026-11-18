@@ -8,7 +8,6 @@ import { BuildingIcon, ClockIcon, PlusIcon, TrendingDownIcon, WalletIcon } from 
 import { cn } from "@/lib/utils";
 import { fmtMoney } from "@/lib/format";
 import { EmptyState } from "@/components/empty-state";
-import { Badge } from "@/components/ui/badge";
 
 export type AccountCardModel = {
   id: string;
@@ -167,28 +166,15 @@ export function AccountsView({
                     <div className="flex size-8 items-center justify-center rounded-full bg-muted">
                       <BuildingIcon className="size-4 text-muted-foreground" />
                     </div>
-                    {account.institution ? (
-                      <span className="truncate text-xs text-muted-foreground">
-                        {account.institution}
-                      </span>
-                    ) : null}
+                    <div>
+                      <p className="text-sm font-semibold">{account.name}</p>
+                      <p className="text-xs text-muted-foreground">{typeLabel(account.type)}</p>
+                    </div>
                   </div>
-                  <div className="mt-3">
-                    <p className="text-sm font-semibold">{account.name}</p>
-                    <p className="text-xs text-muted-foreground">{typeLabel(account.type)}</p>
-                  </div>
-                  <p className="mt-3 tabular-nums text-xl font-bold tracking-tight">
-                    {privacy ? "•••••" : fmtMoney(account.displayBalanceMinor, account.currency)}
-                  </p>
                   <div className="mt-2 flex flex-wrap items-center gap-1.5">
-                    {account.status !== "active" ? (
-                      <Badge variant="outline">{account.status}</Badge>
-                    ) : null}
-                    {!account.isJoint ? <Badge variant="secondary">personal</Badge> : null}
-                    {account.level !== "full_control" ? (
-                      <Badge variant="outline">{account.level}</Badge>
-                    ) : null}
-                    {!account.includedInReports ? <Badge variant="outline">excluded</Badge> : null}
+                    <p className="mt-3 tabular-nums text-xl font-bold tracking-tight">
+                      {privacy ? "•••••" : fmtMoney(account.displayBalanceMinor, account.currency)}
+                    </p>
                     <span className="ml-auto inline-flex items-center gap-1 text-xs text-muted-foreground">
                       <ClockIcon className="size-3" />
                       {account.currency}
