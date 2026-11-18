@@ -73,6 +73,10 @@ export type DashboardData = {
     spentMinor: number;
     remainingMinor: number;
     pct: number;
+    /** Effective limit this month (base + rolled-over credit). */
+    effectiveLimitMinor: number;
+    /** Unspent amount rolled over from last month (0 when rollover is off). */
+    rolloverCreditMinor: number;
   } | null;
   bills: {
     missed: DashboardBill[];
