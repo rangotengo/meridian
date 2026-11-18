@@ -583,6 +583,7 @@ export const budgets = sqliteTable(
       .references(() => families.id, { onDelete: "cascade" }),
     categoryId: text("category_id").references(() => categories.id, { onDelete: "cascade" }),
     amountMinor: integer("amount_minor").notNull(),
+    rollover: integer("rollover", { mode: "boolean" }).notNull().default(false),
     active: integer("active", { mode: "boolean" }).notNull().default(true),
     createdAt: isoTimestamp("created_at")
       .notNull()
