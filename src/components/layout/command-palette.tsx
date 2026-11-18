@@ -18,6 +18,7 @@ import {
   WalletIcon,
   ArrowLeftRightIcon,
   PlusIcon,
+  CalculatorIcon,
   ChartAreaIcon,
   PiggyBankIcon,
   TargetIcon,
@@ -46,6 +47,7 @@ const pages = [
   { label: "Reports", icon: ChartAreaIcon, href: "/reports" },
   { label: "Budgets", icon: TargetIcon, href: "/budgets" },
   { label: "Goals", icon: PiggyBankIcon, href: "/goals" },
+  { label: "Debt payoff", icon: CalculatorIcon, href: "/debts" },
   { label: "Assistant", icon: MessageCircleIcon, href: "/chat" },
   { label: "Settings", icon: SettingsIcon, href: "/settings" }
 ];

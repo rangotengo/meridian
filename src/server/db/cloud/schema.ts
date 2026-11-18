@@ -256,6 +256,7 @@ export const accounts = sqliteTable(
     openedOn: text("opened_on").notNull(),
     externalSource: text("external_source"),
     externalId: text("external_id"),
+    interestRateBps: integer("interest_rate_bps"),
     createdAt: isoTimestamp("created_at")
       .notNull()
       .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`),

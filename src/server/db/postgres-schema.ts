@@ -210,10 +210,15 @@ export const accounts = pgTable(
     openedOn: date("opened_on").notNull(),
     externalSource: text("external_source"),
     externalId: text("external_id"),
+    interestRateBps: integer("interest_rate_bps"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow()
   },
   (t) => [
+    check(
+      "accounts_interest_rate_bps_check",
+      sql`${t.interestRateBps} IS NULL OR (${t.interestRateBps} >= 0 AND ${t.interestRateBps} <= 100000)`
+    ),
     index("accounts_family_idx").on(t.familyId),
     uniqueIndex("accounts_family_external_dedupe_idx")
       .on(t.familyId, t.externalSource, t.externalId)
