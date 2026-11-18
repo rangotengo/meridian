@@ -2,7 +2,7 @@
 
 import { useState, useActionState } from "react";
 import Link from "next/link";
-import { setBudgetAction, removeBudgetAction } from "./actions";
+import { setBudgetAction, setBudgetRolloverAction, removeBudgetAction } from "./actions";
 import { Card, Badge } from "@/components/ds/card";
 import { SetupPanel } from "@/components/ds/setup-panel";
 import { Field, FormError, Input } from "@/components/ds/form";
@@ -11,20 +11,29 @@ import { BudgetRings } from "@/components/finance/budget-rings";
 import { fmtMoney } from "@/lib/format";
 import { minorToDecimal } from "@/lib/money";
 import { usePrivacy } from "@/components/layout/privacy-context";
-
-export type Progress = {
-  categoryId: string | null;
-  categoryName: string;
-  limitMinor: number;
-  spentMinor: number;
-  remainingMinor: number;
-  pct: number;
-};
+import type { BudgetProgress, BudgetSummary, BudgetAlert } from "@/server/domain/budgets";
 
 function pctTone(pct: number): "success" | "warning" | "destructive" {
   if (pct >= 1) return "destructive";
   if (pct >= 0.8) return "warning";
   return "success";
+}
+
+/** Worded alert shown next to the percentage once a budget is at risk. */
+function alertLabel(alert: BudgetAlert): string | null {
+  if (alert === "over") return "Over budget";
+  if (alert === "warning") return "Approaching limit";
+  return null;
+}
+
+function AlertBadge({ alert, pct }: { alert: BudgetAlert; pct: number }) {
+  const label = alertLabel(alert);
+  return (
+    <>
+      <Badge tone={pctTone(pct)}>{Math.round(pct * 100)}% used</Badge>
+      {label ? <Badge tone={pctTone(pct)}>{label}</Badge> : null}
+    </>
+  );
 }
 
 function ProgressBar({ pct }: { pct: number }) {
@@ -46,17 +55,43 @@ function ProgressBar({ pct }: { pct: number }) {
   );
 }
 
+/**
+ * Per-budget rollover toggle. Switching off removes the rolled-over amount
+ * for the current month immediately; last month's unspent is not banked.
+ */
+function RolloverToggle({
+  categoryId,
+  rollover
+}: {
+  categoryId: string | null;
+  rollover: boolean;
+}) {
+  const [state, action] = useActionState(setBudgetRolloverAction, undefined);
+  return (
+    <form action={action} className="flex items-center gap-2">
+      <input type="hidden" name="categoryId" value={categoryId ?? ""} />
+      <input type="hidden" name="rollover" value={rollover ? "off" : "on"} />
+      <SubmitButton variant="ghost" className="px-2 py-1 text-xs">
+        Rollover unspent: {rollover ? "On" : "Off"}
+      </SubmitButton>
+      <FormError message={state?.ok === false ? state.error : undefined} />
+    </form>
+  );
+}
+
 export function BudgetsView({
   currency,
   overall,
   perCategory,
+  summary,
   categoriesWithoutBudget,
   monthLabel,
   privacy = false
 }: {
   currency: string;
-  overall: Progress | null;
-  perCategory: Progress[];
+  overall: BudgetProgress | null;
+  perCategory: BudgetProgress[];
+  summary: BudgetSummary;
   categoriesWithoutBudget: { id: string; name: string }[];
   monthLabel: string;
   privacy?: boolean;
@@ -72,7 +107,7 @@ export function BudgetsView({
             id: "overall",
             name: "Overall",
             spentMinor: overall.spentMinor,
-            limitMinor: overall.limitMinor,
+            limitMinor: overall.effectiveLimitMinor,
             pct: overall.pct
           }
         ]
@@ -81,13 +116,49 @@ export function BudgetsView({
       id: item.categoryId ?? item.categoryName,
       name: item.categoryName,
       spentMinor: item.spentMinor,
-      limitMinor: item.limitMinor,
+      limitMinor: item.effectiveLimitMinor,
       pct: item.pct
     }))
   ];
 
   return (
     <div className="space-y-4">
+      <Card className="overflow-hidden">
+        <h2 className="text-base font-medium text-primary">Monthly summary — {monthLabel}</h2>
+        {perCategory.length === 0 ? (
+          <p className="mt-2 text-sm text-muted-foreground">
+            No category budgets yet. Set one below to see your monthly summary here.
+          </p>
+        ) : (
+          <>
+            <div className="mt-3 grid grid-cols-3 gap-3 text-sm">
+              <div>
+                <p className="text-xs text-muted-foreground">Budgeted</p>
+                <p className="font-semibold tabular-nums">{fmt(summary.totalEffectiveMinor)}</p>
+              </div>
+              <div>
+                <p className="text-xs text-muted-foreground">Spent</p>
+                <p className="font-semibold tabular-nums">{fmt(summary.totalSpentMinor)}</p>
+              </div>
+              <div>
+                <p className="text-xs text-muted-foreground">Remaining</p>
+                <p className="font-semibold tabular-nums">{fmt(summary.totalRemainingMinor)}</p>
+              </div>
+            </div>
+            <p className="mt-2 text-xs text-muted-foreground">
+              {summary.overCount > 0 ? `${summary.overCount} over budget` : "None over budget"}
+              {" · "}
+              {summary.warningCount > 0
+                ? `${summary.warningCount} approaching limit`
+                : "none approaching"}
+              {" · "}
+              {summary.onTrackCount} on track. Category budgets only — the overall cap covers the
+              same spending, so it is not added in.
+            </p>
+          </>
+        )}
+      </Card>
+
       <BudgetRings
         items={rings}
         currency={currency}
@@ -97,22 +168,26 @@ export function BudgetsView({
       <Card className="overflow-hidden">
         <div className="flex items-baseline justify-between">
           <h2 className="text-base font-medium text-primary">Overall monthly cap — {monthLabel}</h2>
-          {overall ? (
-            <Badge tone={pctTone(overall.pct)}>{Math.round(overall.pct * 100)}% used</Badge>
-          ) : null}
+          {overall ? <AlertBadge alert={overall.alert} pct={overall.pct} /> : null}
         </div>
         {overall ? (
           <div className="mt-3 space-y-2">
             <div className="flex items-baseline justify-between text-sm">
               <span className="tabular font-medium">{fmt(overall.spentMinor)} spent</span>
-              <span className="tabular text-muted-foreground">of {fmt(overall.limitMinor)}</span>
+              <span className="tabular text-muted-foreground">
+                of {fmt(overall.effectiveLimitMinor)}
+              </span>
             </div>
             <ProgressBar pct={overall.pct} />
             <p className="text-xs text-muted-foreground">
               {overall.remainingMinor >= 0
                 ? `${fmt(overall.remainingMinor)} left this month`
                 : `${fmt(-overall.remainingMinor)} over cap`}
+              {overall.rolloverCreditMinor > 0
+                ? ` · includes ${fmt(overall.rolloverCreditMinor)} rolled over from last month (base ${fmt(overall.limitMinor)})`
+                : ""}
             </p>
+            <RolloverToggle categoryId={null} rollover={overall.rollover} />
           </div>
         ) : (
           <p className="mt-2 text-sm text-muted-foreground">No overall cap set.</p>
@@ -144,6 +219,10 @@ export function BudgetsView({
               ))}
             </ul>
           )}
+          <p className="mt-3 text-xs text-muted-foreground">
+            Rollover carries only last month&apos;s unspent into this month — it never compounds,
+            and switching it off removes the rolled-over amount for the current month.
+          </p>
         </Card>
 
         <SetupPanel
@@ -174,7 +253,7 @@ function CategoryBudgetItem({
   effectivePrivacy,
   fmt
 }: {
-  budget: Progress;
+  budget: BudgetProgress;
   currency: string;
   effectivePrivacy: boolean;
   fmt: (minor: number) => string;
@@ -188,14 +267,20 @@ function CategoryBudgetItem({
       <div className="flex items-center justify-between gap-3 text-sm">
         <span className="flex min-w-0 items-center gap-2 font-medium">
           <span className="truncate">{budget.categoryName}</span>
-          <Badge tone={pctTone(budget.pct)}>{Math.round(budget.pct * 100)}%</Badge>
+          <AlertBadge alert={budget.alert} pct={budget.pct} />
         </span>
         <span className="tabular shrink-0 text-muted-foreground">
           {effectivePrivacy ? "••••••" : fmt(budget.spentMinor)} /{" "}
-          {effectivePrivacy ? "••••••" : fmt(budget.limitMinor)}
+          {effectivePrivacy ? "••••••" : fmt(budget.effectiveLimitMinor)}
         </span>
       </div>
       <ProgressBar pct={budget.pct} />
+      {budget.rolloverCreditMinor > 0 ? (
+        <p className="text-xs text-muted-foreground">
+          Includes {fmt(budget.rolloverCreditMinor)} rolled over from last month (base{" "}
+          {fmt(budget.limitMinor)})
+        </p>
+      ) : null}
 
       {editing ? (
         <form
@@ -231,7 +316,7 @@ function CategoryBudgetItem({
           </button>
         </form>
       ) : (
-        <div className="flex items-center gap-2 pt-1">
+        <div className="flex flex-wrap items-center gap-2 pt-1">
           <button
             type="button"
             onClick={() => setEditing(true)}
@@ -239,6 +324,7 @@ function CategoryBudgetItem({
           >
             Edit limit
           </button>
+          <RolloverToggle categoryId={budget.categoryId} rollover={budget.rollover} />
           <form action={removeAction}>
             <input type="hidden" name="categoryId" value={budget.categoryId ?? ""} />
             <SubmitButton variant="ghost" className="px-2 py-1 text-xs">
@@ -336,6 +422,10 @@ function SetBudgetForm({
       <Field label={`Monthly limit (${currency})`} htmlFor="budget-amount">
         <Input id="budget-amount" name="amount" required inputMode="decimal" placeholder="800.00" />
       </Field>
+      <label className="flex items-center gap-2 text-sm">
+        <input type="checkbox" name="rollover" value="on" className="size-4 accent-primary" />
+        Rollover unspent to next month
+      </label>
       <SubmitButton>Set budget</SubmitButton>
     </form>
   );

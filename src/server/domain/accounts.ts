@@ -121,6 +121,8 @@ export async function updateAccount(
     includedInReports?: boolean;
     openingBalanceDisplayMinor?: number;
     openedOn?: string;
+    /** Annual interest rate in basis points (1200 = 12.00%); null clears it. */
+    interestRateBps?: number | null;
   }
 ): Promise<void> {
   const account = await requireFullControl(exec, actor, accountId);
@@ -147,6 +149,17 @@ export async function updateAccount(
     if (!isIsoDate(patch.openedOn)) throw errors.validation("Opened-on date must be YYYY-MM-DD.");
     updates.openedOn = patch.openedOn;
     needsRecalc = true;
+  }
+  if (patch.interestRateBps !== undefined) {
+    if (
+      patch.interestRateBps !== null &&
+      (!Number.isInteger(patch.interestRateBps) ||
+        patch.interestRateBps < 0 ||
+        patch.interestRateBps > 100000)
+    ) {
+      throw errors.validation("Interest rate must be between 0% and 1000%.");
+    }
+    updates.interestRateBps = patch.interestRateBps;
   }
 
   await exec.update(accounts).set(updates).where(eq(accounts.id, accountId));

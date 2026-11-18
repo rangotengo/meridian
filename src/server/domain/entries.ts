@@ -14,6 +14,7 @@ import {
 import { errors } from "@/lib/errors";
 import { addMinor } from "@/lib/money";
 import { isIsoDate } from "@/lib/datetime";
+import { smsFallbackIdTail } from "./sms-parser";
 import { recordAudit } from "../observability/audit";
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -136,6 +137,13 @@ export async function createTransactionEntry(
   return { entryId, duplicated: false };
 }
 
+export async function findEntryByExternalId(
+  exec: Executor,
+  input: Pick<TransactionEntryInput, "accountId" | "externalSource" | "externalId">
+): Promise<string | null> {
+  return findByExternalId(exec, input);
+}
+
 async function findByExternalId(
   exec: Executor,
   input: Pick<TransactionEntryInput, "accountId" | "externalSource" | "externalId">
@@ -154,7 +162,28 @@ async function findByExternalId(
       )
     )
     .limit(1);
-  return row?.id ?? null;
+  if (row) return row.id;
+  // SMS fallback ids used to embed the import day's date
+  // (`sms_2026-11-17_…_<tail>`); the current format omits the date when
+  // the SMS carried none. Both forms share the same 12-hex-char hash
+  // tail, so a legacy id for the same SMS is recognised by its tail —
+  // otherwise a re-import after the format change would double-record.
+  const tail = smsFallbackIdTail(input.externalId);
+  if (!tail) return null;
+  const [legacy] = await exec
+    .select({ id: entries.id })
+    .from(entries)
+    .where(
+      and(
+        eq(entries.accountId, input.accountId),
+        input.externalSource
+          ? eq(entries.externalSource, input.externalSource)
+          : sql`external_source IS NULL`,
+        sql`${entries.externalId} LIKE ${`%\\_${tail}`} ESCAPE ${"\\"}`
+      )
+    )
+    .limit(1);
+  return legacy?.id ?? null;
 }
 
 function sanitizeOptionalText(value: string | null | undefined, max: number): string | null {

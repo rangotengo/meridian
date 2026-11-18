@@ -39,6 +39,7 @@ export default async function BudgetsPage() {
         currency={family.currency}
         overall={overview.overall}
         perCategory={overview.perCategory}
+        summary={overview.summary}
         categoriesWithoutBudget={overview.categoriesWithoutBudget}
         monthLabel={formatMonthKey(overview.monthKey, family.locale)}
         privacy={privacy}

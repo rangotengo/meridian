@@ -256,6 +256,7 @@ export const accounts = sqliteTable(
     openedOn: text("opened_on").notNull(),
     externalSource: text("external_source"),
     externalId: text("external_id"),
+    interestRateBps: integer("interest_rate_bps"),
     createdAt: isoTimestamp("created_at")
       .notNull()
       .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`),
@@ -582,6 +583,7 @@ export const budgets = sqliteTable(
       .references(() => families.id, { onDelete: "cascade" }),
     categoryId: text("category_id").references(() => categories.id, { onDelete: "cascade" }),
     amountMinor: integer("amount_minor").notNull(),
+    rollover: integer("rollover", { mode: "boolean" }).notNull().default(false),
     active: integer("active", { mode: "boolean" }).notNull().default(true),
     createdAt: isoTimestamp("created_at")
       .notNull()

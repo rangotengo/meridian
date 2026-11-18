@@ -1,5 +1,5 @@
-import { describe, it, expect } from "vitest";
-import { parseSms, amountTextToMinor } from "@/server/domain/sms-parser";
+import { describe, it, expect, vi } from "vitest";
+import { parseSms, amountTextToMinor, smsFallbackIdTail } from "@/server/domain/sms-parser";
 
 describe("sms-parser", () => {
   it("parses Laxmi Sunrise credit SMS correctly", () => {
@@ -87,5 +87,75 @@ describe("sms-parser currency exponents", () => {
 
   it("handles thousands separators", () => {
     expect(amountTextToMinor("24,360.00", "NPR")).toBe(2436000);
+  });
+});
+
+describe("sms-parser — wallets", () => {
+  it("parses an eSewa debit SMS", () => {
+    const text = `Your eSewa account 9850 has been debited by NPR 500.00 on 17/11/2026. Remarks: Payment to Bhatbhateni`;
+    const parsed = parseSms(text, "eSewa");
+    expect(parsed.kind).toBe("expense");
+    expect(parsed.amountMajor).toBe(500);
+    expect(parsed.amountMinor).toBe(50000);
+    expect(parsed.currency).toBe("NPR");
+    expect(parsed.date).toBe("2026-11-17");
+    expect(parsed.bankName).toBe("eSewa");
+    expect(parsed.accountDigits).toBe("9850");
+    expect(parsed.referenceId).toBeTruthy();
+  });
+
+  it("parses a Khalti credit SMS", () => {
+    const text = `Your Khalti account has been credited by NPR 1,250.00 on 17/11/2026. Remarks: Received from 98XXXXXXXX`;
+    const parsed = parseSms(text, "Khalti");
+    expect(parsed.kind).toBe("income");
+    expect(parsed.amountMajor).toBe(1250);
+    expect(parsed.amountMinor).toBe(125000);
+    expect(parsed.currency).toBe("NPR");
+    expect(parsed.date).toBe("2026-11-17");
+    expect(parsed.bankName).toBe("Khalti");
+    expect(parsed.referenceId).toBeTruthy();
+  });
+});
+
+describe("sms-parser — stable fallback identity", () => {
+  const UNDATED = "Your account XX1234 debited NPR 100.00 at Store";
+
+  it("gives the same undated SMS the same reference id on consecutive days", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(new Date("2026-11-17T12:00:00Z"));
+      const day1 = parseSms(UNDATED).referenceId;
+      vi.setSystemTime(new Date("2026-11-18T12:00:00Z"));
+      const day2 = parseSms(UNDATED).referenceId;
+      // The defaulted "today" must not leak into the identity.
+      expect(day1).toBe("sms_10000_1234_230b09eb42cd");
+      expect(day2).toBe(day1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps an explicit SMS date in the identity, stably across days", () => {
+    const dated = "Your account XX1234 debited NPR 100.00 at Store on 15/11/2026";
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(new Date("2026-11-17T12:00:00Z"));
+      const day1 = parseSms(dated).referenceId;
+      vi.setSystemTime(new Date("2026-11-18T12:00:00Z"));
+      const day2 = parseSms(dated).referenceId;
+      // The hash covers the full text, so it differs from the undated
+      // SMS; the point is the explicit date is in the id and it is stable.
+      expect(day1).toMatch(/^sms_2026-11-15_10000_1234_[0-9a-f]{12}$/);
+      expect(day2).toBe(day1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("exposes the shared hash tail of new and legacy fallback ids", () => {
+    expect(smsFallbackIdTail("sms_10000_1234_230b09eb42cd")).toBe("230b09eb42cd");
+    expect(smsFallbackIdTail("sms_2026-11-17_10000_1234_230b09eb42cd")).toBe("230b09eb42cd");
+    expect(smsFallbackIdTail("178894247201261c")).toBeNull();
+    expect(smsFallbackIdTail(null)).toBeNull();
   });
 });

@@ -18,6 +18,7 @@ import { NavUser } from "@/components/layout/nav-user";
 import { fmtMoney } from "@/lib/format";
 import {
   ArrowLeftRightIcon,
+  CalculatorIcon,
   ChartAreaIcon,
   LandmarkIcon,
   LayoutDashboardIcon,
@@ -125,6 +126,7 @@ export function AppSidebar({
             { title: "SSIS", url: "/insights/ssis", icon: <LandmarkIcon /> },
             { title: "Budgets", url: "/budgets", icon: <TargetIcon /> },
             { title: "Goals", url: "/goals", icon: <PiggyBankIcon /> },
+            { title: "Debt payoff", url: "/debts", icon: <CalculatorIcon /> },
             { title: "Assistant", url: "/chat", icon: <MessageCircleIcon /> }
           ]}
         />

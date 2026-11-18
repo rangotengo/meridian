@@ -151,6 +151,12 @@ export default async function TransactionsPage({ searchParams }: { searchParams:
         actions={
           <div className="flex items-center gap-2">
             <Link
+              href="/transactions/import-sms"
+              className="inline-flex h-8 items-center rounded-lg border border-border px-3 text-sm font-medium hover:bg-border/50"
+            >
+              Import SMS
+            </Link>
+            <Link
               href="/transactions/import-csv"
               className="inline-flex h-8 items-center rounded-lg border border-border px-3 text-sm font-medium"
             >
