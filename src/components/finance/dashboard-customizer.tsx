@@ -32,6 +32,10 @@ type Block = {
   id: string;
   label: string;
   size: WidgetSize;
+  // Compact widgets take their natural height instead of stretching to
+  // the grid row height. Used for widgets whose content is short, so a
+  // tall row would otherwise leave a big mostly-empty card.
+  compact?: boolean;
 };
 
 const defaultBlocks: Block[] = [
@@ -39,9 +43,9 @@ const defaultBlocks: Block[] = [
   { id: "account-cards", label: "Accounts", size: "sm" },
   { id: "transfer-spending", label: "Actions & spending", size: "sm" },
   { id: "money-movement", label: "Money movement", size: "sm" },
-  { id: "goals", label: "Goals", size: "sm" },
+  { id: "health-score", label: "Financial health", size: "sm", compact: true },
   { id: "bills", label: "Bills & reminders", size: "sm" },
-  { id: "health-score", label: "Financial health", size: "sm" },
+  { id: "goals", label: "Goals", size: "sm", compact: true },
   { id: "recent-transactions", label: "Recent transactions", size: "full" }
 ];
 
@@ -98,6 +102,7 @@ function SortableWidget({ block, editing }: { block: Block; editing: boolean }) 
       className={cn(
         sizeClass[block.size],
         "relative transition-opacity duration-200",
+        block.compact && "self-start",
         isDragging && "opacity-30",
         editing && !isDragging && "rounded-xl ring-2 ring-dashed ring-primary/20"
       )}
@@ -112,7 +117,12 @@ function SortableWidget({ block, editing }: { block: Block; editing: boolean }) 
           {block.label}
         </div>
       ) : null}
-      <div className={cn("h-full [&>*]:h-full", editing && "pointer-events-none select-none")}>
+      <div
+        className={cn(
+          !block.compact && "h-full [&>*]:h-full",
+          editing && "pointer-events-none select-none"
+        )}
+      >
         {widgetFor(block.id)}
       </div>
     </div>
