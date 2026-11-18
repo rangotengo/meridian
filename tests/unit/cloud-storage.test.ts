@@ -44,6 +44,9 @@ describe("Cloudflare SQLite storage", () => {
     expect(response.status, body).toBe(200);
     return JSON.parse(body);
   }
+  it("recognises legacy SMS fallback ids in SQLite", async () => {
+    expect(await probe("sms-legacy-dedupe")).toEqual({ same: true });
+  });
   it("round-trips identities, dates, JSON, booleans and exact money", async () => {
     expect(await probe("roundtrip")).toEqual({
       validId: true,

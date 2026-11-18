@@ -38,3 +38,34 @@ test("editing the SMS after preview hides the record button until re-parse", asy
   await expect(page.getByText("Money in")).toBeVisible();
   await expect(page.getByRole("button", { name: "Record transaction" })).toBeVisible();
 });
+
+test("re-parse keeps Record hidden until the new response arrives", async ({ page }) => {
+  await page.goto("/transactions/import-sms");
+  await page.locator('textarea[name="rawSms"]').fill(EXPENSE_SMS);
+  await page.getByRole("button", { name: "Parse SMS" }).click();
+  await expect(page.getByText("Money out")).toBeVisible();
+  await page.locator('textarea[name="rawSms"]').fill(INCOME_SMS);
+  let release = () => {};
+  let received = () => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const arrived = new Promise<void>((resolve) => {
+    received = resolve;
+  });
+  await page.route("**/transactions/import-sms", async (route) => {
+    if (route.request().method() !== "POST") return route.continue();
+    const response = await route.fetch();
+    received();
+    await gate;
+    await route.fulfill({ response });
+  });
+  try {
+    await page.getByRole("button", { name: "Parse SMS" }).click();
+    await arrived;
+    await expect(page.getByRole("button", { name: "Record transaction" })).toHaveCount(0);
+  } finally {
+    release();
+  }
+  await expect(page.getByText("Money in")).toBeVisible();
+});

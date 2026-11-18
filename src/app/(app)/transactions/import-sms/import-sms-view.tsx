@@ -34,7 +34,10 @@ export function ImportSmsView({
   accounts: ImportAccount[];
   categories: { id: string; name: string }[];
 }) {
-  const [previewState, previewAction] = useActionState(previewSmsImportAction, undefined);
+  const [previewState, previewAction, previewPending] = useActionState(
+    previewSmsImportAction,
+    undefined
+  );
   const [rawSms, setRawSms] = useState("");
   const [sender, setSender] = useState("");
   // The inputs the current preview was parsed from. The preview (and its
@@ -87,7 +90,7 @@ export function ImportSmsView({
         </form>
       </Card>
 
-      {preview && !previewStale ? (
+      {preview && !previewStale && !previewPending ? (
         <PreviewCard
           key={preview.parsed.referenceId ?? "preview"}
           preview={preview}

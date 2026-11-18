@@ -179,7 +179,7 @@ async function findByExternalId(
         input.externalSource
           ? eq(entries.externalSource, input.externalSource)
           : sql`external_source IS NULL`,
-        sql`${entries.externalId} LIKE ${`%\\_${tail}`}`
+        sql`${entries.externalId} LIKE ${`%\\_${tail}`} ESCAPE ${"\\"}`
       )
     )
     .limit(1);
