@@ -66,6 +66,8 @@ export function AppSidebar({
   signOut: () => Promise<void>;
   togglePrivacy: () => Promise<void>;
 }) {
+  const cashAccounts = accounts.filter((account) => account.type === "depository");
+
   const secondary = [
     { title: "Settings", url: "/settings", icon: <SettingsIcon /> },
     ...(showAdmin ? [{ title: "Admin", url: "/admin", icon: <ShieldIcon /> }] : [])
@@ -130,11 +132,11 @@ export function AppSidebar({
             { title: "Assistant", url: "/chat", icon: <MessageCircleIcon /> }
           ]}
         />
-        {accounts.length > 0 ? (
+        {cashAccounts.length > 0 ? (
           <SidebarGroup className="group-data-[collapsible=icon]:hidden">
-            <SidebarGroupLabel>Accounts</SidebarGroupLabel>
+            <SidebarGroupLabel>Cash accounts</SidebarGroupLabel>
             <SidebarMenu>
-              {accounts.slice(0, 12).map((account) => (
+              {cashAccounts.slice(0, 12).map((account) => (
                 <SidebarMenuItem key={account.id}>
                   <SidebarMenuButton size="sm" render={<Link href={`/accounts/${account.id}`} />}>
                     <span className="min-w-0 truncate">{account.name}</span>
