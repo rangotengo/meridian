@@ -18,6 +18,7 @@ const labelMap: Record<string, string> = {
   budgets: "Budgets",
   goals: "Goals",
   debts: "Debt payoff",
+  "import-csv": "Import CSV",
   reports: "Reports",
   chat: "Assistant",
   settings: "Settings",

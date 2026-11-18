@@ -30,7 +30,8 @@ import {
   SunIcon,
   SearchIcon,
   TagIcon,
-  StoreIcon
+  StoreIcon,
+  UploadIcon
 } from "lucide-react";
 import { applyTheme } from "@/lib/theme";
 import { setThemePreferenceAction } from "@/server/actions/session-actions";
@@ -45,6 +46,7 @@ const pages = [
   { label: "Transactions", icon: ArrowLeftRightIcon, href: "/transactions" },
   { label: "New transaction", icon: PlusIcon, href: "/transactions/new", shortcut: "N" },
   { label: "Import SMS", icon: MailIcon, href: "/transactions/import-sms" },
+  { label: "Import statement CSV", icon: UploadIcon, href: "/transactions/import-csv" },
   { label: "Quick add", icon: PlusIcon, href: "/quick-add", shortcut: "Q" },
   { label: "Reports", icon: ChartAreaIcon, href: "/reports" },
   { label: "Budgets", icon: TargetIcon, href: "/budgets" },
