@@ -7,7 +7,11 @@ import type { Actor } from "../../src/server/auth/context";
 import { registerAccessHousehold } from "../../src/server/domain/access-users";
 import { createAccount, getAccountOverview } from "../../src/server/domain/accounts";
 import { addTransaction, makeTransferWithEntries } from "../../src/server/domain/orchestrate";
-import { listEntriesPage } from "../../src/server/domain/entries";
+import {
+  listEntriesPage,
+  createTransactionEntry,
+  findEntryByExternalId
+} from "../../src/server/domain/entries";
 import { dashboardSummary, incomeExpenseSeries } from "../../src/server/domain/reports";
 import { upsertRate, getRate } from "../../src/server/domain/exchange-rates";
 import { createSeries, postDueSeries } from "../../src/server/domain/recurring";
@@ -103,6 +107,7 @@ export class StorageProbe {
     const db = this.db;
     const operation = new URL(request.url).pathname;
     if (
+      operation === "/sms-legacy-dedupe" ||
       operation === "/ledger" ||
       operation === "/import-meroshare" ||
       operation === "/valuation-edit" ||
@@ -137,6 +142,31 @@ export class StorageProbe {
         emailVerified: true
       };
       const today = new Date().toISOString().slice(0, 10);
+      if (operation === "/sms-legacy-dedupe") {
+        const { accountId } = await createAccount(exec, actor, {
+          name: "SMS account",
+          type: "depository",
+          currency: "NPR",
+          openedOn: today,
+          openingBalanceDisplayMinor: 0,
+          includedInReports: true,
+          joint: false
+        });
+        const first = await createTransactionEntry(exec, actor, {
+          accountId,
+          date: today,
+          name: "Store",
+          amountLedgerMinor: 10000,
+          externalSource: "sms_shortcut",
+          externalId: "sms_2026-11-17_10000_1234_230b09eb42cd"
+        });
+        const existing = await findEntryByExternalId(exec, {
+          accountId,
+          externalSource: "sms_shortcut",
+          externalId: "sms_10000_1234_230b09eb42cd"
+        });
+        return Response.json({ same: existing === first.entryId });
+      }
       if (operation === "/valuation-edit") {
         const { accountId } = await createAccount(exec, actor, {
           name: "Valuation loan",

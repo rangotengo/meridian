@@ -22,6 +22,7 @@ const labelMap: Record<string, string> = {
   chat: "Assistant",
   settings: "Settings",
   "quick-add": "Quick add",
+  "import-sms": "Import SMS",
   new: "New",
   categories: "Categories",
   tags: "Tags",

@@ -39,6 +39,8 @@ const KNOWN_SENDER_BANKS: Record<string, string> = {
   hbl: "Himalayan Bank",
   scb: "Standard Chartered Bank",
   scbn: "Standard Chartered Bank",
+  esewa: "eSewa",
+  khalti: "Khalti",
   czbil: "Citizens Bank",
   mbl: "Machhapuchchhre Bank",
   adbl: "Agricultural Development Bank",
@@ -59,6 +61,8 @@ const KNOWN_BODY_BANKS = [
   "NMB Bank",
   "Himalayan Bank",
   "Standard Chartered",
+  "eSewa",
+  "Khalti",
   "Citizens Bank",
   "Machhapuchchhre Bank",
   "Nepal Bank"
@@ -199,8 +203,13 @@ export function parseSms(text: string, sender?: string | null): ParsedSmsResult 
   let accountNumber: string | null = null;
   let accountDigits: string | null = null;
 
+  // Explicit account keywords first: in "Your eSewa account 9850" the
+  // "Your <word>" branch would otherwise capture the bank name ("eSewa")
+  // and find no digits. The "Your" branch still handles "Your #88011052"
+  // and "Your 110##02167".
   const acctMatch =
-    clean.match(/(?:Your\s+#?|AC\s+|A\/C\s+|account\s+|acct\s+)([0-9A-Za-z#*]{4,})/i) ||
+    clean.match(/(?:AC\s+|A\/C\s+|account\s+|acct\s+)([0-9A-Za-z#*]{4,})/i) ||
+    clean.match(/Your\s+#?([0-9A-Za-z#*]{4,})/i) ||
     clean.match(/#([0-9A-Za-z#*]{4,})/i);
 
   if (acctMatch?.[1]) {
@@ -273,10 +282,16 @@ export function parseSms(text: string, sender?: string | null): ParsedSmsResult 
     }
   }
 
-  // Deterministic fallback for deduplication
+  // Deterministic fallback for deduplication. The identity must be
+  // stable across days: an SMS with no explicit date gets today's date
+  // as its *display* date, but that default must not leak into the
+  // identity, or the same text would dedupe differently tomorrow. Only
+  // a date the SMS itself carried is part of the identity.
   if (!referenceId && amountMinor > 0) {
     const rawHash = hashToken(clean).slice(0, 12);
-    referenceId = `sms_${date}_${amountMinor}_${accountDigits ?? "acct"}_${rawHash}`;
+    referenceId = dateExplicit
+      ? `sms_${date}_${amountMinor}_${accountDigits ?? "acct"}_${rawHash}`
+      : `sms_${amountMinor}_${accountDigits ?? "acct"}_${rawHash}`;
   }
 
   return {
@@ -294,4 +309,18 @@ export function parseSms(text: string, sender?: string | null): ParsedSmsResult 
     referenceId,
     rawText: clean
   };
+}
+
+/**
+ * The stable tail of a deterministic `sms_…` fallback id: the 12-hex-char
+ * hash of the raw text. Legacy fallback ids embedded the import day's
+ * date (`sms_2026-11-17_…_<tail>`); the current format omits the date
+ * when the SMS carried none. Both forms end with the same tail, so the
+ * entry layer can recognise a legacy id for the same SMS. Returns null
+ * for anything that is not a fallback id (e.g. a bank reference).
+ */
+export function smsFallbackIdTail(referenceId: string | null): string | null {
+  if (!referenceId) return null;
+  const match = referenceId.match(/^sms_.*_([0-9a-f]{12})$/);
+  return match?.[1] ?? null;
 }
