@@ -63,3 +63,32 @@ test("start over clears the parse and the preview", async ({ page }) => {
   await expect(page.getByLabel("Account")).toBeEnabled();
   await expect(page.getByLabel("Or paste the CSV")).toBeEmpty();
 });
+
+test("re-preview keeps Import hidden until the new response arrives", async ({ page }) => {
+  await parseAndPreview(page);
+  await page.getByLabel("Debit column").selectOption("3");
+  await page.getByLabel("Credit column").selectOption("2");
+  let release = () => {};
+  let received = () => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const arrived = new Promise<void>((resolve) => {
+    received = resolve;
+  });
+  await page.route("**/transactions/import-csv", async (route) => {
+    if (route.request().method() !== "POST") return route.continue();
+    const response = await route.fetch();
+    received();
+    await gate;
+    await route.fulfill({ response });
+  });
+  try {
+    await page.getByRole("button", { name: "Preview import" }).click();
+    await arrived;
+    await expect(page.getByRole("button", { name: /Import \d+ transactions?/ })).toHaveCount(0);
+  } finally {
+    release();
+  }
+  await expect(page.getByRole("row", { name: /ATM Withdrawal/ })).toContainText("-$5,000.00");
+});
