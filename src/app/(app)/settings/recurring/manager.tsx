@@ -13,6 +13,7 @@ import { Field, FormError, Input, Select } from "@/components/ds/form";
 import { SubmitButton } from "@/components/ds/submit-button";
 import { ConfirmDialog } from "@/components/ds/dialog";
 import { fmtMoney } from "@/lib/format";
+import { nextDueFromActiveSeries } from "@/lib/recurring-summary";
 
 type Series = {
   id: string;
@@ -68,10 +69,7 @@ export function RecurringManager({
 }) {
   const setupComplete = series.length > 0;
   const activeCount = series.filter((s) => s.active).length;
-  const nextDue = [...series]
-    .map((s) => s.nextDue)
-    .sort()
-    .at(0);
+  const nextDue = nextDueFromActiveSeries(series);
 
   return (
     <div className="grid gap-6 lg:grid-cols-2">
