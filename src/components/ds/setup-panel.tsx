@@ -13,6 +13,10 @@ import { ChevronDownIcon, ChevronUpIcon } from "lucide-react";
  * The collapsed default is decided on mount. Completing setup during this
  * visit leaves the panel open so the confirmation stays visible; the
  * summary row is the default on the next visit.
+ *
+ * The panel container stays in the DOM while collapsed (hidden and
+ * empty) so the toggle button's aria-controls always resolves to an
+ * existing node; the setup form itself still unmounts on collapse.
  */
 export function SetupPanel({
   title,
@@ -50,6 +54,7 @@ export function SetupPanel({
             Edit setup <ChevronDownIcon className="h-4 w-4" aria-hidden />
           </button>
         </div>
+        <div id={panelId} hidden />
       </Card>
     );
   }

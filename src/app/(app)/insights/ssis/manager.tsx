@@ -98,6 +98,7 @@ function Controls({ data }: { data: SsisInsightData }) {
             Edit setup <ChevronDownIcon className="h-4 w-4" aria-hidden />
           </button>
         </div>
+        <div id="ssis-setup-panel" hidden />
       </Card>
     );
   }
