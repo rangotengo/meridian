@@ -45,6 +45,17 @@ export function fmtMonth(monthKey: string, locale = "en"): string {
   return formatMonthKey(monthKey, locale);
 }
 
+/**
+ * Signed percentage change for deltas: "+12.3%", "-4.0%", or an em dash
+ * when the previous value was zero (null) or the ratio is not finite.
+ * Single shared copy — the dashboard and reports delta rows previously
+ * each carried an identical local definition (PR #26 follow-up).
+ */
+export function formatPct(pct: number | null): string {
+  if (pct === null || !Number.isFinite(pct)) return "—";
+  return `${pct >= 0 ? "+" : ""}${(pct * 100).toFixed(1)}%`;
+}
+
 export function fmtPercent(ratio: number, locale = "en"): string {
   return new Intl.NumberFormat(locale, { style: "percent", maximumFractionDigits: 1 }).format(
     ratio
