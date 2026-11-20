@@ -6,6 +6,12 @@
 
 export type RecentEntryLike = {
   merchant: string | null;
+  /**
+   * Entry description. Quick Add saves merchant:null, so the description
+   * is the only payee signal those entries carry — without it a
+   * Quick Add-only user never builds recent payee chips.
+   */
+  name?: string | null;
   categoryId: string | null;
   categoryName: string | null;
 };
@@ -13,15 +19,19 @@ export type RecentEntryLike = {
 export type RecentPayee = { name: string; categoryId: string | null };
 
 /**
- * Distinct merchants from the most recent entries first, each with the
+ * Distinct payees from the most recent entries first, each with the
  * category its latest transaction used (so one tap can fill description
- * and category together). Entries without a merchant are skipped.
+ * and category together). The stored merchant wins when present; entries
+ * without one fall back to their description, so Quick Add entries
+ * (merchant:null) build chips too, and choosing a chip refreshes that
+ * payee recency — the saved entry is the most recent one carrying the
+ * name, so it sorts first on the next visit.
  */
 export function recentPayees(items: RecentEntryLike[], limit = 6): RecentPayee[] {
   const seen = new Set<string>();
   const out: RecentPayee[] = [];
   for (const item of items) {
-    const name = item.merchant?.trim();
+    const name = item.merchant?.trim() || item.name?.trim();
     if (!name || seen.has(name)) continue;
     seen.add(name);
     out.push({ name, categoryId: item.categoryId });

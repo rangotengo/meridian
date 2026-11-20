@@ -36,16 +36,22 @@ describe("quick add recents (listEntriesPage -> recent helpers)", () => {
       merchant: "Old Mart",
       categoryId: groceries.categoryId
     });
+    // Dated today so it is unambiguously the most recent entry:
+    // same-day ties order by random UUID in listEntriesPage.
     await addTxn(user, accountId, {
       amountLedgerMinor: 500,
-      date: daysAgo(1),
+      date: daysAgo(0),
       name: "No merchant",
       merchant: null,
       categoryId: null
     });
 
     const page = await listEntriesPage(db(), actor, { limit: 50 });
+    // The merchant-less entry contributes its description as a payee
+    // chip (Quick Add saves merchant:null); it is the most recent, so
+    // it sorts first.
     expect(recentPayees(page.items)).toEqual([
+      { name: "No merchant", categoryId: null },
       { name: "Old Mart", categoryId: groceries.categoryId },
       { name: "Sajha Bus", categoryId: transport.categoryId }
     ]);
