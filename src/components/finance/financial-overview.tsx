@@ -10,7 +10,7 @@ import {
 } from "@/components/ui/chart";
 import { Area, AreaChart, CartesianGrid, Line, XAxis, YAxis, type DotProps } from "recharts";
 import { useDashboardData } from "@/components/finance/dashboard-data";
-import { fmtMoney, fmtSignedMoney } from "@/lib/format";
+import { fmtMoney, fmtSignedMoney, formatPct } from "@/lib/format";
 import { minorToMajor } from "@/lib/money";
 import { netWorthChange } from "@/lib/period-comparison";
 
@@ -45,11 +45,6 @@ const chartConfig: ChartConfig = {
     color: "var(--color-muted-foreground)"
   }
 };
-
-function formatPct(pct: number | null): string {
-  if (pct === null || !Number.isFinite(pct)) return "—";
-  return `${pct >= 0 ? "+" : ""}${(pct * 100).toFixed(1)}%`;
-}
 
 export function FinancialOverview() {
   const { series, projection, currency, netWorthMinor, assetsMinor, liabilitiesMinor, privacy } =

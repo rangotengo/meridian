@@ -14,7 +14,7 @@ import { Amount } from "@/components/finance/amount";
 import { CategoryDonut } from "@/components/finance/category-donut";
 import { FxIssuesAlert } from "@/components/finance/fx-issues-alert";
 import { SpendingHeatmap } from "@/components/finance/spending-heatmap";
-import { fmtDate, fmtMoney, fmtMonth } from "@/lib/format";
+import { fmtDate, fmtMonth, fmtSignedMoney, formatPct } from "@/lib/format";
 import { deltaWithPct } from "@/lib/period-comparison";
 import { monthKeyIn, todayIn } from "@/lib/datetime";
 import { REPORT_PERIODS, resolveReportRange, selectNetWorthInRange } from "@/lib/report-range";
@@ -22,11 +22,6 @@ import { PrintButton } from "./print-button";
 import { cn } from "@/lib/utils";
 
 export const metadata = { title: "Reports" };
-
-function formatPct(pct: number | null): string {
-  if (pct === null || !Number.isFinite(pct)) return "—";
-  return `${pct >= 0 ? "+" : ""}${(pct * 100).toFixed(1)}%`;
-}
 
 function DeltaLine({
   currentMinor,
@@ -51,7 +46,7 @@ function DeltaLine({
             deltaMinor >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-destructive"
           }`}
         >
-          {fmtMoney(deltaMinor, currency, "en", "exceptZero")} ({formatPct(pct)})
+          {fmtSignedMoney(deltaMinor, currency)} ({formatPct(pct)})
         </span>
       )}
     </p>

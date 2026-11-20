@@ -17,7 +17,7 @@ import {
 } from "@/components/ui/chart";
 import { Bar, BarChart, CartesianGrid, XAxis, YAxis } from "recharts";
 import { useDashboardData } from "@/components/finance/dashboard-data";
-import { fmtMoney, fmtMonth, fmtSignedMoney } from "@/lib/format";
+import { fmtMoney, fmtMonth, fmtSignedMoney, formatPct } from "@/lib/format";
 import { minorToMajor } from "@/lib/money";
 import { compareFlowWindows, monthVsLastMonth, type PeriodDelta } from "@/lib/period-comparison";
 import { ArrowDownLeftIcon, ArrowUpRightIcon } from "lucide-react";
@@ -26,11 +26,6 @@ const chartConfig = {
   moneyIn: { label: "Money in", color: "var(--color-primary)" },
   moneyOut: { label: "Money out", color: "var(--color-muted-foreground)" }
 } satisfies ChartConfig;
-
-function formatPct(pct: number | null): string {
-  if (pct === null || !Number.isFinite(pct)) return "—";
-  return `${pct >= 0 ? "+" : ""}${(pct * 100).toFixed(1)}%`;
-}
 
 function DeltaLine({
   delta,
