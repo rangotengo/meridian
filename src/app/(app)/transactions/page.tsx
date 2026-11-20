@@ -382,6 +382,8 @@ export default async function TransactionsPage({ searchParams }: { searchParams:
           items={page.items}
           privacy={privacy}
           tagNames={Object.fromEntries(tagNameById)}
+          categories={categories.map((c) => ({ id: c.id, name: c.name }))}
+          accountLevels={Object.fromEntries(accounts.map((a) => [a.id, a.level]))}
           pagination={pagination}
         />
       )}
