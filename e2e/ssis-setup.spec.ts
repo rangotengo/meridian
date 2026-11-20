@@ -55,6 +55,12 @@ test("completed setup collapses to a summary row; Edit setup expands and Collaps
   const editSetup = page.getByRole("button", { name: "Edit setup" });
   await expect(editSetup).toBeVisible();
   await expect(editSetup).toHaveAttribute("aria-expanded", "false");
+  // The collapsed panel keeps its container (hidden) so the toggle's
+  // aria-controls resolves; the setup forms stay unmounted.
+  await expect(editSetup).toHaveAttribute("aria-controls", "ssis-setup-panel");
+  const panel = page.locator("#ssis-setup-panel");
+  await expect(panel).toHaveCount(1);
+  await expect(panel).toBeHidden();
   await expect(page.getByRole("heading", { name: "SSIS setup" })).toBeVisible();
   await expect(page.getByText(/BO account ••••2222/)).toBeVisible();
   await expect(page.getByText(/3 purchases · 2 statement rows/)).toBeVisible();
@@ -70,10 +76,13 @@ test("completed setup collapses to a summary row; Edit setup expands and Collaps
   await expect(collapse).toHaveAttribute("aria-expanded", "true");
   await expect(page.locator('input[name="boAccountNo"]')).toBeVisible();
   await expect(page.getByRole("button", { name: "Refresh now" })).toBeVisible();
+  await expect(page.locator("#ssis-setup-panel")).toBeVisible();
 
   // Collapse again; the summary row returns and the forms leave the page.
   await collapse.click();
   await expect(page.getByRole("button", { name: "Edit setup" })).toBeVisible();
   await expect(page.locator('input[name="boAccountNo"]')).toHaveCount(0);
+  await expect(page.locator("#ssis-setup-panel")).toHaveCount(1);
+  await expect(page.locator("#ssis-setup-panel")).toBeHidden();
   await expect(page.getByText("Total Units")).toBeVisible();
 });
