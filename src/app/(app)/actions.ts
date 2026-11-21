@@ -212,6 +212,69 @@ export async function bulkDeleteEntriesAction(
   });
 }
 
+export type BulkRecategoriseResult = {
+  updated: string[];
+  skipped: { id: string; reason: string }[];
+};
+
+const bulkRecategoriseSchema = z.object({
+  entryIds: z.array(z.string().uuid()).min(1).max(25),
+  categoryId: z.string().uuid().nullable()
+});
+
+/**
+ * Recategorise several transactions from the list in one go. Each entry is
+ * updated in its own transaction via the same editTransaction path as a
+ * single edit (so permission, transfer-leg and split rules apply per
+ * entry), and a failure for one entry - e.g. an entry the actor cannot
+ * see - only skips that entry instead of rolling back the rest. A null
+ * categoryId clears the category ("Uncategorized"). The result names every
+ * updated id and every skipped id with its reason. Same 25-id cap as bulk
+ * delete, enforced up front by the schema.
+ */
+export async function bulkRecategoriseEntriesAction(
+  _prev: ActionState<BulkRecategoriseResult> | undefined,
+  formData: FormData
+): Promise<ActionState<BulkRecategoriseResult>> {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(String(formData.get("entryIds") ?? "[]"));
+  } catch {
+    return { ok: false, error: "Invalid selection.", code: "validation.failed" };
+  }
+  const categoryRaw = String(formData.get("categoryId") ?? "");
+  const parsed = bulkRecategoriseSchema.safeParse({
+    entryIds: raw,
+    categoryId: categoryRaw === "" ? null : categoryRaw
+  });
+  if (!parsed.success) {
+    return { ok: false, error: "Check the highlighted fields.", code: "validation.failed" };
+  }
+  return runAction("txn.bulk-recategorise", async () => {
+    const actor = await assertActor();
+    const updated: string[] = [];
+    const skipped: { id: string; reason: string }[] = [];
+    for (const entryId of parsed.data.entryIds) {
+      try {
+        await withTransaction((tx) =>
+          orchestrate.editTransaction(tx, actor, entryId, {
+            categoryId: parsed.data.categoryId
+          })
+        );
+        updated.push(entryId);
+      } catch (e) {
+        skipped.push({
+          id: entryId,
+          reason: e instanceof DomainError ? e.userMessage : "Could not update."
+        });
+      }
+    }
+    revalidatePath("/transactions");
+    revalidatePath("/");
+    return { updated, skipped };
+  });
+}
+
 const splitPayloadSchema = z.object({
   parentEntryId: z.string().uuid(),
   parts: z

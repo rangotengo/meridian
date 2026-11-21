@@ -3,7 +3,8 @@ import {
   toggleSelection,
   selectAllOnPage,
   deselectAllOnPage,
-  formatBulkDeleteSummary
+  formatBulkDeleteSummary,
+  formatBulkRecategoriseSummary
 } from "@/lib/bulk-selection";
 
 describe("toggleSelection", () => {
@@ -36,6 +37,19 @@ describe("formatBulkDeleteSummary", () => {
     );
     expect(formatBulkDeleteSummary(0, 2)).toBe(
       "Deleted 0 transactions. 2 transactions were skipped."
+    );
+  });
+});
+
+describe("formatBulkRecategoriseSummary", () => {
+  it("reports updates and skips with correct plurals", () => {
+    expect(formatBulkRecategoriseSummary(1, 0)).toBe("Updated 1 transaction.");
+    expect(formatBulkRecategoriseSummary(3, 0)).toBe("Updated 3 transactions.");
+    expect(formatBulkRecategoriseSummary(2, 1)).toBe(
+      "Updated 2 transactions. 1 transaction was skipped."
+    );
+    expect(formatBulkRecategoriseSummary(0, 2)).toBe(
+      "Updated 0 transactions. 2 transactions were skipped."
     );
   });
 });

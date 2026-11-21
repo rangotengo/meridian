@@ -5,8 +5,8 @@
  * Selection is scoped to the visible page: the list remounts with fresh
  * state on page/filter changes (see page.tsx listKey), and the component
  * only ever shows or submits ids on the current page — so a selection can
- * never grow past the 25 ids the bulk-delete action accepts, even if rows
- * were selected on an earlier page before a revalidation.
+ * never grow past the 25 ids the bulk actions accept, even if rows were
+ * selected on an earlier page before a revalidation.
  */
 
 /** Toggle one id in the selection. */
@@ -39,4 +39,16 @@ export function formatBulkDeleteSummary(deletedCount: number, skippedCount: numb
       ? "1 transaction was skipped."
       : `${skippedCount} transactions were skipped.`;
   return `${deleted} ${skipped}`;
+}
+
+/** One-line summary of a bulk recategorise outcome for the result banner. */
+export function formatBulkRecategoriseSummary(updatedCount: number, skippedCount: number): string {
+  const updated =
+    updatedCount === 1 ? "Updated 1 transaction." : `Updated ${updatedCount} transactions.`;
+  if (skippedCount === 0) return updated;
+  const skipped =
+    skippedCount === 1
+      ? "1 transaction was skipped."
+      : `${skippedCount} transactions were skipped.`;
+  return `${updated} ${skipped}`;
 }
