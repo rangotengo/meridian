@@ -4,6 +4,7 @@ import { getDb } from "@/server/db/client";
 import { users } from "@/server/db/schema";
 import { cookies } from "next/headers";
 import { getPreference, getUserPrivacyMode } from "@/server/domain/users";
+import { isDigestOptedIn } from "@/server/domain/monthly-digest";
 import { Card, PageHeader } from "@/components/ds/card";
 import { chooseThemePreference, parseThemePreference, THEME_COOKIE_NAME } from "@/lib/theme";
 import { ProfileForms } from "./forms";
@@ -33,6 +34,7 @@ export default async function SettingsPage() {
   const [user] = await db.select().from(users).where(eq(users.id, actor.userId)).limit(1);
   const privacy = user ? await getUserPrivacyMode(db, actor.userId) : false;
   const prefs = (user?.preferences ?? {}) as Record<string, unknown>;
+  const monthlyDigest = isDigestOptedIn(prefs);
   const themePref = await getPreference<string>(prefs, "theme", "system");
   const themeCookie = (await cookies()).get(THEME_COOKIE_NAME)?.value;
   const theme = chooseThemePreference(
@@ -53,6 +55,7 @@ export default async function SettingsPage() {
             timezones={TIMEZONES}
             privacy={privacy}
             theme={theme}
+            monthlyDigest={monthlyDigest}
             canEditTimezone={actor.familyRole === "admin"}
             accessManaged={actor.authProvider === "cloudflare-access"}
           />

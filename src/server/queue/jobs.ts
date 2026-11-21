@@ -9,6 +9,7 @@ import {
   recalculateAllActiveAccounts,
   recalculateTargetedAccounts
 } from "../domain/balances-maintenance";
+import { runMonthlyDigest } from "../domain/monthly-digest";
 import { postDueSeries } from "../domain/recurring";
 import { runScheduledBackup } from "../domain/backups";
 import { cleanupOAuthHousekeeping } from "../domain/oauth";
@@ -116,6 +117,10 @@ export async function createJobRegistry() {
     await runScheduledBackup(exec);
   });
 
+  registry.set("digest:monthly", async (_payload, exec) => {
+    await runMonthlyDigest(exec);
+  });
+
   return registry;
 }
 
@@ -123,7 +128,8 @@ export const CRON_DEFINITIONS: CronDef[] = [
   { key: "nightly-backup", queue: "maintenance:backup", cron: "47 2 * * *" },
   { key: "nightly-balances", queue: "maintenance:balances", cron: "2 4 * * *" },
   { key: "nightly-cleanup", queue: "maintenance:cleanup", cron: "17 3 * * *" },
-  { key: "recurring-post", queue: "recurring:post", cron: "*/30 * * * *" }
+  { key: "recurring-post", queue: "recurring:post", cron: "*/30 * * * *" },
+  { key: "monthly-digest", queue: "digest:monthly", cron: "17 6 1 * *" }
 ];
 
 export async function registerWorkerBootstraps(exec: Executor): Promise<void> {

@@ -8,6 +8,7 @@ import {
   addDays,
   addMonths,
   endOfMonth,
+  formatMonthKey,
   monthKeyIn,
   monthKeyOf,
   startOfMonth,
@@ -1195,6 +1196,147 @@ export function currentMonthRange(timezone: string): { from: string; to: string 
 
 export function monthRangeOf(monthKey: string): { from: string; to: string } {
   return { from: startOfMonth(`${monthKey}-01`), to: endOfMonth(`${monthKey}-01`) };
+}
+
+/**
+ * The calendar month before the one `now` falls in, in the given timezone.
+ * The digest is computed per family in THAT family's timezone — never UTC —
+ * so a cron firing just after midnight UTC on the 1st still reports the
+ * previous local month for families west of UTC.
+ */
+export function previousMonthRange(
+  timezone: string,
+  now: Date = new Date()
+): { monthKey: string; from: string; to: string } {
+  const prevMk = addMonths(monthKeyIn(timezone, now), -1);
+  return { monthKey: prevMk, from: startOfMonth(`${prevMk}-01`), to: endOfMonth(`${prevMk}-01`) };
+}
+
+export type MonthlyDigestSummary = {
+  monthKey: string;
+  monthLabel: string;
+  from: string;
+  to: string;
+  netWorthMinor: number;
+  incomeMinor: number;
+  expenseMinor: number;
+  savingsMinor: number;
+  incompleteFx: boolean;
+  /**
+   * False when the month has no reportable content for this recipient: no
+   * included flows and no nonzero balance. Judged on raw presence, not
+   * converted totals, so amounts excluded for a missing FX rate still
+   * produce an email carrying the exclusion sentence. The handler sends
+   * nothing when false — never an empty "you had no activity" email.
+   */
+  hasActivity: boolean;
+};
+
+/**
+ * Per-recipient previous-month totals for the monthly digest email. Totals
+ * only — no names, merchants, categories, or accounts leave this function.
+ *
+ * Mirrors dashboardSummary's filters exactly (ordinary transactions only:
+ * transfer legs, split parts, and balance-tracking opening adjustments
+ * excluded; active accounts with included_in_reports), restricted to the
+ * recipient's own account access via the same ACCESS_SQL predicate the
+ * report queries apply — so a member never sees another member's unshared
+ * accounts. Net worth is the latest snapshot per in-scope account as of
+ * the last day of the month. Amounts without an FX rate are excluded and
+ * reported via `incompleteFx`, exactly like the other reports.
+ */
+export async function monthlyDigestSummary(
+  exec: Executor,
+  family: Family,
+  userId: string,
+  opts: { now?: Date } = {}
+): Promise<MonthlyDigestSummary> {
+  const ctx = newConversionContext();
+  const { monthKey, from, to } = previousMonthRange(family.timezone, opts.now);
+  const currency = family.currency;
+
+  const balanceRows = await exec.execute<{
+    account_id: string;
+    balance_minor: string;
+    currency: string;
+    type: string;
+  }>(sql`
+    SELECT
+      CAST(b.account_id AS TEXT) AS account_id, CAST(b.balance_minor AS TEXT) AS balance_minor, b.currency, a.type
+    FROM balances b
+    JOIN accounts a ON a.id = b.account_id
+    WHERE a.family_id = ${family.id}
+      AND a.status = 'active'
+      AND a.included_in_reports = true
+      AND ${ACCESS_SQL(userId)}
+      AND b.as_of = (SELECT max(latest.as_of) FROM balances latest WHERE latest.account_id = b.account_id AND latest.as_of <= ${to})
+    ORDER BY b.account_id
+  `);
+
+  let netWorthMinor = 0;
+  for (const r of balanceRows.rows ?? []) {
+    netWorthMinor = safeAdd(
+      netWorthMinor,
+      await convertTo(exec, safeParseMinor(r.balance_minor), r.currency, currency, to, ctx)
+    );
+  }
+
+  const flows = await exec.execute<{
+    outflow_minor: string;
+    inflow_minor: string;
+    outflow_currency: string;
+  }>(sql`
+    SELECT
+      CAST(COALESCE(SUM(CASE WHEN e.amount_minor > 0 THEN e.amount_minor ELSE 0 END), 0) AS TEXT) AS outflow_minor,
+      CAST(COALESCE(SUM(CASE WHEN e.amount_minor < 0 THEN -e.amount_minor ELSE 0 END), 0) AS TEXT) AS inflow_minor,
+      e.currency AS outflow_currency
+    FROM entries e
+    JOIN accounts a ON a.id = e.account_id
+    JOIN transactions t ON t.entry_id = e.id
+    WHERE a.family_id = ${family.id}
+      AND a.included_in_reports = true
+      AND a.status = 'active'
+      AND ${ACCESS_SQL(userId)}
+      AND e.entryable_type = 'transaction'
+      AND t.transfer_id IS NULL
+      ${NOT_OPENING_ADJUSTMENT_SQL}
+      AND NOT EXISTS (SELECT 1 FROM entries c WHERE c.parent_entry_id = e.id)
+      AND e.date BETWEEN ${from} AND ${to}
+    GROUP BY e.currency
+  `);
+
+  let incomeMinor = 0;
+  let expenseMinor = 0;
+  for (const r of flows.rows ?? []) {
+    expenseMinor = safeAdd(
+      expenseMinor,
+      await convertTo(exec, safeParseMinor(r.outflow_minor), r.outflow_currency, currency, to, ctx)
+    );
+    incomeMinor = safeAdd(
+      incomeMinor,
+      await convertTo(exec, safeParseMinor(r.inflow_minor), r.outflow_currency, currency, to, ctx)
+    );
+  }
+
+  const fx = completenessOf(ctx);
+  // Activity is judged on raw presence, not converted totals: amounts
+  // excluded for a missing FX rate still count as reportable — the
+  // recipient gets the exclusion sentence instead of silence.
+  const hasActivity =
+    (flows.rows ?? []).length > 0 ||
+    (balanceRows.rows ?? []).some((r) => safeParseMinor(r.balance_minor) !== 0);
+  return {
+    monthKey,
+    monthLabel: formatMonthKey(monthKey),
+    from,
+    to,
+    netWorthMinor,
+    incomeMinor,
+    expenseMinor,
+    savingsMinor: safeAdd(incomeMinor, -expenseMinor),
+    incompleteFx: fx.incompleteFx,
+    hasActivity
+  };
 }
 
 export function monthOf(iso: string): string {
