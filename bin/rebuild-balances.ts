@@ -14,11 +14,7 @@ async function main() {
   const db = getDb();
   const result = await recalculateAllActiveAccounts(db);
   console.log(
-    JSON.stringify(
-      { recalculated: result.recalculated, failures: result.failures },
-      null,
-      2
-    )
+    JSON.stringify({ recalculated: result.recalculated, failures: result.failures }, null, 2)
   );
   if (result.failures.length > 0) {
     process.exitCode = 1;
