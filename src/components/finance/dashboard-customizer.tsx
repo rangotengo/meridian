@@ -1,16 +1,29 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
+  closestCenter,
   DndContext,
-  pointerWithin,
+  DragOverlay,
+  KeyboardSensor,
   PointerSensor,
+  pointerWithin,
   useSensor,
   useSensors,
+  type Announcements,
+  type CollisionDetection,
   type DragEndEvent,
-  type DragStartEvent
+  type DragStartEvent,
+  type UniqueIdentifier
 } from "@dnd-kit/core";
-import { arrayMove, SortableContext, useSortable } from "@dnd-kit/sortable";
+import {
+  arrayMove,
+  rectSortingStrategy,
+  SortableContext,
+  sortableKeyboardCoordinates,
+  useSortable
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
 import { Button } from "@/components/ui/button";
 import {
   Sheet,
@@ -22,19 +35,48 @@ import {
 } from "@/components/ui/sheet";
 import { Switch } from "@/components/ui/switch";
 import {
+  ArrowDownIcon,
   ArrowLeftRightIcon,
+  ArrowUpIcon,
   CalendarClockIcon,
   ChartAreaIcon,
+  ChartPieIcon,
+  CheckIcon,
+  EyeOffIcon,
   GripVerticalIcon,
   HeartPulseIcon,
   LayoutGridIcon,
+  MousePointerClickIcon,
   PiggyBankIcon,
+  PlusIcon,
   ReceiptIcon,
   RotateCcwIcon,
+  ShieldCheckIcon,
+  SlidersHorizontalIcon,
+  TrendingUpIcon,
   WalletIcon,
   ZapIcon
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import {
+  applyVisibleOrder,
+  buildDashboardLayout,
+  DASHBOARD_LAYOUT_STORAGE_KEY,
+  DASHBOARD_SIZE_OPTIONS,
+  DEFAULT_DASHBOARD_BLOCKS,
+  DEFAULT_HIDDEN_WIDGETS,
+  hideWidget,
+  moveWidget,
+  resetDashboardLayout,
+  serializeDashboardLayout,
+  setWidgetCompact,
+  setWidgetSize,
+  showWidget,
+  visibleBlocks,
+  type DashboardBlock,
+  type DashboardLayout,
+  type WidgetSize
+} from "@/lib/dashboard-layout";
 import { DashboardDataProvider, type DashboardData } from "@/components/finance/dashboard-data";
 import { FinancialOverview } from "@/components/finance/financial-overview";
 import { AccountCards } from "@/components/finance/account-cards";
@@ -45,19 +87,9 @@ import { RecentTransactions } from "@/components/finance/recent-transactions";
 import { HealthScore } from "@/components/finance/health-score";
 import { GoalsWidget } from "@/components/finance/goals-widget";
 import { BillsWidget } from "@/components/finance/bills-widget";
+import { MonthlySnapshot } from "@/components/finance/monthly-snapshot";
+import { SpendingBreakdown } from "@/components/finance/spending-breakdown";
 import { FxWarning } from "@/components/finance/fx-warning";
-
-type WidgetSize = "sm" | "lg" | "full";
-
-type Block = {
-  id: string;
-  label: string;
-  size: WidgetSize;
-  // Compact widgets take their natural height instead of stretching to
-  // the grid row height. Used for widgets whose content is short, so a
-  // tall row would otherwise leave a big mostly-empty card.
-  compact?: boolean;
-};
 
 type WidgetMeta = {
   icon: React.ComponentType<{ className?: string }>;
@@ -72,7 +104,7 @@ const widgetMeta: Record<string, WidgetMeta> = {
   "account-cards": { icon: WalletIcon, description: "Account cards and wallet balance." },
   "transfer-spending": {
     icon: ZapIcon,
-    description: "Quick actions and monthly spending limit."
+    description: "Quick actions and monthly spending limit together."
   },
   "money-movement": {
     icon: ArrowLeftRightIcon,
@@ -81,7 +113,23 @@ const widgetMeta: Record<string, WidgetMeta> = {
   "health-score": { icon: HeartPulseIcon, description: "Health score and factor breakdown." },
   bills: { icon: CalendarClockIcon, description: "Upcoming bills and reminders." },
   goals: { icon: PiggyBankIcon, description: "Savings goals and progress." },
-  "recent-transactions": { icon: ReceiptIcon, description: "Latest ledger entries." }
+  "recent-transactions": { icon: ReceiptIcon, description: "Latest ledger entries." },
+  "monthly-snapshot": {
+    icon: TrendingUpIcon,
+    description: "Income, spending, net saved and savings rate this month."
+  },
+  "spending-categories": {
+    icon: ChartPieIcon,
+    description: "Where this month's spending went."
+  },
+  "quick-actions": {
+    icon: MousePointerClickIcon,
+    description: "Quick add, ledger entry and account shortcuts on their own."
+  },
+  "spending-limit": {
+    icon: ShieldCheckIcon,
+    description: "Overall monthly budget and remaining spend on its own."
+  }
 };
 
 const fallbackMeta: WidgetMeta = {
@@ -89,100 +137,43 @@ const fallbackMeta: WidgetMeta = {
   description: ""
 };
 
-const defaultBlocks: Block[] = [
-  { id: "financial-overview", label: "Net worth", size: "lg" },
-  { id: "account-cards", label: "Accounts", size: "sm" },
-  { id: "transfer-spending", label: "Actions & spending", size: "sm" },
-  { id: "money-movement", label: "Money movement", size: "sm" },
-  { id: "health-score", label: "Financial health", size: "sm", compact: true },
-  { id: "bills", label: "Bills & reminders", size: "sm" },
-  { id: "goals", label: "Goals", size: "sm", compact: true },
-  { id: "recent-transactions", label: "Recent transactions", size: "full" }
-];
-
 const sizeClass: Record<WidgetSize, string> = {
   sm: "col-span-12 lg:col-span-4",
+  md: "col-span-12 lg:col-span-6",
   lg: "col-span-12 lg:col-span-8",
   full: "col-span-12"
 };
 
-const sizeOptions: { value: WidgetSize; label: string }[] = [
-  { value: "sm", label: "Small" },
-  { value: "lg", label: "Medium" },
-  { value: "full", label: "Large" }
-];
+const labelById = new Map(DEFAULT_DASHBOARD_BLOCKS.map((block) => [block.id, block.label]));
 
-const STORAGE_KEY = "meridian-dashboard-order";
-const nullStrategy = () => null;
+function labelFor(id: UniqueIdentifier) {
+  return labelById.get(String(id)) ?? String(id);
+}
 
-type SavedLayout = {
-  version: 2;
-  order: string[];
-  hidden: string[];
-  sizes: Partial<Record<string, WidgetSize>>;
+const announcements: Announcements = {
+  onDragStart({ active }) {
+    return `Picked up ${labelFor(active.id)}.`;
+  },
+  onDragOver({ active, over }) {
+    if (!over) return `${labelFor(active.id)} is not over a widget.`;
+    return `${labelFor(active.id)} is over ${labelFor(over.id)}.`;
+  },
+  onDragEnd({ active, over }) {
+    if (!over) return `${labelFor(active.id)} was dropped.`;
+    return `${labelFor(active.id)} was dropped over ${labelFor(over.id)}.`;
+  },
+  onDragCancel({ active }) {
+    return `Moving ${labelFor(active.id)} was cancelled.`;
+  }
 };
 
-function isWidgetSize(value: unknown): value is WidgetSize {
-  return value === "sm" || value === "lg" || value === "full";
-}
-
-function isStringArray(value: unknown): value is string[] {
-  return Array.isArray(value) && value.every((item) => typeof item === "string");
-}
-
-/**
- * Rebuild the layout from a saved value. Accepts both the v2 object
- * ({ order, hidden, sizes }) and the v1 bare array of ids (order only:
- * everything visible, default sizes), so an existing saved order is
- * migrated without losing the user's arrangement. Unknown ids are dropped
- * and widgets missing from the saved value are appended in default order.
- */
-function buildLayout(saved: unknown): { blocks: Block[]; hidden: string[] } {
-  const byId = new Map(defaultBlocks.map((block) => [block.id, block]));
-  let order: string[] = [];
-  let hidden: string[] = [];
-  const sizes = new Map<string, WidgetSize>();
-  if (isStringArray(saved)) {
-    order = saved;
-  } else if (saved && typeof saved === "object") {
-    const record = saved as Record<string, unknown>;
-    if (isStringArray(record.order)) order = record.order;
-    if (isStringArray(record.hidden)) hidden = record.hidden;
-    if (record.sizes && typeof record.sizes === "object") {
-      for (const [id, size] of Object.entries(record.sizes as Record<string, unknown>)) {
-        if (isWidgetSize(size)) sizes.set(id, size);
-      }
-    }
-  }
-  const seen = new Set<string>();
-  const blocks: Block[] = [];
-  for (const id of order) {
-    const fallback = byId.get(id);
-    if (!fallback || seen.has(id)) continue;
-    seen.add(id);
-    blocks.push({ ...fallback, size: sizes.get(id) ?? fallback.size });
-  }
-  for (const fallback of defaultBlocks) {
-    if (!seen.has(fallback.id)) blocks.push({ ...fallback });
-  }
-  return { blocks, hidden: hidden.filter((id) => byId.has(id)) };
-}
-
-function persistLayout(blocks: Block[], hidden: string[]) {
-  try {
-    const sizes: Partial<Record<string, WidgetSize>> = {};
-    for (const block of blocks) sizes[block.id] = block.size;
-    const saved: SavedLayout = {
-      version: 2,
-      order: blocks.map((block) => block.id),
-      hidden,
-      sizes
-    };
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(saved));
-  } catch {
-    /* ignore */
-  }
-}
+// Pointer-first so a drag only targets a widget the pointer is actually
+// over; closestCenter keeps keyboard and edge drags working when the
+// pointer sits in a grid gap.
+const collisionDetection: CollisionDetection = (args) => {
+  const pointerCollisions = pointerWithin(args);
+  return pointerCollisions.length > 0 ? pointerCollisions : closestCenter(args);
+};
 
 function widgetFor(id: string) {
   switch (id) {
@@ -211,124 +202,338 @@ function widgetFor(id: string) {
       return <HealthScore />;
     case "recent-transactions":
       return <RecentTransactions />;
+    case "monthly-snapshot":
+      return <MonthlySnapshot />;
+    case "spending-categories":
+      return <SpendingBreakdown />;
+    case "quick-actions":
+      return <QuickActions />;
+    case "spending-limit":
+      return <SpendingLimit />;
     default:
       return null;
   }
 }
 
-function SortableWidget({ block, editing }: { block: Block; editing: boolean }) {
-  const { attributes, listeners, setNodeRef, isDragging } = useSortable({
+function SortableWidget({
+  block,
+  editing,
+  position,
+  total
+}: {
+  block: DashboardBlock;
+  editing: boolean;
+  position: number;
+  total: number;
+}) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: block.id,
     disabled: !editing
   });
+  const meta = widgetMeta[block.id] ?? fallbackMeta;
+  const Icon = meta.icon;
 
   return (
     <div
       ref={setNodeRef}
+      style={{ transform: CSS.Transform.toString(transform), transition }}
       className={cn(
         sizeClass[block.size],
-        "relative transition-[opacity,box-shadow] duration-200",
+        "relative",
         block.compact && "self-start",
-        isDragging && "z-20 scale-[1.02] opacity-95 shadow-2xl ring-2 ring-primary/40",
-        editing && !isDragging && "rounded-xl ring-2 ring-dashed ring-primary/20"
+        editing &&
+          "rounded-xl ring-2 ring-primary/20 hover:ring-primary/40 focus-within:ring-primary/50",
+        isDragging && "z-20 opacity-30"
       )}
     >
       {editing ? (
-        <>
-          <div className="absolute -top-3 left-1/2 z-10 -translate-x-1/2 rounded-full bg-primary px-2.5 py-1 text-[10px] font-medium whitespace-nowrap text-primary-foreground shadow-md">
-            {block.label}
-          </div>
-          <button
-            type="button"
-            {...attributes}
-            {...listeners}
-            aria-label={`Drag ${block.label} to reorder`}
-            className="absolute -top-3 left-3 z-10 flex size-6 cursor-grab items-center justify-center rounded-full bg-primary text-primary-foreground shadow-md active:cursor-grabbing"
-          >
-            <GripVerticalIcon className="size-3.5" />
-          </button>
-        </>
+        <div
+          {...attributes}
+          {...listeners}
+          aria-label={`Move ${block.label}`}
+          className="absolute inset-x-0 top-0 z-10 flex h-9 cursor-grab touch-none items-center gap-2 rounded-t-xl border-b border-primary/20 bg-primary/10 px-3 text-xs font-medium text-primary backdrop-blur-sm select-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none active:cursor-grabbing"
+        >
+          <GripVerticalIcon className="size-3.5 shrink-0" />
+          <Icon className="size-3.5 shrink-0 opacity-70" />
+          <span className="truncate">{block.label}</span>
+          <span className="ml-auto shrink-0 rounded-full bg-primary/15 px-1.5 py-0.5 text-[10px] tabular-nums">
+            {position + 1}/{total}
+          </span>
+        </div>
       ) : null}
       <div
         className={cn(
           !block.compact && "h-full [&>*]:h-full",
-          editing && "pointer-events-none select-none"
+          // Reserve the drag bar's height so it never covers the card header.
+          editing && "pt-9 pointer-events-none select-none"
         )}
       >
         {widgetFor(block.id)}
       </div>
+      {editing ? (
+        <div
+          aria-hidden
+          className="pointer-events-none absolute inset-0 rounded-xl ring-1 ring-primary/10 ring-inset"
+        />
+      ) : null}
+    </div>
+  );
+}
+
+function DragPreview({ block }: { block: DashboardBlock }) {
+  const meta = widgetMeta[block.id] ?? fallbackMeta;
+  const Icon = meta.icon;
+  return (
+    <div className="w-72 max-w-[calc(100vw-2rem)] rotate-1 rounded-xl border-2 border-primary/40 bg-card p-3 shadow-2xl ring-1 ring-primary/20">
+      <div className="flex items-center gap-2.5">
+        <div className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
+          <Icon className="size-4" />
+        </div>
+        <div className="min-w-0 flex-1">
+          <p className="truncate text-sm font-semibold">{block.label}</p>
+          <p className="truncate text-[11px] text-muted-foreground">{meta.description}</p>
+        </div>
+        <GripVerticalIcon className="size-4 shrink-0 text-muted-foreground" />
+      </div>
+    </div>
+  );
+}
+
+function WidgetSettingsRow({
+  block,
+  index,
+  total,
+  onMoveUp,
+  onMoveDown,
+  onHide,
+  onSize,
+  onCompact
+}: {
+  block: DashboardBlock;
+  index: number;
+  total: number;
+  onMoveUp: () => void;
+  onMoveDown: () => void;
+  onHide: () => void;
+  onSize: (size: WidgetSize) => void;
+  onCompact: (compact: boolean) => void;
+}) {
+  const meta = widgetMeta[block.id] ?? fallbackMeta;
+  const Icon = meta.icon;
+
+  return (
+    <div className="rounded-xl border bg-card p-3">
+      <div className="flex items-start gap-2.5">
+        <div className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-muted">
+          <Icon className="size-4 text-muted-foreground" />
+        </div>
+        <div className="min-w-0 flex-1">
+          <p className="line-clamp-2 text-sm font-medium leading-snug">{block.label}</p>
+          <p className="line-clamp-2 text-xs text-muted-foreground">{meta.description}</p>
+        </div>
+        <div className="flex shrink-0 items-center gap-0.5">
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            disabled={index === 0}
+            onClick={onMoveUp}
+            aria-label={`Move ${block.label} up`}
+            title="Move up"
+          >
+            <ArrowUpIcon />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            disabled={index === total - 1}
+            onClick={onMoveDown}
+            aria-label={`Move ${block.label} down`}
+            title="Move down"
+          >
+            <ArrowDownIcon />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            onClick={onHide}
+            aria-label={`Hide ${block.label}`}
+            title="Hide widget"
+          >
+            <EyeOffIcon />
+          </Button>
+        </div>
+      </div>
+      <div className="mt-2.5 flex items-center gap-2">
+        <div
+          className="flex flex-1 gap-0.5 rounded-lg bg-muted p-0.5"
+          role="group"
+          aria-label={`${block.label} width`}
+        >
+          {DASHBOARD_SIZE_OPTIONS.map((option) => (
+            <button
+              key={option.value}
+              type="button"
+              aria-pressed={block.size === option.value}
+              title={option.title}
+              onClick={() => onSize(option.value)}
+              className={cn(
+                "flex-1 rounded-md px-1.5 py-1 text-[11px] font-medium transition-colors",
+                block.size === option.value
+                  ? "bg-card text-foreground shadow-sm"
+                  : "text-muted-foreground hover:text-foreground"
+              )}
+            >
+              {option.label}
+            </button>
+          ))}
+        </div>
+        <label
+          htmlFor={`widget-fit-${block.id}`}
+          className="flex shrink-0 cursor-pointer items-center gap-1.5 text-[11px] text-muted-foreground"
+          title="Use the widget's natural height instead of stretching it"
+        >
+          <Switch
+            id={`widget-fit-${block.id}`}
+            size="sm"
+            checked={block.compact ?? false}
+            onCheckedChange={onCompact}
+            aria-label={`Fit ${block.label} to content`}
+          />
+          Fit
+        </label>
+      </div>
+    </div>
+  );
+}
+
+function AvailableWidgetRow({ block, onAdd }: { block: DashboardBlock; onAdd: () => void }) {
+  const meta = widgetMeta[block.id] ?? fallbackMeta;
+  const Icon = meta.icon;
+
+  return (
+    <div className="flex items-center gap-2.5 rounded-xl border border-dashed p-2.5">
+      <div className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-muted">
+        <Icon className="size-4 text-muted-foreground" />
+      </div>
+      <div className="min-w-0 flex-1">
+        <p className="line-clamp-2 text-sm font-medium leading-snug">{block.label}</p>
+        <p className="line-clamp-2 text-xs text-muted-foreground">{meta.description}</p>
+      </div>
+      <Button
+        size="xs"
+        variant="outline"
+        className="shrink-0 gap-1"
+        onClick={onAdd}
+        aria-label={`Add ${block.label}`}
+      >
+        <PlusIcon />
+        Add
+      </Button>
     </div>
   );
 }
 
 export function DashboardCustomizer({ data }: { data: DashboardData }) {
   const [editing, setEditing] = useState(false);
-  const [blocks, setBlocks] = useState(defaultBlocks);
-  const [hiddenIds, setHiddenIds] = useState<string[]>([]);
+  const [panelOpen, setPanelOpen] = useState(false);
+  const [layout, setLayout] = useState<DashboardLayout>(() => ({
+    blocks: DEFAULT_DASHBOARD_BLOCKS,
+    hidden: DEFAULT_HIDDEN_WIDGETS
+  }));
+  const [activeId, setActiveId] = useState<string | null>(null);
 
   useEffect(() => {
     try {
-      const raw = localStorage.getItem(STORAGE_KEY);
+      const raw = localStorage.getItem(DASHBOARD_LAYOUT_STORAGE_KEY);
       if (!raw) return;
-      const next = buildLayout(JSON.parse(raw));
-      queueMicrotask(() => {
-        setBlocks(next.blocks);
-        setHiddenIds(next.hidden);
-      });
+      const next = buildDashboardLayout(JSON.parse(raw));
+      queueMicrotask(() => setLayout(next));
     } catch {
       /* ignore */
     }
   }, []);
-  const [, setActiveId] = useState<string | null>(null);
-  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 8 } }));
 
-  const visibleBlocks = blocks.filter((block) => !hiddenIds.includes(block.id));
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
+  );
 
-  function updateLayout(nextBlocks: Block[], nextHidden: string[]) {
-    setBlocks(nextBlocks);
-    setHiddenIds(nextHidden);
-    persistLayout(nextBlocks, nextHidden);
+  const visible = useMemo(() => visibleBlocks(layout), [layout]);
+  const hidden = useMemo(
+    () => layout.blocks.filter((block) => layout.hidden.includes(block.id)),
+    [layout]
+  );
+  const activeBlock = activeId
+    ? (layout.blocks.find((block) => block.id === activeId) ?? null)
+    : null;
+
+  function updateLayout(next: DashboardLayout) {
+    setLayout(next);
+    try {
+      localStorage.setItem(
+        DASHBOARD_LAYOUT_STORAGE_KEY,
+        JSON.stringify(serializeDashboardLayout(next))
+      );
+    } catch {
+      /* ignore */
+    }
   }
 
   function handleDragEnd(event: DragEndEvent) {
     setActiveId(null);
     const { active, over } = event;
     if (!over || active.id === over.id) return;
-    const oldIndex = visibleBlocks.findIndex((block) => block.id === active.id);
-    const newIndex = visibleBlocks.findIndex((block) => block.id === over.id);
+    const ids = visible.map((block) => block.id);
+    const oldIndex = ids.indexOf(String(active.id));
+    const newIndex = ids.indexOf(String(over.id));
     if (oldIndex === -1 || newIndex === -1) return;
-    const nextVisible = arrayMove(visibleBlocks, oldIndex, newIndex);
-    // Hidden widgets keep their slots in the full order; visible ones take
-    // the new order, so re-showing a widget returns it to its old position.
-    let visibleCursor = 0;
-    const next = blocks.map((block) => {
-      if (hiddenIds.includes(block.id)) return block;
-      const replacement = nextVisible[visibleCursor];
-      visibleCursor += 1;
-      return replacement ?? block;
-    });
-    updateLayout(next, hiddenIds);
+    updateLayout(applyVisibleOrder(layout, arrayMove(ids, oldIndex, newIndex)));
   }
 
-  function setWidgetVisible(id: string, show: boolean) {
-    const nextHidden = show ? hiddenIds.filter((hiddenId) => hiddenId !== id) : [...hiddenIds, id];
-    updateLayout(blocks, nextHidden);
+  function handleMove(id: string, direction: -1 | 1) {
+    updateLayout(moveWidget(layout, id, direction));
   }
 
-  function setWidgetSize(id: string, size: WidgetSize) {
-    updateLayout(
-      blocks.map((block) => (block.id === id ? { ...block, size } : block)),
-      hiddenIds
-    );
+  function handleHide(id: string) {
+    updateLayout(hideWidget(layout, id));
   }
 
-  function resetLayout() {
-    updateLayout(defaultBlocks, []);
+  function handleShow(id: string) {
+    updateLayout(showWidget(layout, id));
+  }
+
+  function handleSize(id: string, size: WidgetSize) {
+    updateLayout(setWidgetSize(layout, id, size));
+  }
+
+  function handleCompact(id: string, compact: boolean) {
+    updateLayout(setWidgetCompact(layout, id, compact));
+  }
+
+  function handleReset() {
+    updateLayout(resetDashboardLayout());
+  }
+
+  function startEditing() {
+    setEditing(true);
+    setPanelOpen(true);
+  }
+
+  function stopEditing() {
+    setEditing(false);
+    setPanelOpen(false);
   }
 
   return (
     <DashboardDataProvider data={data}>
-      <div className="flex flex-1 flex-col gap-4">
+      <div
+        className={cn(
+          "flex flex-1 flex-col gap-4",
+          // Keep the full grid visible next to the options panel on wide
+          // screens instead of letting the panel cover the right column.
+          editing && panelOpen && "xl:pr-[24rem]"
+        )}
+      >
         <div className="flex flex-wrap items-end justify-between gap-3">
           <div>
             <h1 className="text-2xl font-semibold tracking-tight sm:text-3xl">{data.greeting}</h1>
@@ -338,10 +543,10 @@ export function DashboardCustomizer({ data }: { data: DashboardData }) {
             variant={editing ? "default" : "outline"}
             size="sm"
             className="h-7 gap-1.5 text-xs"
-            onClick={() => setEditing(true)}
+            onClick={() => (editing ? stopEditing() : startEditing())}
           >
-            <LayoutGridIcon className="size-3" />
-            Customize
+            {editing ? <CheckIcon className="size-3" /> : <LayoutGridIcon className="size-3" />}
+            {editing ? "Done" : "Customize"}
           </Button>
         </div>
 
@@ -349,126 +554,156 @@ export function DashboardCustomizer({ data }: { data: DashboardData }) {
 
         {editing ? (
           <div className="flex flex-wrap items-center gap-2 rounded-xl border border-dashed border-primary/40 bg-primary/5 px-3 py-2 text-xs">
-            <LayoutGridIcon className="size-3.5 shrink-0 text-primary" />
-            <span className="font-medium">Editing layout</span>
+            <GripVerticalIcon className="size-3.5 shrink-0 text-primary" />
+            <span className="font-medium">Edit layout</span>
             <span className="text-muted-foreground">
-              Drag widgets by their handle to reorder. Use the panel to show, hide, or resize
-              widgets.
+              Drag any card by its top bar to move it. Use the panel for width, fit, and visibility.
             </span>
-            <Button
-              variant="outline"
-              size="sm"
-              className="ml-auto h-7 text-xs"
-              onClick={() => setEditing(false)}
-            >
-              Done
-            </Button>
+            <div className="ml-auto flex items-center gap-1.5">
+              {!panelOpen ? (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 gap-1.5 text-xs"
+                  onClick={() => setPanelOpen(true)}
+                >
+                  <SlidersHorizontalIcon className="size-3.5" />
+                  Widget options
+                </Button>
+              ) : null}
+              <Button variant="outline" size="sm" className="h-7 text-xs" onClick={stopEditing}>
+                Done
+              </Button>
+            </div>
           </div>
         ) : null}
 
         <Sheet
-          open={editing}
+          open={panelOpen}
           onOpenChange={(open, eventDetails) => {
             // The grid is the workspace while the panel is open: dragging a
             // widget fires outside-press and focus-out, and clicking the grid
-            // fires outside-press; none of those may dismiss the panel. Only
-            // explicit dismissal (the X, Escape, or a Done button) exits
-            // edit mode.
+            // fires outside-press; none of those may dismiss the panel.
+            // Closing the panel (X or Escape) keeps edit mode so the whole
+            // grid stays draggable; the header/banner "Done" exits.
             if (
               !open &&
               (eventDetails.reason === "outside-press" || eventDetails.reason === "focus-out")
             )
               return;
-            if (!open) setEditing(false);
+            if (!open) setPanelOpen(false);
           }}
           modal={false}
         >
           <SheetContent side="right" showOverlay={false} className="sm:max-w-md">
-            <SheetHeader>
-              <SheetTitle>Customize dashboard</SheetTitle>
-              <SheetDescription>
-                Show, hide, resize, and reorder widgets. Drag widgets on the dashboard to move them.
-              </SheetDescription>
+            <SheetHeader className="border-b">
+              <div className="flex items-start justify-between gap-3 pr-8">
+                <div className="space-y-0.5">
+                  <SheetTitle>Customize dashboard</SheetTitle>
+                  <SheetDescription>
+                    Drag a card&apos;s top bar to move it, or use the arrows here. Changes save
+                    automatically.
+                  </SheetDescription>
+                </div>
+                <span className="shrink-0 rounded-full bg-muted px-2 py-0.5 text-[11px] font-medium text-muted-foreground tabular-nums">
+                  {visible.length}/{layout.blocks.length}
+                </span>
+              </div>
             </SheetHeader>
-            <div className="min-h-0 flex-1 space-y-3 overflow-y-auto px-4 pb-4">
-              {blocks.map((block) => {
-                const meta = widgetMeta[block.id] ?? fallbackMeta;
-                const Icon = meta.icon;
-                const visible = !hiddenIds.includes(block.id);
-                return (
-                  <div key={block.id} className="rounded-xl border p-3">
-                    <div className="flex items-center gap-3">
-                      <div className="flex size-9 shrink-0 items-center justify-center rounded-full bg-muted">
-                        <Icon className="size-4 text-muted-foreground" />
-                      </div>
-                      <div className="min-w-0 flex-1">
-                        <p className="truncate text-sm font-medium">{block.label}</p>
-                        <p className="text-xs text-muted-foreground">{meta.description}</p>
-                      </div>
-                      <Switch
-                        checked={visible}
-                        onCheckedChange={(checked) => setWidgetVisible(block.id, checked)}
-                        aria-label={`Show ${block.label}`}
-                      />
-                    </div>
-                    <div
-                      className="mt-3 flex gap-1 rounded-lg bg-muted p-1"
-                      role="group"
-                      aria-label={`${block.label} size`}
-                    >
-                      {sizeOptions.map((option) => (
-                        <button
-                          key={option.value}
-                          type="button"
-                          disabled={!visible}
-                          aria-pressed={block.size === option.value}
-                          onClick={() => setWidgetSize(block.id, option.value)}
-                          className={cn(
-                            "flex-1 rounded-md px-2 py-1.5 text-xs font-medium transition-colors",
-                            block.size === option.value
-                              ? "bg-card text-foreground shadow-sm"
-                              : "text-muted-foreground hover:text-foreground",
-                            !visible && "opacity-50"
-                          )}
-                        >
-                          {option.label}
-                        </button>
-                      ))}
-                    </div>
+
+            <div className="min-h-0 flex-1 space-y-5 overflow-y-auto px-4 pb-4">
+              <section className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                    On your dashboard
+                  </h3>
+                  <span className="text-[11px] text-muted-foreground">Top to bottom</span>
+                </div>
+                {visible.length === 0 ? (
+                  <p className="rounded-lg border border-dashed p-3 text-xs text-muted-foreground">
+                    No widgets are showing. Add one from the available list below.
+                  </p>
+                ) : null}
+                {visible.map((block, index) => (
+                  <WidgetSettingsRow
+                    key={block.id}
+                    block={block}
+                    index={index}
+                    total={visible.length}
+                    onMoveUp={() => handleMove(block.id, -1)}
+                    onMoveDown={() => handleMove(block.id, 1)}
+                    onHide={() => handleHide(block.id)}
+                    onSize={(size) => handleSize(block.id, size)}
+                    onCompact={(compact) => handleCompact(block.id, compact)}
+                  />
+                ))}
+              </section>
+
+              {hidden.length > 0 ? (
+                <section className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                      Available widgets
+                    </h3>
+                    <span className="text-[11px] text-muted-foreground">{hidden.length}</span>
                   </div>
-                );
-              })}
+                  {hidden.map((block) => (
+                    <AvailableWidgetRow
+                      key={block.id}
+                      block={block}
+                      onAdd={() => handleShow(block.id)}
+                    />
+                  ))}
+                </section>
+              ) : null}
             </div>
-            <SheetFooter className="flex-row items-center justify-between gap-2">
-              <Button
-                variant="ghost"
-                size="sm"
-                className="gap-1.5 text-xs text-muted-foreground"
-                onClick={resetLayout}
-              >
-                <RotateCcwIcon className="size-3.5" />
-                Reset layout
-              </Button>
-              <Button size="sm" onClick={() => setEditing(false)}>
-                Done
-              </Button>
+
+            <SheetFooter className="border-t">
+              <div className="flex items-center justify-between gap-2">
+                <span className="flex items-center gap-1 text-[11px] text-muted-foreground">
+                  <CheckIcon className="size-3" />
+                  Saved automatically
+                </span>
+                <div className="flex items-center gap-1.5">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="gap-1.5 text-xs text-muted-foreground"
+                    onClick={handleReset}
+                    title="Restore the default dashboard"
+                  >
+                    <RotateCcwIcon className="size-3.5" />
+                    Reset
+                  </Button>
+                  <Button size="sm" onClick={stopEditing}>
+                    Done
+                  </Button>
+                </div>
+              </div>
             </SheetFooter>
           </SheetContent>
         </Sheet>
 
         <DndContext
           sensors={sensors}
-          collisionDetection={pointerWithin}
+          collisionDetection={collisionDetection}
+          accessibility={{ announcements }}
           onDragStart={(event: DragStartEvent) => setActiveId(String(event.active.id))}
           onDragEnd={handleDragEnd}
           onDragCancel={() => setActiveId(null)}
         >
-          <SortableContext items={visibleBlocks.map((block) => block.id)} strategy={nullStrategy}>
+          <SortableContext items={visible.map((block) => block.id)} strategy={rectSortingStrategy}>
             <div className="grid grid-cols-12 gap-4">
-              {visibleBlocks.map((block) => (
-                <SortableWidget key={block.id} block={block} editing={editing} />
+              {visible.map((block, index) => (
+                <SortableWidget
+                  key={block.id}
+                  block={block}
+                  editing={editing}
+                  position={index}
+                  total={visible.length}
+                />
               ))}
-              {visibleBlocks.length === 0 ? (
+              {visible.length === 0 ? (
                 <div className="col-span-12 flex flex-col items-center justify-center gap-2 rounded-xl border border-dashed py-16 text-center">
                   <LayoutGridIcon className="size-8 text-muted-foreground" />
                   <p className="text-sm font-medium">All widgets are hidden</p>
@@ -476,10 +711,10 @@ export function DashboardCustomizer({ data }: { data: DashboardData }) {
                     Show widgets from the customize panel to build your dashboard.
                   </p>
                   <div className="mt-2 flex gap-2">
-                    <Button size="sm" onClick={() => setEditing(true)}>
+                    <Button size="sm" onClick={startEditing}>
                       Customize dashboard
                     </Button>
-                    <Button size="sm" variant="outline" onClick={resetLayout}>
+                    <Button size="sm" variant="outline" onClick={handleReset}>
                       Reset layout
                     </Button>
                   </div>
@@ -487,6 +722,9 @@ export function DashboardCustomizer({ data }: { data: DashboardData }) {
               ) : null}
             </div>
           </SortableContext>
+          <DragOverlay dropAnimation={{ duration: 200, easing: "cubic-bezier(0.2, 0, 0, 1)" }}>
+            {activeBlock ? <DragPreview block={activeBlock} /> : null}
+          </DragOverlay>
         </DndContext>
       </div>
     </DashboardDataProvider>
