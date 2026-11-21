@@ -107,7 +107,13 @@ export function buildDashboardLayout(saved: unknown): DashboardLayout {
     const record = saved as Record<string, unknown>;
     version = typeof record.version === "number" ? record.version : 2;
     if (isStringArray(record.order)) order = record.order;
-    if (isStringArray(record.hidden)) rawHidden = record.hidden;
+    if (isStringArray(record.hidden)) {
+      rawHidden = record.hidden;
+    } else if (version >= DASHBOARD_LAYOUT_VERSION) {
+      // A current layout that omits `hidden` still starts from the default
+      // available set, so optional widgets are not forced onto the grid.
+      rawHidden = [...DEFAULT_HIDDEN_WIDGETS];
+    }
     if (record.sizes && typeof record.sizes === "object") {
       for (const [id, size] of Object.entries(record.sizes as Record<string, unknown>)) {
         if (isWidgetSize(size)) sizes.set(id, size);

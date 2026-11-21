@@ -65,6 +65,18 @@ describe("buildDashboardLayout", () => {
     expect(layout.blocks).toHaveLength(DEFAULT_DASHBOARD_BLOCKS.length);
   });
 
+  it("keeps optional widgets hidden when a v3 layout omits the hidden list", () => {
+    const layout = buildDashboardLayout({
+      version: 3,
+      order: ["financial-overview"]
+    });
+
+    expect(layout.hidden).toEqual(expect.arrayContaining(DEFAULT_HIDDEN_WIDGETS));
+    expect(visibleBlocks(layout).some((block) => DEFAULT_HIDDEN_WIDGETS.includes(block.id))).toBe(
+      false
+    );
+  });
+
   it("honors the exact hidden set, sizes and compact flags in a v3 layout", () => {
     const layout = buildDashboardLayout({
       version: 3,
