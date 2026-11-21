@@ -73,6 +73,26 @@ export async function togglePrivacyAction(): Promise<void> {
   revalidatePath("/", "layout");
 }
 
+const monthlyDigestSchema = z.object({ value: z.enum(["on", "off"]).default("off") });
+
+export async function setMonthlyDigestAction(
+  _prev: ActionState | undefined,
+  formData: FormData
+): Promise<ActionState> {
+  return runAction("profile.monthly_digest", async () => {
+    // Verified actor only, and never a client-supplied user id: the
+    // preference is always written for the signed-in user.
+    const actor = await assertActor();
+    if (!actor.emailVerified) {
+      throw errors.forbidden("Verify your email address before opting into the monthly summary.");
+    }
+    const input = monthlyDigestSchema.parse(formValues(formData));
+    await usersSvc.setUserPreference(getDb(), actor.userId, "monthly_digest", input.value === "on");
+    revalidatePath("/settings");
+    return undefined;
+  });
+}
+
 const passwordChangeSchema = z.object({
   currentPassword: z.string().min(1),
   newPassword: z.string().min(1)

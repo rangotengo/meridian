@@ -12,7 +12,7 @@ export const DEFAULT_FLAGS: Record<FlagKey, { enabled: boolean; description: str
   },
   monthly_digest_email: {
     enabled: false,
-    description: "Preview: send a monthly summary email to family members."
+    description: "Send a monthly summary email to members who opted in."
   }
 };
 

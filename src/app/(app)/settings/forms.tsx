@@ -6,6 +6,7 @@ import {
   updateFamilySettingsAction,
   changeEmailAction,
   changePasswordAction,
+  setMonthlyDigestAction,
   setPreferenceAction
 } from "@/app/(app)/settings/actions";
 import { Field, FormError, Input, Select } from "@/components/ds/form";
@@ -19,6 +20,7 @@ export function ProfileForms({
   timezones,
   privacy,
   theme,
+  monthlyDigest,
   canEditTimezone,
   accessManaged = false
 }: {
@@ -28,6 +30,7 @@ export function ProfileForms({
   timezones: string[];
   privacy: boolean;
   theme: "light" | "dark" | "system";
+  monthlyDigest: boolean;
   canEditTimezone: boolean;
   accessManaged?: boolean;
 }) {
@@ -35,6 +38,7 @@ export function ProfileForms({
     <div className="space-y-6">
       <NameForm name={name} />
       <PrivacyToggle privacy={privacy} />
+      <MonthlyDigestForm optedIn={monthlyDigest} email={email} />
       <AppearanceForm theme={theme} />
       {canEditTimezone ? (
         <TimezoneForm timezone={timezone} timezones={timezones} />
@@ -87,6 +91,37 @@ function PrivacyToggle({ privacy }: { privacy: boolean }) {
       <SubmitButton variant="secondary" className="shrink-0 whitespace-nowrap">
         {privacy ? "Turn off" : "Turn on"}
       </SubmitButton>
+    </form>
+  );
+}
+
+function MonthlyDigestForm({ optedIn, email }: { optedIn: boolean; email: string }) {
+  const [state, action] = useActionState(setMonthlyDigestAction, undefined);
+  return (
+    <form action={action} className="space-y-3">
+      <FormError message={state?.ok === false ? state.error : undefined} />
+      <div className="flex items-start gap-3">
+        <input type="hidden" name="value" value="off" />
+        <input
+          id="s-digest"
+          name="value"
+          type="checkbox"
+          value="on"
+          defaultChecked={optedIn}
+          className="mt-1 h-4 w-4"
+        />
+        <div>
+          <label htmlFor="s-digest" className="text-sm font-medium">
+            Email me a monthly summary
+          </label>
+          <p className="text-xs text-muted-foreground">
+            Totals only — no transaction details. Sent only if an operator enables the monthly
+            digest feature, to the verified address on this account ({email}).
+          </p>
+        </div>
+      </div>
+      <SubmitButton variant="secondary">Save email preference</SubmitButton>
+      {state?.ok ? <p className="text-xs text-success">Saved.</p> : null}
     </form>
   );
 }
